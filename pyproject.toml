@@ -1,0 +1,28 @@
+[project]
+name = "nexus-open-swe-runtime"
+version = "0.1.0"
+description = "External Open SWE / Deep Agents execution runtime for Nexus"
+requires-python = ">=3.11"
+dependencies = [
+    "deepagents==0.7.6",
+    "google-genai==1.74.0",
+    "langchain-core==1.5.2",
+    "langchain-google-genai==4.3.2",
+]
+
+[project.scripts]
+nexus-open-swe-runtime = "nexus_open_swe_runtime.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "ruff>=0.15.17",
+]
+
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nexus_open_swe_runtime*"]
