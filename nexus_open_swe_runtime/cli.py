@@ -13,9 +13,15 @@ REQUEST_SCHEMA = "nexus.open_swe_runtime.request.v1"
 RESULT_SCHEMA = "nexus.open_swe_runtime.result.v1"
 SEMANTIC_TOOLS = frozenset({"glob", "grep", "ls", "read_file", "record_finding"})
 DIAGNOSIS_TOOLS = frozenset({"glob", "grep", "ls", "read_file", "record_diagnosis"})
-REPAIR_TOOLS = frozenset(
-    {"edit_file", "glob", "grep", "ls", "read_file", "record_worker_result", "write_file"}
-)
+REPAIR_TOOLS = frozenset({
+    "edit_file",
+    "glob",
+    "grep",
+    "ls",
+    "read_file",
+    "record_worker_result",
+    "write_file",
+})
 
 
 class RuntimeErrorBounded(RuntimeError):
@@ -167,6 +173,15 @@ def _load_runtime() -> dict[str, Any]:
 
 
 def _build_model(runtime: Mapping[str, Any], provider: str, model_id: str) -> Any:
+    if provider == "opencli_chatgpt":
+        from .opencli_web_model import OpenCLIWebChatModel
+
+        return OpenCLIWebChatModel(
+            executable=os.environ.get("NEXUS_OPENCLI_EXECUTABLE", "opencli"),
+            intelligence_level=model_id,
+            profile=os.environ.get("NEXUS_OPENCLI_PROFILE", ""),
+            site_session=os.environ.get("NEXUS_OPENCLI_SITE_SESSION", "ephemeral"),
+        )
     return runtime["init_chat_model"](model=model_id, model_provider=provider)
 
 
@@ -271,7 +286,9 @@ def build_repair_graph(
 
 def executable_tool_surface(graph: Any) -> tuple[str, ...]:
     try:
-        return tuple(sorted(str(name) for name in graph.get_graph().nodes["tools"].data.tools_by_name))
+        return tuple(
+            sorted(str(name) for name in graph.get_graph().nodes["tools"].data.tools_by_name)
+        )
     except (AttributeError, KeyError, TypeError) as exc:
         raise RuntimeErrorBounded("OPEN_SWE_TOOL_SURFACE_UNAVAILABLE") from exc
 
@@ -318,15 +335,13 @@ def _prompt_field(prompt: str, name: str) -> str:
 
 
 def _worker_result(task_id: str, unit_id: str, status: str, summary: str) -> str:
-    return _canonical_json(
-        {
-            "schema": "external_intelligence_worker_result.v1",
-            "task_id": task_id,
-            "unit_id": unit_id,
-            "status": status,
-            "summary": summary[:400],
-        }
-    )
+    return _canonical_json({
+        "schema": "external_intelligence_worker_result.v1",
+        "task_id": task_id,
+        "unit_id": unit_id,
+        "status": status,
+        "summary": summary[:400],
+    })
 
 
 def _deepagents_version() -> str:
@@ -354,7 +369,11 @@ def _workspace_index_path(request: Mapping[str, Any]) -> Path:
     workspace = str(request.get("workspace_path") or "")
     if not workspace:
         raise RuntimeErrorBounded("OPEN_SWE_WORKSPACE_REQUIRED")
-    return _state_root(request) / "workspaces" / f"{_sha256(str(Path(workspace).expanduser().resolve()))}.json"
+    return (
+        _state_root(request)
+        / "workspaces"
+        / f"{_sha256(str(Path(workspace).expanduser().resolve()))}.json"
+    )
 
 
 def _session_path(request: Mapping[str, Any], session_id: str) -> Path:
@@ -471,7 +490,9 @@ def _session_id(workspace: Path, task_id: str, unit_id: str) -> str:
     return f"ses_open_swe_{hashlib.sha256(material).hexdigest()[:20]}"
 
 
-def _worker_context(request: Mapping[str, Any], prompt: str) -> tuple[str, str, tuple[str, ...], str]:
+def _worker_context(
+    request: Mapping[str, Any], prompt: str
+) -> tuple[str, str, tuple[str, ...], str]:
     session_id = str(request.get("session_id") or "")
     if session_id:
         context = _read_json(_session_path(request, session_id))
@@ -519,7 +540,9 @@ def _worker_run(
     runtime_loader: Callable[[], Mapping[str, Any]] = _load_runtime,
     model_factory: Callable[[Mapping[str, Any], str, str], Any] = _build_model,
     diagnosis_factory: Callable[[Any, Path, Mapping[str, Any], str], Any] = build_diagnosis_graph,
-    repair_factory: Callable[[Any, Path, Mapping[str, Any], tuple[str, ...], str], Any] = build_repair_graph,
+    repair_factory: Callable[
+        [Any, Path, Mapping[str, Any], tuple[str, ...], str], Any
+    ] = build_repair_graph,
 ) -> dict[str, Any]:
     existing = _read_json(_operation_path(request))
     if existing is not None:
@@ -531,7 +554,13 @@ def _worker_run(
     prompt = str(request.get("prompt") or "")
     provider = str(request.get("provider_id") or "")
     model_id = str(request.get("model_id") or "")
-    if not workspace.is_dir() or not artifact.is_file() or not prompt or not provider or not model_id:
+    if (
+        not workspace.is_dir()
+        or not artifact.is_file()
+        or not prompt
+        or not provider
+        or not model_id
+    ):
         return _base_result(request, kind="worker", status="OPEN_SWE_EXECUTION_INPUT_INVALID")
     started = _write_started(request, "worker")
     diagnosis_status = ""
@@ -693,7 +722,9 @@ def main() -> int:
             raise RuntimeErrorBounded("OPEN_SWE_PROTOCOL_REQUEST_INVALID")
         result = dispatch(request)
     except Exception as exc:
-        provider = request.get("provider_id", "") if isinstance(locals().get("request"), dict) else ""
+        provider = (
+            request.get("provider_id", "") if isinstance(locals().get("request"), dict) else ""
+        )
         model = request.get("model_id", "") if isinstance(locals().get("request"), dict) else ""
         result = {
             "schema": RESULT_SCHEMA,
