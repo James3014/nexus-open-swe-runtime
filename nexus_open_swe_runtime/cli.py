@@ -172,16 +172,44 @@ def _load_runtime() -> dict[str, Any]:
     }
 
 
-def _build_model(runtime: Mapping[str, Any], provider: str, model_id: str) -> Any:
+def _build_model(
+    runtime: Mapping[str, Any],
+    provider: str,
+    model_id: str,
+    transport_config: Mapping[str, Any] | None = None,
+) -> Any:
+    config = dict(transport_config or {})
     if provider == "opencli_chatgpt":
         from .opencli_web_model import OpenCLIWebChatModel
 
+        expected = {"executable", "profile", "site_session", "timeout_seconds"}
+        if set(config) != expected:
+            raise RuntimeErrorBounded("OPENCLI_WEB_TRANSPORT_CONFIG_INVALID")
+        executable = config.get("executable")
+        profile = config.get("profile")
+        site_session = config.get("site_session")
+        timeout_seconds = config.get("timeout_seconds")
+        if not isinstance(executable, str) or not executable.strip() or "\x00" in executable:
+            raise RuntimeErrorBounded("OPENCLI_WEB_TRANSPORT_CONFIG_INVALID")
+        if not isinstance(profile, str) or "\x00" in profile:
+            raise RuntimeErrorBounded("OPENCLI_WEB_TRANSPORT_CONFIG_INVALID")
+        if not isinstance(site_session, str) or not site_session.strip() or "\x00" in site_session:
+            raise RuntimeErrorBounded("OPENCLI_WEB_TRANSPORT_CONFIG_INVALID")
+        if (
+            not isinstance(timeout_seconds, int)
+            or isinstance(timeout_seconds, bool)
+            or not 30 <= timeout_seconds <= 900
+        ):
+            raise RuntimeErrorBounded("OPENCLI_WEB_TRANSPORT_CONFIG_INVALID")
         return OpenCLIWebChatModel(
-            executable=os.environ.get("NEXUS_OPENCLI_EXECUTABLE", "opencli"),
+            executable=executable.strip(),
             intelligence_level=model_id,
-            profile=os.environ.get("NEXUS_OPENCLI_PROFILE", ""),
-            site_session=os.environ.get("NEXUS_OPENCLI_SITE_SESSION", "ephemeral"),
+            profile=profile,
+            timeout_seconds=timeout_seconds,
+            site_session=site_session.strip(),
         )
+    if config:
+        raise RuntimeErrorBounded("OPEN_SWE_TRANSPORT_CONFIG_PROVIDER_MISMATCH")
     return runtime["init_chat_model"](model=model_id, model_provider=provider)
 
 
@@ -434,7 +462,9 @@ def _semantic_run(
     request: Mapping[str, Any],
     *,
     runtime_loader: Callable[[], Mapping[str, Any]] = _load_runtime,
-    model_factory: Callable[[Mapping[str, Any], str, str], Any] = _build_model,
+    model_factory: Callable[
+        [Mapping[str, Any], str, str, Mapping[str, Any] | None], Any
+    ] = _build_model,
     graph_factory: Callable[[Any, Path, Mapping[str, Any], str], Any] = build_semantic_graph,
 ) -> dict[str, Any]:
     existing = _read_json(_operation_path(request))
@@ -451,7 +481,7 @@ def _semantic_run(
     started = _write_started(request, "semantic")
     try:
         runtime = runtime_loader()
-        model = model_factory(runtime, provider, model_id)
+        model = model_factory(runtime, provider, model_id, request.get("transport_config"))
         graph = graph_factory(model, root, runtime, f"{provider}:{model_id}")
         if set(executable_tool_surface(graph)) != SEMANTIC_TOOLS:
             raise RuntimeErrorBounded("OPEN_SWE_TOOL_SURFACE_INVALID")
@@ -538,7 +568,9 @@ def _worker_run(
     request: Mapping[str, Any],
     *,
     runtime_loader: Callable[[], Mapping[str, Any]] = _load_runtime,
-    model_factory: Callable[[Mapping[str, Any], str, str], Any] = _build_model,
+    model_factory: Callable[
+        [Mapping[str, Any], str, str, Mapping[str, Any] | None], Any
+    ] = _build_model,
     diagnosis_factory: Callable[[Any, Path, Mapping[str, Any], str], Any] = build_diagnosis_graph,
     repair_factory: Callable[
         [Any, Path, Mapping[str, Any], tuple[str, ...], str], Any
@@ -572,7 +604,7 @@ def _worker_run(
     try:
         task_id, unit_id, allowed_paths, session_id = _worker_context(request, prompt)
         runtime = runtime_loader()
-        model = model_factory(runtime, provider, model_id)
+        model = model_factory(runtime, provider, model_id, request.get("transport_config"))
         profile_key = f"{provider}:{model_id}"
         diagnosis_graph = diagnosis_factory(model, workspace, runtime, profile_key)
         repair_graph = repair_factory(model, workspace, runtime, allowed_paths, profile_key)

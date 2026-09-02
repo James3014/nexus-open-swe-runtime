@@ -76,10 +76,68 @@ def test_build_model_selects_opencli_web_bridge_without_langchain_provider():
         {"init_chat_model": fail_init},
         "opencli_chatgpt",
         "very-high",
+        {
+            "executable": "/opt/opencli",
+            "profile": "profile-a",
+            "site_session": "session-a",
+            "timeout_seconds": 240,
+        },
     )
 
     assert isinstance(model, OpenCLIWebChatModel)
-    assert model.intelligence_level == "very-high"
+    assert model.executable == "/opt/opencli"
+    assert model.profile == "profile-a"
+    assert model.site_session == "session-a"
+    assert model.timeout_seconds == 240
+
+
+def test_build_model_ignores_ambient_opencli_binding(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("NEXUS_OPENCLI_EXECUTABLE", "/tmp/wrong-opencli")
+    monkeypatch.setenv("NEXUS_OPENCLI_PROFILE", "wrong-profile")
+    monkeypatch.setenv("NEXUS_OPENCLI_SITE_SESSION", "wrong-session")
+    monkeypatch.setenv("NEXUS_OPENCLI_TIMEOUT_SECONDS", "899")
+
+    model = cli._build_model(
+        {},
+        "opencli_chatgpt",
+        "very-high",
+        {
+            "executable": "opencli",
+            "profile": "correct-profile",
+            "site_session": "correct-session",
+            "timeout_seconds": 120,
+        },
+    )
+
+    assert model.executable == "opencli"
+    assert model.profile == "correct-profile"
+    assert model.site_session == "correct-session"
+    assert model.timeout_seconds == 120
+
+
+def test_build_model_rejects_missing_unknown_and_out_of_range_transport_config():
+    valid = {
+        "executable": "opencli",
+        "profile": "",
+        "site_session": "ephemeral",
+        "timeout_seconds": 30,
+    }
+    cli._build_model({}, "opencli_chatgpt", "very-high", valid)
+    cli._build_model({}, "opencli_chatgpt", "very-high", {**valid, "timeout_seconds": 900})
+    for config in (
+        None,
+        {**valid, "timeout_seconds": 29},
+        {**valid, "timeout_seconds": 901},
+        {**valid, "extra": "unexpected"},
+    ):
+        with pytest.raises(cli.RuntimeErrorBounded, match="OPENCLI_WEB_TRANSPORT_CONFIG_INVALID"):
+            cli._build_model({}, "opencli_chatgpt", "very-high", config)
+    with pytest.raises(
+        cli.RuntimeErrorBounded, match="OPEN_SWE_TRANSPORT_CONFIG_PROVIDER_MISMATCH"
+    ):
+        cli._build_model(
+            {"init_chat_model": lambda **_kwargs: object()}, "google_genai", "g", valid
+        )
 
 
 def test_opencli_web_model_uses_chatgpt_web_and_no_shell(monkeypatch: pytest.MonkeyPatch):
