@@ -164,7 +164,7 @@ class OpenCLIWebChatModel(BaseChatModel):
     def _select_intelligence_level(self) -> None:
         if self.intelligence_level not in _ALLOWED_LEVELS:
             raise OpenCLIWebModelError("OPENCLI_WEB_MODEL_LEVEL_INVALID")
-        self._run([
+        argv = [
             self.executable,
             "chatgpt",
             "model",
@@ -173,7 +173,13 @@ class OpenCLIWebChatModel(BaseChatModel):
             self.site_session,
             "-f",
             "json",
-        ])
+        ]
+        try:
+            self._run(argv)
+        except OpenCLIWebModelError as exc:
+            if str(exc) != "OPENCLI_WEB_PROCESS_FAILURE":
+                raise
+            self._run(argv)
 
     def _render_prompt(
         self,
@@ -375,6 +381,20 @@ class OpenCLIWebChatModel(BaseChatModel):
             )
         return False
 
+    def _refresh_protocol_response(self, response: str, *, turn_id: str) -> str:
+        if self._is_complete_protocol_response(response) or not self._conversation_id:
+            return response
+        latest = response
+        for _ in range(2):
+            latest = self._detail_response(
+                self._conversation_id,
+                wait=True,
+                turn_id=turn_id,
+            )
+            if self._is_complete_protocol_response(latest):
+                return latest
+        return latest
+
     def _repair_protocol_response(self, invalid_response: str) -> str:
         if not self._conversation_id:
             raise OpenCLIWebModelError("OPENCLI_WEB_CONVERSATION_ID_INVALID")
@@ -454,7 +474,9 @@ class OpenCLIWebChatModel(BaseChatModel):
 
         self._select_intelligence_level()
         prompt = self._render_prompt(messages, normalized_tools, tool_choice)
+        turn_id = str(json.loads(prompt)["turn_id"])
         response = self._send_and_reconcile(prompt)
+        response = self._refresh_protocol_response(response, turn_id=turn_id)
         if not self._is_complete_protocol_response(response):
             response = self._repair_protocol_response(response)
         message = self._response_message(response, normalized_tools)

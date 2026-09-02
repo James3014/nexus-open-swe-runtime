@@ -182,6 +182,58 @@ def test_opencli_web_model_uses_chatgpt_web_and_no_shell(monkeypatch: pytest.Mon
     assert prompt["messages"][-1]["content"] == "inspect the repository"
 
 
+def test_opencli_web_model_retries_idempotent_model_selection_once(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    model_attempts = 0
+    ask_attempts = 0
+    latest_prompt = ""
+
+    def fake_run(argv, **_kwargs):
+        nonlocal model_attempts, ask_attempts, latest_prompt
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            model_attempts += 1
+            if model_attempts == 1:
+                return SimpleNamespace(returncode=1, stdout="", stderr="selector busy")
+            return SimpleNamespace(
+                returncode=0, stdout='[{"Status":"Already selected"}]', stderr=""
+            )
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_attempts += 1
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": "web-conversation-1", "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {
+                        "Index": 2,
+                        "Role": "Assistant",
+                        "Text": '{"type":"final","content":"done"}',
+                        "Generating": False,
+                    },
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr(
+        "nexus_open_swe_runtime.opencli_web_model.subprocess.run",
+        fake_run,
+    )
+    model = OpenCLIWebChatModel(executable="/opt/opencli", intelligence_level="very-high")
+
+    assert model.invoke([HumanMessage(content="hello")]).content == "done"
+    assert model_attempts == 2
+    assert ask_attempts == 1
+
+
 def test_opencli_web_model_translates_declared_tool_call(monkeypatch: pytest.MonkeyPatch):
     calls = _fake_process(
         monkeypatch,
@@ -276,6 +328,62 @@ def test_opencli_web_model_rejects_conversation_identity_drift(
     assert model.invoke([HumanMessage(content="first")]).content == "done"
     with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_CONVERSATION_ID_MISMATCH"):
         model.invoke([HumanMessage(content="second")])
+
+
+def test_opencli_web_model_refreshes_incomplete_readback_without_redispatch(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    ask_count = 0
+    detail_count = 0
+    latest_prompt = ""
+
+    def fake_run(argv, **_kwargs):
+        nonlocal ask_count, detail_count, latest_prompt
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_count += 1
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": "web-conversation-1", "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            detail_count += 1
+            text = (
+                '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}'
+                if detail_count >= 2
+                else '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README'
+            )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {"Index": 2, "Role": "Assistant", "Text": text, "Generating": False},
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr(
+        "nexus_open_swe_runtime.opencli_web_model.subprocess.run",
+        fake_run,
+    )
+
+    @tool
+    def read_file(file_path: str) -> str:
+        """Read one repository file."""
+        return file_path
+
+    model = OpenCLIWebChatModel(executable="/opt/opencli", intelligence_level="very-high")
+    result = model.bind_tools([read_file]).invoke("inspect README")
+
+    assert ask_count == 1
+    assert detail_count == 2
+    assert result.tool_calls[0]["name"] == "read_file"
+    assert result.tool_calls[0]["args"] == {"file_path": "README.md"}
 
 
 def test_opencli_web_model_repairs_truncated_protocol_response_before_tool_execution(
