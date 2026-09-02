@@ -520,6 +520,28 @@ def _session_id(workspace: Path, task_id: str, unit_id: str) -> str:
     return f"ses_open_swe_{hashlib.sha256(material).hexdigest()[:20]}"
 
 
+def _opencli_session_namespace(request: Mapping[str, Any]) -> dict[str, str]:
+    if str(request.get("provider_id") or "") != "opencli_chatgpt":
+        return {}
+    transport_config = request.get("transport_config")
+    if not isinstance(transport_config, Mapping):
+        raise RuntimeErrorBounded("OPENCLI_WEB_TRANSPORT_CONFIG_INVALID")
+    profile = transport_config.get("profile")
+    site_session = transport_config.get("site_session")
+    if (
+        not isinstance(profile, str)
+        or "\x00" in profile
+        or not isinstance(site_session, str)
+        or not site_session.strip()
+        or "\x00" in site_session
+    ):
+        raise RuntimeErrorBounded("OPENCLI_WEB_TRANSPORT_CONFIG_INVALID")
+    return {
+        "opencli_profile": profile,
+        "opencli_site_session": site_session.strip(),
+    }
+
+
 def _worker_context(
     request: Mapping[str, Any], prompt: str
 ) -> tuple[str, str, tuple[str, ...], str]:
@@ -533,6 +555,7 @@ def _worker_context(
             "provider_id": str(request.get("provider_id") or ""),
             "model_id": str(request.get("model_id") or ""),
             "worker_identity_sha256": str(request.get("worker_identity_sha256") or ""),
+            **_opencli_session_namespace(request),
         }
         if any(str(context.get(key) or "") != value for key, value in expected.items()):
             raise RuntimeErrorBounded("SESSION_BINDING_MISMATCH")
@@ -559,6 +582,7 @@ def _worker_context(
         "provider_id": str(request.get("provider_id") or ""),
         "model_id": str(request.get("model_id") or ""),
         "worker_identity_sha256": str(request.get("worker_identity_sha256") or ""),
+        **_opencli_session_namespace(request),
     }
     _atomic_json(_session_path(request, session_id), context)
     return task_id, unit_id, allowed_paths, session_id
