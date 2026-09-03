@@ -693,8 +693,13 @@ def test_opencli_web_model_concurrent_budget_admission_is_atomic(
             return SimpleNamespace(
                 returncode=0,
                 stdout=json.dumps([
-                        {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
-                    {"Index": 2, "Role": "Assistant", "Text": '{"type":"final","content":"ok"}', "Generating": False},
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {
+                        "Index": 2,
+                        "Role": "Assistant",
+                        "Text": '{"type":"final","content":"ok"}',
+                        "Generating": False,
+                    },
                 ]),
                 stderr="",
             )
@@ -1056,7 +1061,12 @@ def test_opencli_web_model_reconciles_bound_timeout_without_history_scan(
                 returncode=0,
                 stdout=json.dumps([
                     {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
-                    {"Index": 2, "Role": "Assistant", "Text": '{"type":"final","content":"reconciled"}', "Generating": False},
+                    {
+                        "Index": 2,
+                        "Role": "Assistant",
+                        "Text": '{"type":"final","content":"reconciled"}',
+                        "Generating": False,
+                    },
                 ]),
                 stderr="",
             )
