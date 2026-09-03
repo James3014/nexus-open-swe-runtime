@@ -4,6 +4,10 @@ import hashlib
 import json
 import os
 import subprocess
+import threading
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
 from langchain_core.language_models.chat_models import BaseChatModel, LanguageModelInput
@@ -16,6 +20,49 @@ from pydantic import PrivateAttr
 
 OPENCLI_WEB_PROTOCOL = "nexus.opencli_web_chat.v1"
 _ALLOWED_LEVELS = frozenset({"fast", "balanced", "advanced", "very-high", "pro"})
+_ALLOWED_SITE_SESSIONS = frozenset({"ephemeral", "persistent"})
+_HARD_BLOCK_MARKERS = (
+    "login required",
+    "not logged in",
+    "challenge",
+    "captcha",
+    "quota",
+)
+_BUSY_MARKERS = ("busy", "rate control", "rate-control", "too many requests")
+_MIN_WEB_SEND_INTERVAL_SECONDS = 15.0
+_POST_RESPONSE_SETTLE_SECONDS = 3.0
+_MAX_WEB_TURNS_PER_OPERATION = 12
+
+
+@dataclass
+class _PacingState:
+    condition: threading.Condition = field(default_factory=threading.Condition)
+    in_flight: bool = False
+    last_send_started: float | None = None
+    last_response_finished: float | None = None
+
+
+_MAX_PACING_SESSION_KEYS = 64
+_PACING_STATES_LOCK = threading.Lock()
+_PACING_STATES: OrderedDict[tuple[str, str, str], _PacingState] = OrderedDict()
+
+
+def _shared_pacing_state(key: tuple[str, str, str]) -> _PacingState:
+    with _PACING_STATES_LOCK:
+        state = _PACING_STATES.get(key)
+        if state is None:
+            state = _PacingState()
+            _PACING_STATES[key] = state
+        else:
+            _PACING_STATES.move_to_end(key)
+        if len(_PACING_STATES) > _MAX_PACING_SESSION_KEYS:
+            for stale_key, stale_state in tuple(_PACING_STATES.items()):
+                if stale_key == key or stale_state.in_flight:
+                    continue
+                del _PACING_STATES[stale_key]
+                if len(_PACING_STATES) <= _MAX_PACING_SESSION_KEYS:
+                    break
+        return state
 
 
 class OpenCLIWebModelError(RuntimeError):
@@ -97,6 +144,11 @@ class OpenCLIWebChatModel(BaseChatModel):
     site_session: str = "ephemeral"
     disable_streaming: bool = True
     _conversation_id: str | None = PrivateAttr(default=None)
+    _sleep: Callable[[float], None] = PrivateAttr(default=time.sleep)
+    _clock: Callable[[], float] = PrivateAttr(default=time.monotonic)
+    _pacing_state: _PacingState = PrivateAttr(default_factory=_PacingState)
+    _bound_pacing_state: _PacingState | None = PrivateAttr(default=None)
+    _web_turn_count: int = PrivateAttr(default=0)
 
     @property
     def model_name(self) -> str:
@@ -158,10 +210,29 @@ class OpenCLIWebChatModel(BaseChatModel):
             diagnostic = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
             if "timed out" in diagnostic and "may still complete" in diagnostic:
                 raise OpenCLIWebModelError("OPENCLI_WEB_TIMEOUT")
+            if any(marker in diagnostic for marker in _HARD_BLOCK_MARKERS):
+                raise OpenCLIWebModelError("OPENCLI_WEB_HARD_BLOCK")
+            if any(marker in diagnostic for marker in _BUSY_MARKERS):
+                raise OpenCLIWebModelError("OPENCLI_WEB_BUSY")
             raise OpenCLIWebModelError("OPENCLI_WEB_PROCESS_FAILURE")
         return result.stdout or ""
 
+    def _cooldown_and_probe_status(self) -> None:
+        self._sleep(60.0)
+        self._run([
+            self.executable,
+            "chatgpt",
+            "status",
+            "--site-session",
+            self.site_session,
+            "-f",
+            "json",
+        ])
+        raise OpenCLIWebModelError("OPENCLI_WEB_BUSY")
+
     def _select_intelligence_level(self) -> None:
+        if self.site_session not in _ALLOWED_SITE_SESSIONS:
+            raise OpenCLIWebModelError("OPENCLI_WEB_SITE_SESSION_INVALID")
         if self.intelligence_level not in _ALLOWED_LEVELS:
             raise OpenCLIWebModelError("OPENCLI_WEB_MODEL_LEVEL_INVALID")
         argv = [
@@ -177,8 +248,11 @@ class OpenCLIWebChatModel(BaseChatModel):
         try:
             self._run(argv)
         except OpenCLIWebModelError as exc:
+            if str(exc) == "OPENCLI_WEB_BUSY":
+                self._cooldown_and_probe_status()
             if str(exc) != "OPENCLI_WEB_PROCESS_FAILURE":
                 raise
+            self._sleep(10.0)
             self._run(argv)
 
     def _render_prompt(
@@ -286,13 +360,62 @@ class OpenCLIWebChatModel(BaseChatModel):
             "--timeout",
             str(readback_timeout),
             "--stable",
-            "6",
+            str(int(_POST_RESPONSE_SETTLE_SECONDS)),
             "--site-session",
             self.site_session,
             "-f",
             "json",
         ])
         return self._extract_detail_response(detail, turn_id)
+
+    def _session_pacing_state(self) -> _PacingState:
+        if not self.profile:
+            return self._pacing_state
+        if self._bound_pacing_state is None:
+            self._bound_pacing_state = _shared_pacing_state(
+                (self.executable, self.profile, self.site_session)
+            )
+        return self._bound_pacing_state
+
+    def _begin_web_turn(self) -> _PacingState:
+        state = self._session_pacing_state()
+        with state.condition:
+            while state.in_flight:
+                state.condition.wait()
+            if self._web_turn_count >= _MAX_WEB_TURNS_PER_OPERATION:
+                raise OpenCLIWebModelError("OPENCLI_WEB_TURN_BUDGET_EXHAUSTED")
+            state.in_flight = True
+            now = self._clock()
+            eligible_at = now
+            if state.last_send_started is not None:
+                eligible_at = max(
+                    eligible_at,
+                    state.last_send_started + _MIN_WEB_SEND_INTERVAL_SECONDS,
+                )
+            if state.last_response_finished is not None:
+                eligible_at = max(
+                    eligible_at,
+                    state.last_response_finished + _POST_RESPONSE_SETTLE_SECONDS,
+                )
+        try:
+            if eligible_at > now:
+                self._sleep(eligible_at - now)
+            with state.condition:
+                state.last_send_started = self._clock()
+                self._web_turn_count += 1
+            return state
+        except BaseException:
+            with state.condition:
+                state.in_flight = False
+                state.condition.notify_all()
+            raise
+
+    def _finish_web_turn(self, state: _PacingState, *, response_finished: bool) -> None:
+        with state.condition:
+            if response_finished:
+                state.last_response_finished = self._clock()
+            state.in_flight = False
+            state.condition.notify_all()
 
     def _reconcile_timeout(self, turn_id: str) -> str:
         if self._conversation_id:
@@ -328,41 +451,52 @@ class OpenCLIWebChatModel(BaseChatModel):
         return self._detail_response(matches[0], wait=True, turn_id=turn_id)
 
     def _send_and_reconcile(self, prompt: str) -> str:
+        pacing_state = self._begin_web_turn()
+        response_finished = False
         try:
-            prompt_envelope = json.loads(prompt)
-        except json.JSONDecodeError:
-            prompt_envelope = {}
-        turn_id = (
-            str(prompt_envelope.get("turn_id") or "")
-            if isinstance(prompt_envelope, Mapping)
-            else ""
-        )
-        argv = [self.executable, "chatgpt", "ask", prompt]
-        if self._conversation_id:
-            argv.extend(["--conversation", self._conversation_id])
-        else:
-            argv.append("--new")
-        argv.extend([
-            "--wait",
-            "true",
-            "--timeout",
-            str(self.timeout_seconds),
-            "--site-session",
-            self.site_session,
-            "-f",
-            "json",
-        ])
-        try:
-            stdout = self._run(argv)
-        except OpenCLIWebModelError as exc:
-            if str(exc) != "OPENCLI_WEB_TIMEOUT" or not turn_id:
-                raise
-            return self._reconcile_timeout(turn_id)
-        conversation_id, _immediate_response = self._extract_ask_result(stdout)
-        if self._conversation_id and conversation_id != self._conversation_id:
-            raise OpenCLIWebModelError("OPENCLI_WEB_CONVERSATION_ID_MISMATCH")
-        self._conversation_id = conversation_id
-        return self._detail_response(conversation_id, wait=True, turn_id=turn_id)
+            try:
+                prompt_envelope = json.loads(prompt)
+            except json.JSONDecodeError:
+                prompt_envelope = {}
+            turn_id = (
+                str(prompt_envelope.get("turn_id") or "")
+                if isinstance(prompt_envelope, Mapping)
+                else ""
+            )
+            argv = [self.executable, "chatgpt", "ask", prompt]
+            if self._conversation_id:
+                argv.extend(["--conversation", self._conversation_id])
+            else:
+                argv.append("--new")
+            argv.extend([
+                "--wait",
+                "true",
+                "--timeout",
+                str(self.timeout_seconds),
+                "--site-session",
+                self.site_session,
+                "-f",
+                "json",
+            ])
+            try:
+                stdout = self._run(argv)
+            except OpenCLIWebModelError as exc:
+                if str(exc) == "OPENCLI_WEB_BUSY":
+                    self._cooldown_and_probe_status()
+                if str(exc) != "OPENCLI_WEB_TIMEOUT" or not turn_id:
+                    raise
+                response = self._reconcile_timeout(turn_id)
+                response_finished = True
+                return response
+            conversation_id, _immediate_response = self._extract_ask_result(stdout)
+            if self._conversation_id and conversation_id != self._conversation_id:
+                raise OpenCLIWebModelError("OPENCLI_WEB_CONVERSATION_ID_MISMATCH")
+            self._conversation_id = conversation_id
+            response = self._detail_response(conversation_id, wait=True, turn_id=turn_id)
+            response_finished = True
+            return response
+        finally:
+            self._finish_web_turn(pacing_state, response_finished=response_finished)
 
     @staticmethod
     def _is_complete_protocol_response(response: str) -> bool:
@@ -462,6 +596,8 @@ class OpenCLIWebChatModel(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         del stop, run_manager
+        if self._web_turn_count >= _MAX_WEB_TURNS_PER_OPERATION:
+            raise OpenCLIWebModelError("OPENCLI_WEB_TURN_BUDGET_EXHAUSTED")
         tools = kwargs.get("tools") or []
         if not isinstance(tools, Sequence) or isinstance(tools, (str, bytes)):
             raise OpenCLIWebModelError("OPENCLI_WEB_TOOLS_INVALID")

@@ -189,11 +189,19 @@ def _build_model(
         profile = config.get("profile")
         site_session = config.get("site_session")
         timeout_seconds = config.get("timeout_seconds")
-        if not isinstance(executable, str) or not executable.strip() or "\x00" in executable:
+        if (
+            not isinstance(executable, str)
+            or not executable.strip()
+            or "\x00" in executable
+            or not Path(executable.strip()).is_absolute()
+        ):
             raise RuntimeErrorBounded("OPENCLI_WEB_TRANSPORT_CONFIG_INVALID")
-        if not isinstance(profile, str) or "\x00" in profile:
+        if not isinstance(profile, str) or not profile.strip() or "\x00" in profile:
             raise RuntimeErrorBounded("OPENCLI_WEB_TRANSPORT_CONFIG_INVALID")
-        if not isinstance(site_session, str) or not site_session.strip() or "\x00" in site_session:
+        if (
+            not isinstance(site_session, str)
+            or site_session.strip() not in {"ephemeral", "persistent"}
+        ):
             raise RuntimeErrorBounded("OPENCLI_WEB_TRANSPORT_CONFIG_INVALID")
         if (
             not isinstance(timeout_seconds, int)
@@ -204,7 +212,7 @@ def _build_model(
         return OpenCLIWebChatModel(
             executable=executable.strip(),
             intelligence_level=model_id,
-            profile=profile,
+            profile=profile.strip(),
             timeout_seconds=timeout_seconds,
             site_session=site_session.strip(),
         )
