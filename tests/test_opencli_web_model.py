@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -10,9 +16,17 @@ from langchain_core.tools import tool
 from nexus_open_swe_runtime import cli
 from nexus_open_swe_runtime import opencli_web_model as web_model
 from nexus_open_swe_runtime.opencli_web_model import (
+    _DURABLE_STATE_SCHEMA,
     OPENCLI_WEB_PROTOCOL,
+    DurablePacingBackend,
+    DurablePacingLock,
+    DurablePacingState,
     OpenCLIWebChatModel,
     OpenCLIWebModelError,
+    _durable_pacing_key,
+    _read_durable_state,
+    _validate_state_file,
+    _write_durable_state,
 )
 
 
@@ -50,35 +64,39 @@ def _fake_process(monkeypatch: pytest.MonkeyPatch, response: str):
             latest_prompt = args[3]
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([
-                    {
-                        "conversationId": "web-conversation-1",
-                        "conversationUrl": "https://chatgpt.com/c/web-conversation-1",
-                        "tool": "chatgpt",
-                        "response": "",
-                    }
-                ]),
+                stdout=json.dumps(
+                    [
+                        {
+                            "conversationId": "web-conversation-1",
+                            "conversationUrl": "https://chatgpt.com/c/web-conversation-1",
+                            "tool": "chatgpt",
+                            "response": "",
+                        }
+                    ]
+                ),
                 stderr="",
             )
         if args[1:3] == ["chatgpt", "detail"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([
-                    {
-                        "Index": 1,
-                        "Role": "User",
-                        "Text": latest_prompt,
-                        "Generating": False,
-                        "StableSeconds": 6,
-                    },
-                    {
-                        "Index": 2,
-                        "Role": "Assistant",
-                        "Text": response,
-                        "Generating": False,
-                        "StableSeconds": 6,
-                    },
-                ]),
+                stdout=json.dumps(
+                    [
+                        {
+                            "Index": 1,
+                            "Role": "User",
+                            "Text": latest_prompt,
+                            "Generating": False,
+                            "StableSeconds": 6,
+                        },
+                        {
+                            "Index": 2,
+                            "Role": "Assistant",
+                            "Text": response,
+                            "Generating": False,
+                            "StableSeconds": 6,
+                        },
+                    ]
+                ),
                 stderr="",
             )
         raise AssertionError(args)
@@ -258,15 +276,17 @@ def test_opencli_web_model_retries_idempotent_model_selection_once(
         if args[1:3] == ["chatgpt", "detail"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([
-                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
-                    {
-                        "Index": 2,
-                        "Role": "Assistant",
-                        "Text": '{"type":"final","content":"done"}',
-                        "Generating": False,
-                    },
-                ]),
+                stdout=json.dumps(
+                    [
+                        {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                        {
+                            "Index": 2,
+                            "Role": "Assistant",
+                            "Text": '{"type":"final","content":"done"}',
+                            "Generating": False,
+                        },
+                    ]
+                ),
                 stderr="",
             )
         raise AssertionError(args)
@@ -532,20 +552,22 @@ def test_opencli_web_model_serializes_shared_session_across_instances(
             conversation_id = args[3]
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([
-                    {
-                        "Index": 1,
-                        "Role": "User",
-                        "Text": prompts[conversation_id],
-                        "Generating": False,
-                    },
-                    {
-                        "Index": 2,
-                        "Role": "Assistant",
-                        "Text": '{"type":"final","content":"done"}',
-                        "Generating": False,
-                    },
-                ]),
+                stdout=json.dumps(
+                    [
+                        {
+                            "Index": 1,
+                            "Role": "User",
+                            "Text": prompts[conversation_id],
+                            "Generating": False,
+                        },
+                        {
+                            "Index": 2,
+                            "Role": "Assistant",
+                            "Text": '{"type":"final","content":"done"}',
+                            "Generating": False,
+                        },
+                    ]
+                ),
                 stderr="",
             )
         raise AssertionError(args)
@@ -692,15 +714,17 @@ def test_opencli_web_model_concurrent_budget_admission_is_atomic(
         if args[1:3] == ["chatgpt", "detail"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([
-                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
-                    {
-                        "Index": 2,
-                        "Role": "Assistant",
-                        "Text": '{"type":"final","content":"ok"}',
-                        "Generating": False,
-                    },
-                ]),
+                stdout=json.dumps(
+                    [
+                        {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                        {
+                            "Index": 2,
+                            "Role": "Assistant",
+                            "Text": '{"type":"final","content":"ok"}',
+                            "Generating": False,
+                        },
+                    ]
+                ),
                 stderr="",
             )
         raise AssertionError(args)
@@ -746,26 +770,30 @@ def test_opencli_web_model_rejects_conversation_identity_drift(
             conversation_id = "web-conversation-1" if calls == 1 else "web-conversation-2"
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([
-                    {
-                        "conversationId": conversation_id,
-                        "response": '{"type":"final","content":"done"}',
-                    }
-                ]),
+                stdout=json.dumps(
+                    [
+                        {
+                            "conversationId": conversation_id,
+                            "response": '{"type":"final","content":"done"}',
+                        }
+                    ]
+                ),
                 stderr="",
             )
         if args[1:3] == ["chatgpt", "detail"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([
-                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
-                    {
-                        "Index": 2,
-                        "Role": "Assistant",
-                        "Text": '{"type":"final","content":"done"}',
-                        "Generating": False,
-                    },
-                ]),
+                stdout=json.dumps(
+                    [
+                        {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                        {
+                            "Index": 2,
+                            "Role": "Assistant",
+                            "Text": '{"type":"final","content":"done"}',
+                            "Generating": False,
+                        },
+                    ]
+                ),
                 stderr="",
             )
         raise AssertionError(args)
@@ -811,10 +839,12 @@ def test_opencli_web_model_refreshes_incomplete_readback_without_redispatch(
             )
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([
-                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
-                    {"Index": 2, "Role": "Assistant", "Text": text, "Generating": False},
-                ]),
+                stdout=json.dumps(
+                    [
+                        {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                        {"Index": 2, "Role": "Assistant", "Text": text, "Generating": False},
+                    ]
+                ),
                 stderr="",
             )
         raise AssertionError(args)
@@ -871,10 +901,12 @@ def test_opencli_web_model_repairs_truncated_protocol_response_before_tool_execu
             )
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([
-                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
-                    {"Index": 2, "Role": "Assistant", "Text": text, "Generating": False},
-                ]),
+                stdout=json.dumps(
+                    [
+                        {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                        {"Index": 2, "Role": "Assistant", "Text": text, "Generating": False},
+                    ]
+                ),
                 stderr="",
             )
         raise AssertionError(args)
@@ -924,10 +956,12 @@ def test_opencli_web_model_protocol_repair_consumes_turn_budget_without_second_a
         if args[1:3] == ["chatgpt", "detail"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([
-                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
-                    {"Index": 2, "Role": "Assistant", "Text": "{", "Generating": False},
-                ]),
+                stdout=json.dumps(
+                    [
+                        {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                        {"Index": 2, "Role": "Assistant", "Text": "{", "Generating": False},
+                    ]
+                ),
                 stderr="",
             )
         raise AssertionError(args)
@@ -1010,12 +1044,14 @@ def test_opencli_web_model_reconciles_browser_timeout_without_redispatch(
             wait = args[args.index("--wait") + 1] if "--wait" in args else "false"
             rows = [{"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False}]
             if wait == "true":
-                rows.append({
-                    "Index": 2,
-                    "Role": "Assistant",
-                    "Text": '{"type":"final","content":"reconciled"}',
-                    "Generating": False,
-                })
+                rows.append(
+                    {
+                        "Index": 2,
+                        "Role": "Assistant",
+                        "Text": '{"type":"final","content":"reconciled"}',
+                        "Generating": False,
+                    }
+                )
             return SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr="")
         raise AssertionError(args)
 
@@ -1059,15 +1095,17 @@ def test_opencli_web_model_reconciles_bound_timeout_without_history_scan(
             assert args[3] == "bound-conversation"
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([
-                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
-                    {
-                        "Index": 2,
-                        "Role": "Assistant",
-                        "Text": '{"type":"final","content":"reconciled"}',
-                        "Generating": False,
-                    },
-                ]),
+                stdout=json.dumps(
+                    [
+                        {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                        {
+                            "Index": 2,
+                            "Role": "Assistant",
+                            "Text": '{"type":"final","content":"reconciled"}',
+                            "Generating": False,
+                        },
+                    ]
+                ),
                 stderr="",
             )
         raise AssertionError(args)
@@ -1097,25 +1135,6 @@ def test_opencli_web_model_fails_closed_on_process_error(monkeypatch: pytest.Mon
 
 # ---------------------------------------------------------------------------
 # Durable cross-process pacing tests
-# ---------------------------------------------------------------------------
-
-import multiprocessing
-import os
-import stat
-import subprocess
-import sys
-import tempfile
-
-from nexus_open_swe_runtime.opencli_web_model import (
-    DurablePacingBackend,
-    DurablePacingLock,
-    DurablePacingState,
-    _DURABLE_STATE_SCHEMA,
-    _durable_pacing_key,
-    _read_durable_state,
-    _validate_state_file,
-    _write_durable_state,
-)
 
 
 def _durable_pacing_dir(tmp_path):
@@ -1187,8 +1206,18 @@ def test_durable_pacing_validate_wrong_owner_fails_closed(tmp_path):
     path = os.path.join(pacing_dir, "state.json")
     # Write a valid-looking state file but with empty key (malformed)
     import json as _json
+
     with open(path, "w") as _f:
-        _json.dump({"schema": _DURABLE_STATE_SCHEMA, "key": "", "last_send_started": 0, "last_response_finished": 0}, _f)
+        _json.dump(
+            {
+                "schema": _DURABLE_STATE_SCHEMA,
+                "key": "",
+                "last_send_started": 0,
+                "last_response_finished": 0,
+            },
+            _f,
+        )
+    os.chmod(path, 0o600)
     with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_DURABLE_STATE_MALFORMED"):
         _validate_state_file(path)
 
@@ -1197,8 +1226,18 @@ def test_durable_pacing_validate_missing_schema_fails_closed(tmp_path):
     pacing_dir = _durable_pacing_dir(tmp_path)
     path = os.path.join(pacing_dir, "bad-schema.json")
     import json
+
     with open(path, "w") as f:
-        json.dump({"schema": "wrong-schema", "key": "k", "last_send_started": 0, "last_response_finished": 0}, f)
+        json.dump(
+            {
+                "schema": "wrong-schema",
+                "key": "k",
+                "last_send_started": 0,
+                "last_response_finished": 0,
+            },
+            f,
+        )
+    os.chmod(path, 0o600)
     with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_DURABLE_STATE_MALFORMED"):
         _validate_state_file(path)
 
@@ -1226,8 +1265,18 @@ def test_durable_pacing_validate_non_numeric_timestamps_fail_closed(tmp_path):
     pacing_dir = _durable_pacing_dir(tmp_path)
     path = os.path.join(pacing_dir, "bad-ts.json")
     import json
+
     with open(path, "w") as f:
-        json.dump({"schema": _DURABLE_STATE_SCHEMA, "key": "k", "last_send_started": "not-a-number", "last_response_finished": 0}, f)
+        json.dump(
+            {
+                "schema": _DURABLE_STATE_SCHEMA,
+                "key": "k",
+                "last_send_started": "not-a-number",
+                "last_response_finished": 0,
+            },
+            f,
+        )
+    os.chmod(path, 0o600)
     with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_DURABLE_STATE_MALFORMED"):
         _validate_state_file(path)
 
@@ -1244,8 +1293,17 @@ def test_durable_pacing_validate_unsafe_permission_fails_closed(tmp_path):
     pacing_dir = _durable_pacing_dir(tmp_path)
     path = os.path.join(pacing_dir, "unsafe.json")
     import json
+
     with open(path, "w") as f:
-        json.dump({"schema": _DURABLE_STATE_SCHEMA, "key": "k", "last_send_started": 0, "last_response_finished": 0}, f)
+        json.dump(
+            {
+                "schema": _DURABLE_STATE_SCHEMA,
+                "key": "k",
+                "last_send_started": 0,
+                "last_response_finished": 0,
+            },
+            f,
+        )
     os.chmod(path, 0o644)
     with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_DURABLE_STATE_UNSAFE"):
         _validate_state_file(path)
@@ -1253,8 +1311,17 @@ def test_durable_pacing_validate_unsafe_permission_fails_closed(tmp_path):
 
 def _write_d_state_raw(path, key):
     import json
+
     with open(path, "w") as f:
-        json.dump({"schema": _DURABLE_STATE_SCHEMA, "key": key, "last_send_started": 0, "last_response_finished": 0}, f)
+        json.dump(
+            {
+                "schema": _DURABLE_STATE_SCHEMA,
+                "key": key,
+                "last_send_started": 0,
+                "last_response_finished": 0,
+            },
+            f,
+        )
 
 
 def test_durable_pacing_lock_held_during_send(tmp_path):
@@ -1277,7 +1344,7 @@ def test_durable_pacing_lock_held_during_send(tmp_path):
         st = os.stat(lock_path)
         assert st.st_mode & 0o077 == 0
         assert ds.key == "lock-test"
-    assert not lock_held or True  # Lock released after context
+    assert lock_held
 
 
 def test_durable_pacing_across_processes_no_overlap(tmp_path):
@@ -1295,14 +1362,14 @@ def test_durable_pacing_across_processes_no_overlap(tmp_path):
 
     _write_durable_state(state_path, DurablePacingState(key="proc-test"))
 
-    script = f'''
+    script = f"""
 import fcntl, json, os, time, sys
 
-state_path = {state_path!r}
-lock_path = {lock_path!r}
-send_log = {send_log!r}
-release_marker = {release_marker!r}
-clock_time = {clock_time!r}
+state_path = {str(state_path)!r}
+lock_path = {str(lock_path)!r}
+send_log = {str(send_log)!r}
+release_marker = {str(release_marker)!r}
+clock_time = {str(clock_time)!r}
 my_id = sys.argv[1]
 
 # Read clock and compute eligible
@@ -1332,7 +1399,7 @@ while not os.path.exists(release_marker):
 
 fcntl.flock(fd, fcntl.LOCK_UN)
 os.close(fd)
-'''
+"""
     proc_script = tmp_path / "proc_worker.py"
     proc_script.write_text(script)
 
@@ -1386,14 +1453,14 @@ def test_durable_pacing_kill_owner_successor_respects_cooldown(tmp_path):
 
     _write_durable_state(state_path, DurablePacingState(key="kill-test", last_send_started=100.0))
 
-    script = f'''
+    script = f"""
 import fcntl, json, os, time, sys, signal
 
-state_path = {state_path!r}
-lock_path = {lock_path!r}
-send_log = {send_log!r}
-kill_marker = {kill_marker!r}
-clock_time = {clock_time!r}
+state_path = {str(state_path)!r}
+lock_path = {str(lock_path)!r}
+send_log = {str(send_log)!r}
+kill_marker = {str(kill_marker)!r}
+clock_time = {str(clock_time)!r}
 my_id = sys.argv[1]
 
 fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -1425,7 +1492,7 @@ else:
     # Release lock
     fcntl.flock(fd, fcntl.LOCK_UN)
     os.close(fd)
-'''
+"""
     proc_script = tmp_path / "kill_worker.py"
     proc_script.write_text(script)
 
@@ -1493,7 +1560,6 @@ def test_durable_pacing_different_keys_are_independent(tmp_path):
 
 def test_durable_pacing_model_with_runtime_state_root_initializes_backend(tmp_path):
     """Model with runtime_state_root and profile creates DurablePacingBackend."""
-    import time as _time
     model = OpenCLIWebChatModel(
         executable="/opt/opencli",
         intelligence_level="very-high",
@@ -1529,7 +1595,6 @@ def test_durable_pacing_model_without_runtime_state_root_has_no_backend():
 
 def test_durable_pacing_send_and_reconcile_uses_durable_backend(tmp_path, monkeypatch):
     """Durable pacing backend is used when runtime_state_root is set."""
-    import time as _time
     backend = DurablePacingBackend(
         str(tmp_path),
         executable="/opt/opencli",
@@ -1552,12 +1617,15 @@ def test_durable_pacing_send_and_reconcile_uses_durable_backend(tmp_path, monkey
     model._durable_pacing_backend._clock = clock
 
     ask_starts = []
+    latest_prompt = ""
 
     def fake_run(argv, **_kwargs):
         args = list(argv)
         if args[1:3] == ["chatgpt", "model"]:
             return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
         if args[1:3] == ["chatgpt", "ask"]:
+            nonlocal latest_prompt
+            latest_prompt = args[3]
             ask_starts.append(clock())
             return SimpleNamespace(
                 returncode=0,
@@ -1567,10 +1635,17 @@ def test_durable_pacing_send_and_reconcile_uses_durable_backend(tmp_path, monkey
         if args[1:3] == ["chatgpt", "detail"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([
-                    {"Index": 1, "Role": "User", "Text": "test", "Generating": False},
-                    {"Index": 2, "Role": "Assistant", "Text": '{"type":"final","content":"done"}', "Generating": False},
-                ]),
+                stdout=json.dumps(
+                    [
+                        {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                        {
+                            "Index": 2,
+                            "Role": "Assistant",
+                            "Text": '{"type":"final","content":"done"}',
+                            "Generating": False,
+                        },
+                    ]
+                ),
                 stderr="",
             )
         raise AssertionError(args)
@@ -1596,14 +1671,16 @@ def test_durable_pacing_successor_after_restart_respects_cooldown(tmp_path):
     """New process reads durable state and respects cooldown from predecessor."""
     pacing_dir = _durable_pacing_dir(tmp_path)
     state_path = os.path.join(pacing_dir, "restart-test.json")
-    lock_path = os.path.join(pacing_dir, "restart-test.lock")
 
     # Simulate predecessor sent at t=50.0
-    _write_durable_state(state_path, DurablePacingState(
-        key="restart-test",
-        last_send_started=50.0,
-        last_response_finished=45.0,
-    ))
+    _write_durable_state(
+        state_path,
+        DurablePacingState(
+            key="restart-test",
+            last_send_started=50.0,
+            last_response_finished=45.0,
+        ),
+    )
 
     # Simulate successor reading state at t=60.0 (10s after last send)
     # Should need to wait until t=65.0 (50.0 + 15.0)
@@ -1652,7 +1729,6 @@ def test_durable_pacing_restarts_same_root_preserves_state(tmp_path):
 
 def test_durable_pacing_no_duplicate_ask(monkeypatch):
     """Budget lock prevents duplicate asks even with durable pacing."""
-    import time as _time
     tmp_path_for_test = tempfile.mkdtemp()
     model = OpenCLIWebChatModel(
         executable="/opt/opencli",

@@ -13,15 +13,17 @@ REQUEST_SCHEMA = "nexus.open_swe_runtime.request.v1"
 RESULT_SCHEMA = "nexus.open_swe_runtime.result.v1"
 SEMANTIC_TOOLS = frozenset({"glob", "grep", "ls", "read_file", "record_finding"})
 DIAGNOSIS_TOOLS = frozenset({"glob", "grep", "ls", "read_file", "record_diagnosis"})
-REPAIR_TOOLS = frozenset({
-    "edit_file",
-    "glob",
-    "grep",
-    "ls",
-    "read_file",
-    "record_worker_result",
-    "write_file",
-})
+REPAIR_TOOLS = frozenset(
+    {
+        "edit_file",
+        "glob",
+        "grep",
+        "ls",
+        "read_file",
+        "record_worker_result",
+        "write_file",
+    }
+)
 
 
 class RuntimeErrorBounded(RuntimeError):
@@ -373,13 +375,15 @@ def _prompt_field(prompt: str, name: str) -> str:
 
 
 def _worker_result(task_id: str, unit_id: str, status: str, summary: str) -> str:
-    return _canonical_json({
-        "schema": "external_intelligence_worker_result.v1",
-        "task_id": task_id,
-        "unit_id": unit_id,
-        "status": status,
-        "summary": summary[:400],
-    })
+    return _canonical_json(
+        {
+            "schema": "external_intelligence_worker_result.v1",
+            "task_id": task_id,
+            "unit_id": unit_id,
+            "status": status,
+            "summary": summary[:400],
+        }
+    )
 
 
 def _deepagents_version() -> str:
@@ -491,7 +495,13 @@ def _semantic_run(
     started = _write_started(request, "semantic")
     try:
         runtime = runtime_loader()
-        model = model_factory(runtime, provider, model_id, request.get("transport_config"), request.get("runtime_state_root"))
+        model = model_factory(
+            runtime,
+            provider,
+            model_id,
+            request.get("transport_config"),
+            request.get("runtime_state_root"),
+        )
         graph = graph_factory(model, root, runtime, f"{provider}:{model_id}")
         if set(executable_tool_surface(graph)) != SEMANTIC_TOOLS:
             raise RuntimeErrorBounded("OPEN_SWE_TOOL_SURFACE_INVALID")
@@ -638,7 +648,13 @@ def _worker_run(
     try:
         task_id, unit_id, allowed_paths, session_id = _worker_context(request, prompt)
         runtime = runtime_loader()
-        model = model_factory(runtime, provider, model_id, request.get("transport_config"), request.get("runtime_state_root"))
+        model = model_factory(
+            runtime,
+            provider,
+            model_id,
+            request.get("transport_config"),
+            request.get("runtime_state_root"),
+        )
         profile_key = f"{provider}:{model_id}"
         diagnosis_graph = diagnosis_factory(model, workspace, runtime, profile_key)
         repair_graph = repair_factory(model, workspace, runtime, allowed_paths, profile_key)

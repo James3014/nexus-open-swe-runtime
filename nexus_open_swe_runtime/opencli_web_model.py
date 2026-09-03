@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
-import subprocess
 import stat
+import subprocess
 import tempfile
 import threading
 import time
@@ -130,9 +131,7 @@ _STATE_FILE_MODE = 0o600
 _LOCK_FILE_MODE = 0o600
 
 
-def _durable_pacing_key(
-    executable: str, profile: str, site_session: str
-) -> str:
+def _durable_pacing_key(executable: str, profile: str, site_session: str) -> str:
     """Hashed transport identity for durable pacing files."""
     material = f"{executable}\0{profile}\0{site_session}"
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
@@ -155,11 +154,18 @@ class DurablePacingLock:
     _fd: int = -1
 
     def acquire(self) -> None:
-        if _fcntl is None:
+        fcntl = _fcntl
+        if fcntl is None:
             raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_FLOCK_UNAVAILABLE")
-        self._fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        _validate_lock_file(self.lock_path)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        self._fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT | nofollow, _LOCK_FILE_MODE)
         try:
-            _fcntl.flock(self._fd, _fcntl.LOCK_EX)
+            os.fchmod(self._fd, _LOCK_FILE_MODE)
+            st = os.fstat(self._fd)
+            if st.st_uid != os.getuid() or not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077:
+                raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_LOCK_UNSAFE")
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
         except Exception:
             os.close(self._fd)
             self._fd = -1
@@ -168,7 +174,9 @@ class DurablePacingLock:
     def release(self) -> None:
         if self._fd >= 0:
             try:
-                _fcntl.flock(self._fd, _fcntl.LOCK_UN)
+                fcntl = _fcntl
+                if fcntl is not None:
+                    fcntl.flock(self._fd, fcntl.LOCK_UN)
             finally:
                 os.close(self._fd)
                 self._fd = -1
@@ -182,18 +190,39 @@ class DurablePacingLock:
 
 
 def _ensure_pacing_dir(pacing_dir: str) -> None:
+    if os.path.lexists(pacing_dir) and (
+        os.path.islink(pacing_dir) or not os.path.isdir(pacing_dir)
+    ):
+        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
     os.makedirs(pacing_dir, mode=_PACING_DIR_MODE, exist_ok=True)
     os.chmod(pacing_dir, _PACING_DIR_MODE)
+    st = os.stat(pacing_dir)
+    if st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
+
+
+def _validate_lock_file(path: str) -> None:
+    if not os.path.lexists(path):
+        return
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_LOCK_UNSAFE") from exc
+    if (
+        stat.S_ISLNK(st.st_mode)
+        or not stat.S_ISREG(st.st_mode)
+        or st.st_uid != os.getuid()
+        or st.st_mode & 0o077
+    ):
+        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_LOCK_UNSAFE")
 
 
 def _validate_state_file(path: str, *, clock: Callable[[], float] | None = None) -> None:
     """Fail-closed validation of a pacing state file before use."""
-    if not os.path.isfile(path):
+    if not os.path.lexists(path):
         return
-    if os.path.islink(path):
-        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
     try:
-        st = os.stat(path)
+        st = os.lstat(path)
     except OSError:
         return
     if stat.S_ISLNK(st.st_mode):
@@ -208,13 +237,13 @@ def _validate_state_file(path: str, *, clock: Callable[[], float] | None = None)
         try:
             raw = json.loads(_pathlib.Path(path).read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return
+            raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED")
     else:
         try:
             with open(path, encoding="utf-8") as fh:
                 raw = json.load(fh)
         except (OSError, ValueError):
-            return
+            raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED")
     if not isinstance(raw, Mapping):
         raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED")
     if raw.get("schema") != _DURABLE_STATE_SCHEMA:
@@ -223,7 +252,9 @@ def _validate_state_file(path: str, *, clock: Callable[[], float] | None = None)
         raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED")
     for field_name in ("last_send_started", "last_response_finished"):
         value = raw.get(field_name)
-        if not isinstance(value, (int, float)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED")
+        if not math.isfinite(float(value)) or value < 0:
             raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED")
     if clock is not None:
         now = clock()
@@ -278,6 +309,11 @@ def _write_durable_state(path: str, state: DurablePacingState) -> None:
         os.chmod(tmp, _STATE_FILE_MODE)
         os.replace(tmp, path)
         os.chmod(path, _STATE_FILE_MODE)
+        dir_fd = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     finally:
         try:
             os.unlink(tmp)
@@ -302,6 +338,15 @@ class DurablePacingBackend:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._key = _durable_pacing_key(executable, profile, site_session)
+        if os.path.lexists(runtime_state_root) and (
+            os.path.islink(runtime_state_root) or not os.path.isdir(runtime_state_root)
+        ):
+            raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
+        os.makedirs(runtime_state_root, mode=_PACING_DIR_MODE, exist_ok=True)
+        os.chmod(runtime_state_root, _PACING_DIR_MODE)
+        root_stat = os.stat(runtime_state_root)
+        if root_stat.st_uid != os.getuid() or root_stat.st_mode & 0o077:
+            raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
         pacing_dir = os.path.join(runtime_state_root, "pacing")
         _ensure_pacing_dir(pacing_dir)
         self._state_path = os.path.join(pacing_dir, f"{self._key}.json")
@@ -315,10 +360,12 @@ class DurablePacingBackend:
         lock.acquire()
         try:
             _validate_state_file(self._state_path, clock=self._clock)
-            yield _read_durable_state(self._state_path)
-        except BaseException:
+            state = _read_durable_state(self._state_path)
+            if state.key and state.key != self._key:
+                raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_IDENTITY_UNKNOWN")
+            yield state
+        finally:
             lock.release()
-            raise
 
     def release_send_lock(self, lock: DurablePacingLock) -> None:
         lock.release()
@@ -331,9 +378,14 @@ class DurablePacingBackend:
 
     def persisted_state(self) -> DurablePacingState:
         _validate_state_file(self._state_path, clock=self._clock)
-        return _read_durable_state(self._state_path)
+        state = _read_durable_state(self._state_path)
+        if state.key and state.key != self._key:
+            raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_IDENTITY_UNKNOWN")
+        return state
 
     def write_state(self, state: DurablePacingState) -> None:
+        if state.key != self._key:
+            raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_IDENTITY_UNKNOWN")
         _write_durable_state(self._state_path, state)
 
 
@@ -504,15 +556,17 @@ class OpenCLIWebChatModel(BaseChatModel):
 
     def _cooldown_and_probe_status(self) -> None:
         self._sleep(60.0)
-        self._run([
-            self.executable,
-            "chatgpt",
-            "status",
-            "--site-session",
-            self.site_session,
-            "-f",
-            "json",
-        ])
+        self._run(
+            [
+                self.executable,
+                "chatgpt",
+                "status",
+                "--site-session",
+                self.site_session,
+                "-f",
+                "json",
+            ]
+        )
         raise OpenCLIWebModelError("OPENCLI_WEB_BUSY")
 
     def _select_intelligence_level(self) -> None:
@@ -640,22 +694,24 @@ class OpenCLIWebChatModel(BaseChatModel):
 
     def _detail_response(self, conversation_id: str, *, wait: bool, turn_id: str = "") -> str:
         readback_timeout = max(self.timeout_seconds, 30) if wait else self.timeout_seconds
-        detail = self._run([
-            self.executable,
-            "chatgpt",
-            "detail",
-            conversation_id,
-            "--wait",
-            "true" if wait else "false",
-            "--timeout",
-            str(readback_timeout),
-            "--stable",
-            str(int(_POST_RESPONSE_SETTLE_SECONDS)),
-            "--site-session",
-            self.site_session,
-            "-f",
-            "json",
-        ])
+        detail = self._run(
+            [
+                self.executable,
+                "chatgpt",
+                "detail",
+                conversation_id,
+                "--wait",
+                "true" if wait else "false",
+                "--timeout",
+                str(readback_timeout),
+                "--stable",
+                str(int(_POST_RESPONSE_SETTLE_SECONDS)),
+                "--site-session",
+                self.site_session,
+                "-f",
+                "json",
+            ]
+        )
         return self._extract_detail_response(detail, turn_id)
 
     def _session_pacing_state(self) -> _PacingState:
@@ -724,29 +780,33 @@ class OpenCLIWebChatModel(BaseChatModel):
     def _reconcile_timeout(self, turn_id: str) -> str:
         if self._conversation_id:
             return self._detail_response(self._conversation_id, wait=True, turn_id=turn_id)
-        history = self._run([
-            self.executable,
-            "chatgpt",
-            "history",
-            "--site-session",
-            self.site_session,
-            "-f",
-            "json",
-        ])
-        matches: list[str] = []
-        for conversation_id in self._extract_history_ids(history):
-            detail = self._run([
+        history = self._run(
+            [
                 self.executable,
                 "chatgpt",
-                "detail",
-                conversation_id,
-                "--wait",
-                "false",
+                "history",
                 "--site-session",
                 self.site_session,
                 "-f",
                 "json",
-            ])
+            ]
+        )
+        matches: list[str] = []
+        for conversation_id in self._extract_history_ids(history):
+            detail = self._run(
+                [
+                    self.executable,
+                    "chatgpt",
+                    "detail",
+                    conversation_id,
+                    "--wait",
+                    "false",
+                    "--site-session",
+                    self.site_session,
+                    "-f",
+                    "json",
+                ]
+            )
             if turn_id in detail:
                 matches.append(conversation_id)
         if len(matches) != 1:
@@ -794,16 +854,18 @@ class OpenCLIWebChatModel(BaseChatModel):
             argv.extend(["--conversation", self._conversation_id])
         else:
             argv.append("--new")
-        argv.extend([
-            "--wait",
-            "true",
-            "--timeout",
-            str(self.timeout_seconds),
-            "--site-session",
-            self.site_session,
-            "-f",
-            "json",
-        ])
+        argv.extend(
+            [
+                "--wait",
+                "true",
+                "--timeout",
+                str(self.timeout_seconds),
+                "--site-session",
+                self.site_session,
+                "-f",
+                "json",
+            ]
+        )
         try:
             stdout = self._run(argv)
         except OpenCLIWebModelError as exc:
@@ -825,17 +887,18 @@ class OpenCLIWebChatModel(BaseChatModel):
 
     def _durable_send_and_reconcile(self, prompt: str) -> str:
         backend = self._durable_pacing_backend
-        assert backend is not None
+        if backend is None:
+            raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_BACKEND_UNAVAILABLE")
         response_ref = [False]
         with backend.acquire_send_lock() as durable_state:
             now = self._clock()
             eligible_at = now
-            if durable_state.last_send_started > 0:
+            if durable_state.key and durable_state.last_send_started >= 0:
                 eligible_at = max(
                     eligible_at,
                     durable_state.last_send_started + _DURABLE_MIN_SEND_INTERVAL,
                 )
-            if durable_state.last_response_finished > 0:
+            if durable_state.key and durable_state.last_response_finished >= 0:
                 eligible_at = max(
                     eligible_at,
                     durable_state.last_response_finished + _DURABLE_MIN_RESPONSE_SETTLE,
@@ -844,22 +907,19 @@ class OpenCLIWebChatModel(BaseChatModel):
                 self._sleep(eligible_at - now)
             send_time = self._clock()
             new_state = DurablePacingState(
-                key=durable_state.key,
+                key=backend._key,
                 last_send_started=send_time,
                 last_response_finished=durable_state.last_response_finished,
             )
             _write_durable_state(backend.state_path(), new_state)
-        try:
             response = self._execute_web_send(prompt, response_finished_ref=response_ref)
-        finally:
             if response_ref[0]:
-                with backend.acquire_send_lock() as fresh_state:
-                    finish_state = DurablePacingState(
-                        key=fresh_state.key,
-                        last_send_started=fresh_state.last_send_started,
-                        last_response_finished=self._clock(),
-                    )
-                    _write_durable_state(backend.state_path(), finish_state)
+                finish_state = DurablePacingState(
+                    key=new_state.key,
+                    last_send_started=new_state.last_send_started,
+                    last_response_finished=self._clock(),
+                )
+                _write_durable_state(backend.state_path(), finish_state)
         return response
 
     @staticmethod
