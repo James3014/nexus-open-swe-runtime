@@ -8,6 +8,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import tool
 from nexus_open_swe_runtime import cli
+from nexus_open_swe_runtime import opencli_web_model as web_model
 from nexus_open_swe_runtime.opencli_web_model import (
     OPENCLI_WEB_PROTOCOL,
     OpenCLIWebChatModel,
@@ -614,6 +615,31 @@ def test_opencli_web_model_session_gate_survives_registry_eviction_churn(
 
     assert first._session_pacing_state() is second._session_pacing_state()
     assert first._session_pacing_state() is original_state
+
+
+def test_opencli_web_model_existing_borrow_keeps_canonical_gate_over_capacity():
+    with web_model._PACING_STATES_LOCK:
+        web_model._PACING_STATES.clear()
+    key = ("/opt/opencli", "canonical-over-capacity", "persistent")
+    canonical = web_model._shared_pacing_state(key, borrow=True)
+    borrowed = [(key, canonical)]
+    for index in range(63):
+        other_key = ("/opt/opencli", f"borrowed-{index}", "persistent")
+        other = web_model._shared_pacing_state(other_key, borrow=True)
+        borrowed.append((other_key, other))
+    overflow_key = ("/opt/opencli", "overflow", "persistent")
+    with web_model._PACING_STATES_LOCK:
+        overflow = web_model._PacingState(borrowers=1)
+        web_model._PACING_STATES[overflow_key] = overflow
+    borrowed.append((overflow_key, overflow))
+
+    assert len(web_model._PACING_STATES) > web_model._MAX_PACING_SESSION_KEYS
+    assert web_model._shared_pacing_state(key, borrow=True) is canonical
+    assert web_model._PACING_STATES[key] is canonical
+
+    for borrowed_key, state in borrowed:
+        web_model._release_shared_pacing_state(borrowed_key, state)
+    web_model._release_shared_pacing_state(key, canonical)
 
 
 def test_opencli_web_model_turn_budget_stops_before_web_subprocess(

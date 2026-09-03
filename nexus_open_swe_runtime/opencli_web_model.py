@@ -75,6 +75,7 @@ def _shared_pacing_state(
 ) -> _PacingState:
     with _PACING_STATES_LOCK:
         state = _PACING_STATES.get(key)
+        created = state is None
         if state is None:
             state = _PacingState()
             state.clock = clock
@@ -85,7 +86,7 @@ def _shared_pacing_state(
             state.borrowers += 1
         if len(_PACING_STATES) > _MAX_PACING_SESSION_KEYS:
             _evict_idle_pacing_states(keep=key)
-            if len(_PACING_STATES) > _MAX_PACING_SESSION_KEYS:
+            if created and len(_PACING_STATES) > _MAX_PACING_SESSION_KEYS:
                 if borrow:
                     state.borrowers -= 1
                 del _PACING_STATES[key]
