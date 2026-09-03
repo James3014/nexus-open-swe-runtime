@@ -41,6 +41,7 @@ class _PacingState:
     borrowers: int = 0
     last_send_started: float | None = None
     last_response_finished: float | None = None
+    clock: Callable[[], float] = time.monotonic
 
 
 _MAX_PACING_SESSION_KEYS = 64
@@ -52,16 +53,31 @@ def _evict_idle_pacing_states(*, keep: tuple[str, str, str] | None = None) -> No
     for stale_key, stale_state in tuple(_PACING_STATES.items()):
         if stale_key == keep or stale_state.in_flight or stale_state.borrowers:
             continue
+        now = stale_state.clock()
+        if (
+            stale_state.last_send_started is not None
+            and now < stale_state.last_send_started + _MIN_WEB_SEND_INTERVAL_SECONDS
+        ) or (
+            stale_state.last_response_finished is not None
+            and now < stale_state.last_response_finished + _POST_RESPONSE_SETTLE_SECONDS
+        ):
+            continue
         del _PACING_STATES[stale_key]
         if len(_PACING_STATES) <= _MAX_PACING_SESSION_KEYS:
             break
 
 
-def _shared_pacing_state(key: tuple[str, str, str], *, borrow: bool = False) -> _PacingState:
+def _shared_pacing_state(
+    key: tuple[str, str, str],
+    *,
+    borrow: bool = False,
+    clock: Callable[[], float] = time.monotonic,
+) -> _PacingState:
     with _PACING_STATES_LOCK:
         state = _PACING_STATES.get(key)
         if state is None:
             state = _PacingState()
+            state.clock = clock
             _PACING_STATES[key] = state
         else:
             _PACING_STATES.move_to_end(key)
@@ -69,6 +85,11 @@ def _shared_pacing_state(key: tuple[str, str, str], *, borrow: bool = False) -> 
             state.borrowers += 1
         if len(_PACING_STATES) > _MAX_PACING_SESSION_KEYS:
             _evict_idle_pacing_states(keep=key)
+            if len(_PACING_STATES) > _MAX_PACING_SESSION_KEYS:
+                if borrow:
+                    state.borrowers -= 1
+                del _PACING_STATES[key]
+                raise OpenCLIWebModelError("OPENCLI_WEB_PACING_REGISTRY_EXHAUSTED")
         return state
 
 
@@ -164,6 +185,7 @@ class OpenCLIWebChatModel(BaseChatModel):
     _clock: Callable[[], float] = PrivateAttr(default=time.monotonic)
     _pacing_state: _PacingState = PrivateAttr(default_factory=_PacingState)
     _web_turn_count: int = PrivateAttr(default=0)
+    _budget_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
 
     @property
     def model_name(self) -> str:
@@ -268,7 +290,12 @@ class OpenCLIWebChatModel(BaseChatModel):
             if str(exc) != "OPENCLI_WEB_PROCESS_FAILURE":
                 raise
             self._sleep(10.0)
-            self._run(argv)
+            try:
+                self._run(argv)
+            except OpenCLIWebModelError as retry_exc:
+                if str(retry_exc) == "OPENCLI_WEB_BUSY":
+                    self._cooldown_and_probe_status()
+                raise
 
     def _render_prompt(
         self,
@@ -386,7 +413,7 @@ class OpenCLIWebChatModel(BaseChatModel):
     def _session_pacing_state(self) -> _PacingState:
         if not self.profile:
             return self._pacing_state
-        return _shared_pacing_state(self._pacing_key())
+        return _shared_pacing_state(self._pacing_key(), clock=self._clock)
 
     def _pacing_key(self) -> tuple[str, str, str]:
         return (self.executable, self.profile, self.site_session)
@@ -394,7 +421,7 @@ class OpenCLIWebChatModel(BaseChatModel):
     def _begin_web_turn(self) -> tuple[_PacingState, tuple[str, str, str] | None]:
         pacing_key = self._pacing_key() if self.profile else None
         state = (
-            _shared_pacing_state(pacing_key, borrow=True)
+            _shared_pacing_state(pacing_key, borrow=True, clock=self._clock)
             if pacing_key is not None
             else self._pacing_state
         )
@@ -403,8 +430,6 @@ class OpenCLIWebChatModel(BaseChatModel):
             with state.condition:
                 while state.in_flight:
                     state.condition.wait()
-                if self._web_turn_count >= _MAX_WEB_TURNS_PER_OPERATION:
-                    raise OpenCLIWebModelError("OPENCLI_WEB_TURN_BUDGET_EXHAUSTED")
                 state.in_flight = True
                 owns_inflight = True
                 now = self._clock()
@@ -423,7 +448,6 @@ class OpenCLIWebChatModel(BaseChatModel):
                 self._sleep(eligible_at - now)
             with state.condition:
                 state.last_send_started = self._clock()
-                self._web_turn_count += 1
             return state, pacing_key
         except BaseException:
             with state.condition:
@@ -482,7 +506,15 @@ class OpenCLIWebChatModel(BaseChatModel):
         self._conversation_id = matches[0]
         return self._detail_response(matches[0], wait=True, turn_id=turn_id)
 
-    def _send_and_reconcile(self, prompt: str) -> str:
+    def _reserve_web_turn(self) -> None:
+        with self._budget_lock:
+            if self._web_turn_count >= _MAX_WEB_TURNS_PER_OPERATION:
+                raise OpenCLIWebModelError("OPENCLI_WEB_TURN_BUDGET_EXHAUSTED")
+            self._web_turn_count += 1
+
+    def _send_and_reconcile(self, prompt: str, *, budget_reserved: bool = False) -> str:
+        if not budget_reserved:
+            self._reserve_web_turn()
         pacing_state, pacing_key = self._begin_web_turn()
         response_finished = False
         try:
@@ -632,8 +664,6 @@ class OpenCLIWebChatModel(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         del stop, run_manager
-        if self._web_turn_count >= _MAX_WEB_TURNS_PER_OPERATION:
-            raise OpenCLIWebModelError("OPENCLI_WEB_TURN_BUDGET_EXHAUSTED")
         tools = kwargs.get("tools") or []
         if not isinstance(tools, Sequence) or isinstance(tools, (str, bytes)):
             raise OpenCLIWebModelError("OPENCLI_WEB_TOOLS_INVALID")
@@ -644,10 +674,11 @@ class OpenCLIWebChatModel(BaseChatModel):
         if tool_choice is not None and not isinstance(tool_choice, str):
             raise OpenCLIWebModelError("OPENCLI_WEB_TOOL_CHOICE_INVALID")
 
+        self._reserve_web_turn()
         self._select_intelligence_level()
         prompt = self._render_prompt(messages, normalized_tools, tool_choice)
         turn_id = str(json.loads(prompt)["turn_id"])
-        response = self._send_and_reconcile(prompt)
+        response = self._send_and_reconcile(prompt, budget_reserved=True)
         response = self._refresh_protocol_response(response, turn_id=turn_id)
         if not self._is_complete_protocol_response(response):
             response = self._repair_protocol_response(response)

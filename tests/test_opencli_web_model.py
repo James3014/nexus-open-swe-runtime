@@ -343,6 +343,34 @@ def test_opencli_web_model_busy_cools_down_and_probes_status_without_retry(
     assert sleep_delays == [60.0]
 
 
+def test_opencli_web_model_busy_on_selector_retry_cools_down_without_third_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    commands: list[str] = []
+    sleep_delays: list[float] = []
+
+    def fake_run(argv, **_kwargs):
+        command = list(argv)[2]
+        commands.append(command)
+        if command == "model":
+            if commands.count("model") == 1:
+                return SimpleNamespace(returncode=1, stdout="", stderr="selector failed")
+            return SimpleNamespace(returncode=1, stdout="", stderr="rate control busy")
+        if command == "status":
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"Connected"}]', stderr="")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    model = OpenCLIWebChatModel()
+    model._sleep = sleep_delays.append
+
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_BUSY"):
+        model.invoke([HumanMessage(content="hello")])
+
+    assert commands == ["model", "model", "status"]
+    assert sleep_delays == [10.0, 60.0]
+
+
 def test_opencli_web_model_busy_ask_cools_down_without_redispatch(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -553,13 +581,22 @@ def test_opencli_web_model_serializes_shared_session_across_instances(
     assert max_active_asks == 1
 
 
-def test_opencli_web_model_session_gate_survives_registry_eviction_churn():
+def test_opencli_web_model_session_gate_survives_registry_eviction_churn(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _fake_process(monkeypatch, '{"type":"final","content":"done"}')
     first = OpenCLIWebChatModel(
         executable="/opt/opencli",
         profile="target-profile",
         site_session="persistent",
     )
+    clock = _FakeClock()
+    first._clock = clock
+    first._sleep = clock.sleep
+    first.invoke([HumanMessage(content="successful send")])
     original_state = first._session_pacing_state()
+    assert original_state.last_send_started == 0.0
+    assert original_state.last_response_finished == 0.0
 
     for index in range(65):
         churn = OpenCLIWebChatModel(
@@ -576,7 +613,7 @@ def test_opencli_web_model_session_gate_survives_registry_eviction_churn():
     )
 
     assert first._session_pacing_state() is second._session_pacing_state()
-    assert first._session_pacing_state() is not original_state
+    assert first._session_pacing_state() is original_state
 
 
 def test_opencli_web_model_turn_budget_stops_before_web_subprocess(
@@ -600,6 +637,65 @@ def test_opencli_web_model_turn_budget_stops_before_web_subprocess(
         model.invoke([HumanMessage(content="turn thirteen")])
 
     assert calls == 0
+
+
+def test_opencli_web_model_concurrent_budget_admission_is_atomic(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    model_calls = 0
+    ask_started = threading.Event()
+    release_ask = threading.Event()
+    errors: list[BaseException] = []
+    latest_prompt = ""
+
+    def fake_run(argv, **_kwargs):
+        nonlocal model_calls, latest_prompt
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            model_calls += 1
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            latest_prompt = args[3]
+            ask_started.set()
+            release_ask.wait(timeout=2)
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": "c", "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                        {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {"Index": 2, "Role": "Assistant", "Text": '{"type":"final","content":"ok"}', "Generating": False},
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    model = OpenCLIWebChatModel(profile="atomic-budget", site_session="persistent")
+    model._web_turn_count = 11
+
+    def invoke() -> None:
+        try:
+            model.invoke([HumanMessage(content="concurrent")])
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=invoke)
+    second = threading.Thread(target=invoke)
+    first.start()
+    assert ask_started.wait(timeout=1)
+    second.start()
+    second.join(timeout=1)
+    release_ask.set()
+    first.join(timeout=2)
+
+    assert len(errors) == 1
+    assert str(errors[0]) == "OPENCLI_WEB_TURN_BUDGET_EXHAUSTED"
+    assert model_calls == 1
 
 
 def test_opencli_web_model_rejects_conversation_identity_drift(
@@ -907,6 +1003,46 @@ def test_opencli_web_model_reconciles_browser_timeout_without_redispatch(
     assert result.content == "reconciled"
     assert ask_count == 1
     assert model._conversation_id == "web-conversation-1"
+
+
+def test_opencli_web_model_reconciles_bound_timeout_without_history_scan(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    commands: list[str] = []
+    latest_prompt = ""
+
+    def fake_run(argv, **_kwargs):
+        nonlocal latest_prompt
+        args = list(argv)
+        commands.append(args[2])
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="Browser exec command timed out; it may still complete in the browser.",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            assert args[3] == "bound-conversation"
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {"Index": 2, "Role": "Assistant", "Text": '{"type":"final","content":"reconciled"}', "Generating": False},
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model._conversation_id = "bound-conversation"
+
+    assert model.invoke([HumanMessage(content="bound timeout")]).content == "reconciled"
+    assert commands.count("ask") == 1
+    assert "history" not in commands
 
 
 def test_opencli_web_model_fails_closed_on_process_error(monkeypatch: pytest.MonkeyPatch):
