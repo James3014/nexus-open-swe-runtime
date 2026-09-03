@@ -27,11 +27,6 @@ try:
 except ImportError:
     _fcntl = None  # type: ignore[assignment]
 
-try:
-    import pathlib as _pathlib
-except ImportError:
-    _pathlib = None  # type: ignore[assignment]
-
 OPENCLI_WEB_PROTOCOL = "nexus.opencli_web_chat.v1"
 _ALLOWED_LEVELS = frozenset({"fast", "balanced", "advanced", "very-high", "pro"})
 _ALLOWED_SITE_SESSIONS = frozenset({"ephemeral", "persistent"})
@@ -85,7 +80,7 @@ def _shared_pacing_state(
     key: tuple[str, str, str],
     *,
     borrow: bool = False,
-    clock: Callable[[], float] = time.monotonic,
+    clock: Callable[[], float] = time.time,
 ) -> _PacingState:
     with _PACING_STATES_LOCK:
         state = _PACING_STATES.get(key)
@@ -233,17 +228,26 @@ def _validate_state_file(path: str, *, clock: Callable[[], float] | None = None)
         raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
     if st.st_uid != os.getuid():
         raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
-    if _pathlib is not None:
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         try:
-            raw = json.loads(_pathlib.Path(path).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED")
-    else:
-        try:
-            with open(path, encoding="utf-8") as fh:
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.getuid()
+                or opened.st_mode & 0o077
+            ):
+                raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
+            with os.fdopen(fd, encoding="utf-8") as fh:
+                fd = -1
                 raw = json.load(fh)
-        except (OSError, ValueError):
-            raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED")
+        finally:
+            if fd >= 0:
+                os.close(fd)
+    except OpenCLIWebModelError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED") from exc
     if not isinstance(raw, Mapping):
         raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED")
     if raw.get("schema") != _DURABLE_STATE_SCHEMA:
@@ -268,17 +272,20 @@ def _validate_state_file(path: str, *, clock: Callable[[], float] | None = None)
 
 
 def _read_durable_state(path: str) -> DurablePacingState:
-    if _pathlib is not None:
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         try:
-            raw = json.loads(_pathlib.Path(path).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return DurablePacingState()
-    else:
-        try:
-            with open(path, encoding="utf-8") as fh:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode) or opened.st_mode & 0o077:
+                return DurablePacingState()
+            with os.fdopen(fd, encoding="utf-8") as fh:
+                fd = -1
                 raw = json.load(fh)
-        except (OSError, ValueError):
-            return DurablePacingState()
+        finally:
+            if fd >= 0:
+                os.close(fd)
+    except (OSError, ValueError):
+        return DurablePacingState()
     if not isinstance(raw, Mapping):
         return DurablePacingState()
     if raw.get("schema") != _DURABLE_STATE_SCHEMA:
@@ -335,7 +342,7 @@ class DurablePacingBackend:
         executable: str,
         profile: str,
         site_session: str,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._key = _durable_pacing_key(executable, profile, site_session)
         if os.path.lexists(runtime_state_root) and (
@@ -470,7 +477,8 @@ class OpenCLIWebChatModel(BaseChatModel):
     runtime_state_root: str | None = None
     _conversation_id: str | None = PrivateAttr(default=None)
     _sleep: Callable[[float], None] = PrivateAttr(default=time.sleep)
-    _clock: Callable[[], float] = PrivateAttr(default=time.monotonic)
+    # Durable pacing uses epoch wall-clock timestamps so state survives reboot.
+    _clock: Callable[[], float] = PrivateAttr(default=time.time)
     _pacing_state: _PacingState = PrivateAttr(default_factory=_PacingState)
     _web_turn_count: int = PrivateAttr(default=0)
     _budget_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)

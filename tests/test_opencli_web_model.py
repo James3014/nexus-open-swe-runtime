@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -1438,6 +1439,234 @@ os.close(fd)
     t2 = float((send_log / "p2.txt").read_text().strip())
     # p2 acquired lock after p1 released, so send times should not overlap
     assert t2 >= t1
+
+
+def test_durable_backend_production_seam_serializes_real_processes(tmp_path):
+    """Child processes exercise DurablePacingBackend itself, not a lock clone."""
+    runtime_root = tmp_path / "runtime-state"
+    package_root = Path(__file__).resolve().parents[1]
+    log_dir = tmp_path / "log"
+    log_dir.mkdir()
+    script = f"""
+import sys, time
+sys.path.insert(0, {str(package_root)!r})
+from nexus_open_swe_runtime.opencli_web_model import DurablePacingBackend
+backend = DurablePacingBackend({str(runtime_root)!r}, executable='/opt/opencli', profile='p', site_session='persistent', clock=time.time)
+with backend.acquire_send_lock():
+    open({str(log_dir)!r} + '/' + sys.argv[1], 'w').write('held')
+    time.sleep(0.5)
+"""
+    worker = tmp_path / "worker.py"
+    worker.write_text(script)
+    p1 = subprocess.Popen([sys.executable, str(worker), "one"])
+    deadline = time.monotonic() + 5
+    while not (log_dir / "one").exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert (log_dir / "one").exists()
+    p2 = subprocess.Popen([sys.executable, str(worker), "two"])
+    time.sleep(0.1)
+    assert not (log_dir / "two").exists()
+    p1.wait(timeout=5)
+    p2.wait(timeout=5)
+    assert p1.returncode == p2.returncode == 0
+    assert (log_dir / "two").exists()
+
+
+def _write_mock_opencli(path: Path, log_path: Path) -> None:
+    path.write_text(
+        f"""#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+
+clock_path = pathlib.Path(os.environ["MOCK_CLOCK"])
+log_path = pathlib.Path({str(log_path)!r})
+command = sys.argv[2]
+if command == "model":
+    print('[{{"Status":"ok"}}]')
+elif command == "ask":
+    prompt = sys.argv[3]
+    now = float(clock_path.read_text())
+    log_path.with_suffix(".prompt").write_text(prompt, encoding="utf-8")
+    with log_path.open("a", encoding="utf-8") as fh:
+        fh.write(f"{{os.environ.get('MOCK_ID', '')}} ask {{now}}\\n")
+    if os.environ.get("MOCK_WAIT_FOR_KILL") == "1":
+        pathlib.Path(os.environ["MOCK_READY"]).touch()
+        while not pathlib.Path(os.environ["MOCK_RELEASE"]).exists():
+            time.sleep(0.01)
+    print(json.dumps([{{"conversationId":"mock-conversation","response":""}}]))
+elif command == "detail":
+    prompt = log_path.with_suffix(".prompt").read_text(encoding="utf-8")
+    print(json.dumps([{{"Role":"User","Text":prompt,"Generating":False}},
+                      {{"Role":"Assistant","Text":json.dumps({{"type":"final","content":"ok"}}),"Generating":False}}]))
+""",
+        encoding="utf-8",
+    )
+    path.chmod(0o700)
+
+
+def _write_production_worker(path: Path, package_root: Path) -> None:
+    path.write_text(
+        f"""import os, pathlib, sys
+sys.path.insert(0, {str(package_root)!r})
+from langchain_core.messages import HumanMessage
+from nexus_open_swe_runtime.opencli_web_model import OpenCLIWebChatModel
+
+clock_path = pathlib.Path(os.environ["MOCK_CLOCK"])
+def clock():
+    return float(clock_path.read_text())
+def sleeper(delay):
+    clock_path.write_text(str(clock() + delay))
+model = OpenCLIWebChatModel(
+    executable=os.environ["MOCK_EXECUTABLE"], profile=os.environ["MOCK_PROFILE"],
+    site_session="persistent", runtime_state_root=os.environ["MOCK_ROOT"],
+)
+model._clock = clock
+model._sleep = sleeper
+model._durable_pacing_backend._clock = clock
+model.invoke([HumanMessage(content="production pacing test")])
+""",
+        encoding="utf-8",
+    )
+
+
+def test_production_model_seam_paces_restart_and_kill_owner(tmp_path):
+    """Real workers invoke OpenCLIWebChatModel, with a mocked CLI executable."""
+    root = tmp_path / "runtime-state"
+    clock = tmp_path / "clock"
+    clock.write_text("0.0")
+    log = tmp_path / "asks.log"
+    executable = tmp_path / "mock-opencli"
+    worker = tmp_path / "worker.py"
+    package_root = Path(__file__).resolve().parents[1]
+    _write_mock_opencli(executable, log)
+    _write_production_worker(worker, package_root)
+
+    def launch(identifier: str, *, wait_for_kill: bool = False):
+        env = os.environ.copy()
+        env.update(
+            MOCK_CLOCK=str(clock),
+            MOCK_EXECUTABLE=str(executable),
+            MOCK_ROOT=str(root),
+            MOCK_PROFILE="shared-profile",
+            MOCK_ID=identifier,
+        )
+        if wait_for_kill:
+            env.update(
+                MOCK_WAIT_FOR_KILL="1",
+                MOCK_READY=str(tmp_path / "owner.ready"),
+                MOCK_RELEASE=str(tmp_path / "owner.release"),
+            )
+        return subprocess.Popen([sys.executable, str(worker)], env=env)
+
+    first = launch("first")
+    first.wait(timeout=10)
+    assert first.returncode == 0
+    second = launch("restart")
+    second.wait(timeout=10)
+    assert second.returncode == 0
+    starts = [float(line.split()[-1]) for line in log.read_text().splitlines()]
+    assert starts == [0.0, 15.0]
+
+    owner = launch("owner", wait_for_kill=True)
+    ready = tmp_path / "owner.ready"
+    deadline = time.monotonic() + 10
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ready.exists()
+    successor = launch("successor")
+    time.sleep(0.1)
+    assert successor.poll() is None
+    owner.kill()
+    owner.wait(timeout=10)
+    successor.wait(timeout=10)
+    assert successor.returncode == 0
+    starts = [float(line.split()[-1]) for line in log.read_text().splitlines()]
+    assert starts[-1] == 45.0
+
+
+def test_production_model_seam_distinct_keys_are_independent(tmp_path):
+    root = tmp_path / "runtime-state"
+    clock = tmp_path / "clock"
+    clock.write_text("0.0")
+    log = tmp_path / "asks.log"
+    executable = tmp_path / "mock-opencli"
+    worker = tmp_path / "worker.py"
+    package_root = Path(__file__).resolve().parents[1]
+    _write_mock_opencli(executable, log)
+    _write_production_worker(worker, package_root)
+    processes = []
+    for profile in ("profile-a", "profile-b"):
+        env = os.environ.copy()
+        env.update(
+            MOCK_CLOCK=str(clock),
+            MOCK_EXECUTABLE=str(executable),
+            MOCK_ROOT=str(root),
+            MOCK_PROFILE=profile,
+            MOCK_ID=profile,
+        )
+        processes.append(subprocess.Popen([sys.executable, str(worker)], env=env))
+    for process in processes:
+        process.wait(timeout=10)
+        assert process.returncode == 0
+    starts = [float(line.split()[-1]) for line in log.read_text().splitlines()]
+    assert starts == [0.0, 0.0]
+
+
+@pytest.mark.parametrize(
+    "corruption", ["malformed", "symlink", "wrong-mode", "identity", "future", "backward"]
+)
+def test_production_model_seam_rejects_unsafe_state_without_ask(tmp_path, corruption, monkeypatch):
+    root = tmp_path / "runtime-state"
+    clock = tmp_path / "clock"
+    clock.write_text("100.0")
+    log = tmp_path / "asks.log"
+    executable = tmp_path / "mock-opencli"
+    worker = tmp_path / "worker.py"
+    package_root = Path(__file__).resolve().parents[1]
+    _write_mock_opencli(executable, log)
+    _write_production_worker(worker, package_root)
+    monkeypatch.setenv("MOCK_CLOCK", str(clock))
+    model = OpenCLIWebChatModel(
+        executable=str(executable),
+        profile="profile",
+        site_session="persistent",
+        runtime_state_root=str(root),
+    )
+    backend = model._durable_pacing_backend
+    assert backend is not None
+    state = Path(backend.state_path())
+    if corruption == "malformed":
+        state.write_text("not-json")
+    elif corruption == "symlink":
+        _write_durable_state(state, DurablePacingState(key=backend._key))
+        state.unlink()
+        target = tmp_path / "target"
+        target.write_text("{}")
+        state.symlink_to(target)
+    elif corruption == "wrong-mode":
+        _write_durable_state(state, DurablePacingState(key=backend._key))
+        state.chmod(0o644)
+    elif corruption == "identity":
+        state.write_text(
+            json.dumps(
+                {
+                    "schema": _DURABLE_STATE_SCHEMA,
+                    "key": "other",
+                    "last_send_started": 0,
+                    "last_response_finished": 0,
+                }
+            )
+        )
+        state.chmod(0o600)
+    elif corruption == "future":
+        _write_durable_state(state, DurablePacingState(key=backend._key, last_send_started=1000.0))
+    else:
+        _write_durable_state(state, DurablePacingState(key=backend._key, last_send_started=100.0))
+        clock.write_text("100000.0")
+    model._clock = lambda: float(clock.read_text())
+    model._durable_pacing_backend._clock = model._clock
+    with pytest.raises(OpenCLIWebModelError):
+        model.invoke([HumanMessage(content="must not ask")])
+    assert not log.exists() or " ask " not in log.read_text()
 
 
 def test_durable_pacing_kill_owner_successor_respects_cooldown(tmp_path):
