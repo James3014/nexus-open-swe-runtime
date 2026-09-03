@@ -65,39 +65,35 @@ def _fake_process(monkeypatch: pytest.MonkeyPatch, response: str):
             latest_prompt = args[3]
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps(
-                    [
-                        {
-                            "conversationId": "web-conversation-1",
-                            "conversationUrl": "https://chatgpt.com/c/web-conversation-1",
-                            "tool": "chatgpt",
-                            "response": "",
-                        }
-                    ]
-                ),
+                stdout=json.dumps([
+                    {
+                        "conversationId": "web-conversation-1",
+                        "conversationUrl": "https://chatgpt.com/c/web-conversation-1",
+                        "tool": "chatgpt",
+                        "response": "",
+                    }
+                ]),
                 stderr="",
             )
         if args[1:3] == ["chatgpt", "detail"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps(
-                    [
-                        {
-                            "Index": 1,
-                            "Role": "User",
-                            "Text": latest_prompt,
-                            "Generating": False,
-                            "StableSeconds": 6,
-                        },
-                        {
-                            "Index": 2,
-                            "Role": "Assistant",
-                            "Text": response,
-                            "Generating": False,
-                            "StableSeconds": 6,
-                        },
-                    ]
-                ),
+                stdout=json.dumps([
+                    {
+                        "Index": 1,
+                        "Role": "User",
+                        "Text": latest_prompt,
+                        "Generating": False,
+                        "StableSeconds": 6,
+                    },
+                    {
+                        "Index": 2,
+                        "Role": "Assistant",
+                        "Text": response,
+                        "Generating": False,
+                        "StableSeconds": 6,
+                    },
+                ]),
                 stderr="",
             )
         raise AssertionError(args)
@@ -277,17 +273,15 @@ def test_opencli_web_model_retries_idempotent_model_selection_once(
         if args[1:3] == ["chatgpt", "detail"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps(
-                    [
-                        {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
-                        {
-                            "Index": 2,
-                            "Role": "Assistant",
-                            "Text": '{"type":"final","content":"done"}',
-                            "Generating": False,
-                        },
-                    ]
-                ),
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {
+                        "Index": 2,
+                        "Role": "Assistant",
+                        "Text": '{"type":"final","content":"done"}',
+                        "Generating": False,
+                    },
+                ]),
                 stderr="",
             )
         raise AssertionError(args)
@@ -553,22 +547,20 @@ def test_opencli_web_model_serializes_shared_session_across_instances(
             conversation_id = args[3]
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps(
-                    [
-                        {
-                            "Index": 1,
-                            "Role": "User",
-                            "Text": prompts[conversation_id],
-                            "Generating": False,
-                        },
-                        {
-                            "Index": 2,
-                            "Role": "Assistant",
-                            "Text": '{"type":"final","content":"done"}',
-                            "Generating": False,
-                        },
-                    ]
-                ),
+                stdout=json.dumps([
+                    {
+                        "Index": 1,
+                        "Role": "User",
+                        "Text": prompts[conversation_id],
+                        "Generating": False,
+                    },
+                    {
+                        "Index": 2,
+                        "Role": "Assistant",
+                        "Text": '{"type":"final","content":"done"}',
+                        "Generating": False,
+                    },
+                ]),
                 stderr="",
             )
         raise AssertionError(args)
@@ -715,17 +707,15 @@ def test_opencli_web_model_concurrent_budget_admission_is_atomic(
         if args[1:3] == ["chatgpt", "detail"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps(
-                    [
-                        {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
-                        {
-                            "Index": 2,
-                            "Role": "Assistant",
-                            "Text": '{"type":"final","content":"ok"}',
-                            "Generating": False,
-                        },
-                    ]
-                ),
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {
+                        "Index": 2,
+                        "Role": "Assistant",
+                        "Text": '{"type":"final","content":"ok"}',
+                        "Generating": False,
+                    },
+                ]),
                 stderr="",
             )
         raise AssertionError(args)
@@ -771,30 +761,26 @@ def test_opencli_web_model_rejects_conversation_identity_drift(
             conversation_id = "web-conversation-1" if calls == 1 else "web-conversation-2"
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps(
-                    [
-                        {
-                            "conversationId": conversation_id,
-                            "response": '{"type":"final","content":"done"}',
-                        }
-                    ]
-                ),
+                stdout=json.dumps([
+                    {
+                        "conversationId": conversation_id,
+                        "response": '{"type":"final","content":"done"}',
+                    }
+                ]),
                 stderr="",
             )
         if args[1:3] == ["chatgpt", "detail"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps(
-                    [
-                        {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
-                        {
-                            "Index": 2,
-                            "Role": "Assistant",
-                            "Text": '{"type":"final","content":"done"}',
-                            "Generating": False,
-                        },
-                    ]
-                ),
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {
+                        "Index": 2,
+                        "Role": "Assistant",
+                        "Text": '{"type":"final","content":"done"}',
+                        "Generating": False,
+                    },
+                ]),
                 stderr="",
             )
         raise AssertionError(args)
@@ -840,12 +826,10 @@ def test_opencli_web_model_refreshes_incomplete_readback_without_redispatch(
             )
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps(
-                    [
-                        {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
-                        {"Index": 2, "Role": "Assistant", "Text": text, "Generating": False},
-                    ]
-                ),
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {"Index": 2, "Role": "Assistant", "Text": text, "Generating": False},
+                ]),
                 stderr="",
             )
         raise AssertionError(args)
@@ -902,12 +886,10 @@ def test_opencli_web_model_repairs_truncated_protocol_response_before_tool_execu
             )
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps(
-                    [
-                        {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
-                        {"Index": 2, "Role": "Assistant", "Text": text, "Generating": False},
-                    ]
-                ),
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {"Index": 2, "Role": "Assistant", "Text": text, "Generating": False},
+                ]),
                 stderr="",
             )
         raise AssertionError(args)
@@ -957,12 +939,10 @@ def test_opencli_web_model_protocol_repair_consumes_turn_budget_without_second_a
         if args[1:3] == ["chatgpt", "detail"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps(
-                    [
-                        {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
-                        {"Index": 2, "Role": "Assistant", "Text": "{", "Generating": False},
-                    ]
-                ),
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {"Index": 2, "Role": "Assistant", "Text": "{", "Generating": False},
+                ]),
                 stderr="",
             )
         raise AssertionError(args)
@@ -1045,14 +1025,12 @@ def test_opencli_web_model_reconciles_browser_timeout_without_redispatch(
             wait = args[args.index("--wait") + 1] if "--wait" in args else "false"
             rows = [{"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False}]
             if wait == "true":
-                rows.append(
-                    {
-                        "Index": 2,
-                        "Role": "Assistant",
-                        "Text": '{"type":"final","content":"reconciled"}',
-                        "Generating": False,
-                    }
-                )
+                rows.append({
+                    "Index": 2,
+                    "Role": "Assistant",
+                    "Text": '{"type":"final","content":"reconciled"}',
+                    "Generating": False,
+                })
             return SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr="")
         raise AssertionError(args)
 
@@ -1096,17 +1074,15 @@ def test_opencli_web_model_reconciles_bound_timeout_without_history_scan(
             assert args[3] == "bound-conversation"
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps(
-                    [
-                        {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
-                        {
-                            "Index": 2,
-                            "Role": "Assistant",
-                            "Text": '{"type":"final","content":"reconciled"}',
-                            "Generating": False,
-                        },
-                    ]
-                ),
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {
+                        "Index": 2,
+                        "Role": "Assistant",
+                        "Text": '{"type":"final","content":"reconciled"}',
+                        "Generating": False,
+                    },
+                ]),
                 stderr="",
             )
         raise AssertionError(args)
@@ -1680,14 +1656,12 @@ def test_production_model_seam_rejects_unsafe_state_without_ask(tmp_path, corrup
         state.chmod(0o644)
     elif corruption == "identity":
         state.write_text(
-            json.dumps(
-                {
-                    "schema": _DURABLE_STATE_SCHEMA,
-                    "key": "other",
-                    "last_send_started": 0,
-                    "last_response_finished": 0,
-                }
-            )
+            json.dumps({
+                "schema": _DURABLE_STATE_SCHEMA,
+                "key": "other",
+                "last_send_started": 0,
+                "last_response_finished": 0,
+            })
         )
         state.chmod(0o600)
     elif corruption == "future":
@@ -1899,17 +1873,15 @@ def test_durable_pacing_send_and_reconcile_uses_durable_backend(tmp_path, monkey
         if args[1:3] == ["chatgpt", "detail"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps(
-                    [
-                        {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
-                        {
-                            "Index": 2,
-                            "Role": "Assistant",
-                            "Text": '{"type":"final","content":"done"}',
-                            "Generating": False,
-                        },
-                    ]
-                ),
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {
+                        "Index": 2,
+                        "Role": "Assistant",
+                        "Text": '{"type":"final","content":"done"}',
+                        "Generating": False,
+                    },
+                ]),
                 stderr="",
             )
         raise AssertionError(args)

@@ -567,17 +567,15 @@ class OpenCLIWebChatModel(BaseChatModel):
 
     def _cooldown_and_probe_status(self) -> None:
         self._sleep(60.0)
-        self._run(
-            [
-                self.executable,
-                "chatgpt",
-                "status",
-                "--site-session",
-                self.site_session,
-                "-f",
-                "json",
-            ]
-        )
+        self._run([
+            self.executable,
+            "chatgpt",
+            "status",
+            "--site-session",
+            self.site_session,
+            "-f",
+            "json",
+        ])
         raise OpenCLIWebModelError("OPENCLI_WEB_BUSY")
 
     def _select_intelligence_level(self) -> None:
@@ -705,24 +703,22 @@ class OpenCLIWebChatModel(BaseChatModel):
 
     def _detail_response(self, conversation_id: str, *, wait: bool, turn_id: str = "") -> str:
         readback_timeout = max(self.timeout_seconds, 30) if wait else self.timeout_seconds
-        detail = self._run(
-            [
-                self.executable,
-                "chatgpt",
-                "detail",
-                conversation_id,
-                "--wait",
-                "true" if wait else "false",
-                "--timeout",
-                str(readback_timeout),
-                "--stable",
-                str(int(_POST_RESPONSE_SETTLE_SECONDS)),
-                "--site-session",
-                self.site_session,
-                "-f",
-                "json",
-            ]
-        )
+        detail = self._run([
+            self.executable,
+            "chatgpt",
+            "detail",
+            conversation_id,
+            "--wait",
+            "true" if wait else "false",
+            "--timeout",
+            str(readback_timeout),
+            "--stable",
+            str(int(_POST_RESPONSE_SETTLE_SECONDS)),
+            "--site-session",
+            self.site_session,
+            "-f",
+            "json",
+        ])
         return self._extract_detail_response(detail, turn_id)
 
     def _session_pacing_state(self) -> _PacingState:
@@ -791,33 +787,29 @@ class OpenCLIWebChatModel(BaseChatModel):
     def _reconcile_timeout(self, turn_id: str) -> str:
         if self._conversation_id:
             return self._detail_response(self._conversation_id, wait=True, turn_id=turn_id)
-        history = self._run(
-            [
+        history = self._run([
+            self.executable,
+            "chatgpt",
+            "history",
+            "--site-session",
+            self.site_session,
+            "-f",
+            "json",
+        ])
+        matches: list[str] = []
+        for conversation_id in self._extract_history_ids(history):
+            detail = self._run([
                 self.executable,
                 "chatgpt",
-                "history",
+                "detail",
+                conversation_id,
+                "--wait",
+                "false",
                 "--site-session",
                 self.site_session,
                 "-f",
                 "json",
-            ]
-        )
-        matches: list[str] = []
-        for conversation_id in self._extract_history_ids(history):
-            detail = self._run(
-                [
-                    self.executable,
-                    "chatgpt",
-                    "detail",
-                    conversation_id,
-                    "--wait",
-                    "false",
-                    "--site-session",
-                    self.site_session,
-                    "-f",
-                    "json",
-                ]
-            )
+            ])
             if turn_id in detail:
                 matches.append(conversation_id)
         if len(matches) != 1:
@@ -865,18 +857,16 @@ class OpenCLIWebChatModel(BaseChatModel):
             argv.extend(["--conversation", self._conversation_id])
         else:
             argv.append("--new")
-        argv.extend(
-            [
-                "--wait",
-                "true",
-                "--timeout",
-                str(self.timeout_seconds),
-                "--site-session",
-                self.site_session,
-                "-f",
-                "json",
-            ]
-        )
+        argv.extend([
+            "--wait",
+            "true",
+            "--timeout",
+            str(self.timeout_seconds),
+            "--site-session",
+            self.site_session,
+            "-f",
+            "json",
+        ])
         try:
             stdout = self._run(argv)
         except OpenCLIWebModelError as exc:
