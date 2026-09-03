@@ -553,6 +553,32 @@ def test_opencli_web_model_serializes_shared_session_across_instances(
     assert max_active_asks == 1
 
 
+def test_opencli_web_model_session_gate_survives_registry_eviction_churn():
+    first = OpenCLIWebChatModel(
+        executable="/opt/opencli",
+        profile="target-profile",
+        site_session="persistent",
+    )
+    original_state = first._session_pacing_state()
+
+    for index in range(65):
+        churn = OpenCLIWebChatModel(
+            executable="/opt/opencli",
+            profile=f"churn-profile-{index}",
+            site_session="persistent",
+        )
+        churn._session_pacing_state()
+
+    second = OpenCLIWebChatModel(
+        executable="/opt/opencli",
+        profile="target-profile",
+        site_session="persistent",
+    )
+
+    assert first._session_pacing_state() is second._session_pacing_state()
+    assert first._session_pacing_state() is not original_state
+
+
 def test_opencli_web_model_turn_budget_stops_before_web_subprocess(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -691,6 +717,9 @@ def test_opencli_web_model_repairs_truncated_protocol_response_before_tool_execu
 ):
     ask_count = 0
     latest_prompt = ""
+    ask_prompts: list[str] = []
+    ask_starts: list[float] = []
+    clock = _FakeClock()
 
     def fake_run(argv, **_kwargs):
         nonlocal ask_count, latest_prompt
@@ -700,6 +729,8 @@ def test_opencli_web_model_repairs_truncated_protocol_response_before_tool_execu
         if args[1:3] == ["chatgpt", "ask"]:
             ask_count += 1
             latest_prompt = args[3]
+            ask_prompts.append(latest_prompt)
+            ask_starts.append(clock())
             return SimpleNamespace(
                 returncode=0,
                 stdout=json.dumps([{"conversationId": "web-conversation-1", "response": ""}]),
@@ -732,10 +763,14 @@ def test_opencli_web_model_repairs_truncated_protocol_response_before_tool_execu
         return file_path
 
     model = OpenCLIWebChatModel(executable="/opt/opencli", intelligence_level="very-high")
-    _use_fake_clock(model)
+    model._clock = clock
+    model._sleep = clock.sleep
     result = model.bind_tools([read_file]).invoke("inspect README")
 
     assert ask_count == 2
+    assert ask_starts == [0.0, 15.0]
+    assert json.loads(ask_prompts[1])["turn_id"].startswith("turn_repair_")
+    assert model._web_turn_count == 2
     assert result.tool_calls[0]["name"] == "read_file"
     assert result.tool_calls[0]["args"] == {"file_path": "README.md"}
 

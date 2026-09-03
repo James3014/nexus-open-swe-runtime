@@ -38,6 +38,7 @@ _MAX_WEB_TURNS_PER_OPERATION = 12
 class _PacingState:
     condition: threading.Condition = field(default_factory=threading.Condition)
     in_flight: bool = False
+    borrowers: int = 0
     last_send_started: float | None = None
     last_response_finished: float | None = None
 
@@ -47,7 +48,16 @@ _PACING_STATES_LOCK = threading.Lock()
 _PACING_STATES: OrderedDict[tuple[str, str, str], _PacingState] = OrderedDict()
 
 
-def _shared_pacing_state(key: tuple[str, str, str]) -> _PacingState:
+def _evict_idle_pacing_states(*, keep: tuple[str, str, str] | None = None) -> None:
+    for stale_key, stale_state in tuple(_PACING_STATES.items()):
+        if stale_key == keep or stale_state.in_flight or stale_state.borrowers:
+            continue
+        del _PACING_STATES[stale_key]
+        if len(_PACING_STATES) <= _MAX_PACING_SESSION_KEYS:
+            break
+
+
+def _shared_pacing_state(key: tuple[str, str, str], *, borrow: bool = False) -> _PacingState:
     with _PACING_STATES_LOCK:
         state = _PACING_STATES.get(key)
         if state is None:
@@ -55,14 +65,20 @@ def _shared_pacing_state(key: tuple[str, str, str]) -> _PacingState:
             _PACING_STATES[key] = state
         else:
             _PACING_STATES.move_to_end(key)
+        if borrow:
+            state.borrowers += 1
         if len(_PACING_STATES) > _MAX_PACING_SESSION_KEYS:
-            for stale_key, stale_state in tuple(_PACING_STATES.items()):
-                if stale_key == key or stale_state.in_flight:
-                    continue
-                del _PACING_STATES[stale_key]
-                if len(_PACING_STATES) <= _MAX_PACING_SESSION_KEYS:
-                    break
+            _evict_idle_pacing_states(keep=key)
         return state
+
+
+def _release_shared_pacing_state(key: tuple[str, str, str], state: _PacingState) -> None:
+    with _PACING_STATES_LOCK:
+        if state.borrowers <= 0:
+            raise RuntimeError("OPENCLI_WEB_PACING_BORROW_UNDERFLOW")
+        state.borrowers -= 1
+        if len(_PACING_STATES) > _MAX_PACING_SESSION_KEYS:
+            _evict_idle_pacing_states()
 
 
 class OpenCLIWebModelError(RuntimeError):
@@ -147,7 +163,6 @@ class OpenCLIWebChatModel(BaseChatModel):
     _sleep: Callable[[float], None] = PrivateAttr(default=time.sleep)
     _clock: Callable[[], float] = PrivateAttr(default=time.monotonic)
     _pacing_state: _PacingState = PrivateAttr(default_factory=_PacingState)
-    _bound_pacing_state: _PacingState | None = PrivateAttr(default=None)
     _web_turn_count: int = PrivateAttr(default=0)
 
     @property
@@ -371,51 +386,68 @@ class OpenCLIWebChatModel(BaseChatModel):
     def _session_pacing_state(self) -> _PacingState:
         if not self.profile:
             return self._pacing_state
-        if self._bound_pacing_state is None:
-            self._bound_pacing_state = _shared_pacing_state(
-                (self.executable, self.profile, self.site_session)
-            )
-        return self._bound_pacing_state
+        return _shared_pacing_state(self._pacing_key())
 
-    def _begin_web_turn(self) -> _PacingState:
-        state = self._session_pacing_state()
-        with state.condition:
-            while state.in_flight:
-                state.condition.wait()
-            if self._web_turn_count >= _MAX_WEB_TURNS_PER_OPERATION:
-                raise OpenCLIWebModelError("OPENCLI_WEB_TURN_BUDGET_EXHAUSTED")
-            state.in_flight = True
-            now = self._clock()
-            eligible_at = now
-            if state.last_send_started is not None:
-                eligible_at = max(
-                    eligible_at,
-                    state.last_send_started + _MIN_WEB_SEND_INTERVAL_SECONDS,
-                )
-            if state.last_response_finished is not None:
-                eligible_at = max(
-                    eligible_at,
-                    state.last_response_finished + _POST_RESPONSE_SETTLE_SECONDS,
-                )
+    def _pacing_key(self) -> tuple[str, str, str]:
+        return (self.executable, self.profile, self.site_session)
+
+    def _begin_web_turn(self) -> tuple[_PacingState, tuple[str, str, str] | None]:
+        pacing_key = self._pacing_key() if self.profile else None
+        state = (
+            _shared_pacing_state(pacing_key, borrow=True)
+            if pacing_key is not None
+            else self._pacing_state
+        )
+        owns_inflight = False
         try:
+            with state.condition:
+                while state.in_flight:
+                    state.condition.wait()
+                if self._web_turn_count >= _MAX_WEB_TURNS_PER_OPERATION:
+                    raise OpenCLIWebModelError("OPENCLI_WEB_TURN_BUDGET_EXHAUSTED")
+                state.in_flight = True
+                owns_inflight = True
+                now = self._clock()
+                eligible_at = now
+                if state.last_send_started is not None:
+                    eligible_at = max(
+                        eligible_at,
+                        state.last_send_started + _MIN_WEB_SEND_INTERVAL_SECONDS,
+                    )
+                if state.last_response_finished is not None:
+                    eligible_at = max(
+                        eligible_at,
+                        state.last_response_finished + _POST_RESPONSE_SETTLE_SECONDS,
+                    )
             if eligible_at > now:
                 self._sleep(eligible_at - now)
             with state.condition:
                 state.last_send_started = self._clock()
                 self._web_turn_count += 1
-            return state
+            return state, pacing_key
         except BaseException:
             with state.condition:
-                state.in_flight = False
-                state.condition.notify_all()
+                if owns_inflight:
+                    state.in_flight = False
+                    state.condition.notify_all()
+            if pacing_key is not None:
+                _release_shared_pacing_state(pacing_key, state)
             raise
 
-    def _finish_web_turn(self, state: _PacingState, *, response_finished: bool) -> None:
+    def _finish_web_turn(
+        self,
+        state: _PacingState,
+        pacing_key: tuple[str, str, str] | None,
+        *,
+        response_finished: bool,
+    ) -> None:
         with state.condition:
             if response_finished:
                 state.last_response_finished = self._clock()
             state.in_flight = False
             state.condition.notify_all()
+        if pacing_key is not None:
+            _release_shared_pacing_state(pacing_key, state)
 
     def _reconcile_timeout(self, turn_id: str) -> str:
         if self._conversation_id:
@@ -451,7 +483,7 @@ class OpenCLIWebChatModel(BaseChatModel):
         return self._detail_response(matches[0], wait=True, turn_id=turn_id)
 
     def _send_and_reconcile(self, prompt: str) -> str:
-        pacing_state = self._begin_web_turn()
+        pacing_state, pacing_key = self._begin_web_turn()
         response_finished = False
         try:
             try:
@@ -496,7 +528,11 @@ class OpenCLIWebChatModel(BaseChatModel):
             response_finished = True
             return response
         finally:
-            self._finish_web_turn(pacing_state, response_finished=response_finished)
+            self._finish_web_turn(
+                pacing_state,
+                pacing_key,
+                response_finished=response_finished,
+            )
 
     @staticmethod
     def _is_complete_protocol_response(response: str) -> bool:
