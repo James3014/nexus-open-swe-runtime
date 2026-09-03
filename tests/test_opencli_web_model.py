@@ -1348,6 +1348,7 @@ def test_durable_pacing_lock_held_during_send(tmp_path):
     assert lock_held
 
 
+@pytest.mark.skip(reason="superseded by production-model subprocess oracle")
 def test_durable_pacing_across_processes_no_overlap(tmp_path):
     """Two real processes sharing one transport key have max_inflight=1."""
     pacing_dir = _durable_pacing_dir(tmp_path)
@@ -1494,6 +1495,9 @@ elif command == "ask":
             time.sleep(0.01)
     print(json.dumps([{{"conversationId":"mock-conversation","response":""}}]))
 elif command == "detail":
+    advance = float(os.environ.get("MOCK_DETAIL_ADVANCE", "0"))
+    if advance:
+        clock_path.write_text(str(float(clock_path.read_text()) + advance))
     prompt = log_path.with_suffix(".prompt").read_text(encoding="utf-8")
     print(json.dumps([{{"Role":"User","Text":prompt,"Generating":False}},
                       {{"Role":"Assistant","Text":json.dumps({{"type":"final","content":"ok"}}),"Generating":False}}]))
@@ -1581,6 +1585,35 @@ def test_production_model_seam_paces_restart_and_kill_owner(tmp_path):
     assert successor.returncode == 0
     starts = [float(line.split()[-1]) for line in log.read_text().splitlines()]
     assert starts[-1] == 45.0
+    assert len(starts) == 4
+
+
+def test_production_model_seam_uses_response_settle_after_long_response(tmp_path):
+    """A response finishing at t=20 permits the next send at t=23."""
+    root = tmp_path / "runtime-state"
+    clock = tmp_path / "clock"
+    clock.write_text("0.0")
+    log = tmp_path / "asks.log"
+    executable = tmp_path / "mock-opencli"
+    worker = tmp_path / "worker.py"
+    package_root = Path(__file__).resolve().parents[1]
+    _write_mock_opencli(executable, log)
+    _write_production_worker(worker, package_root)
+    for identifier in ("first", "restart"):
+        env = os.environ.copy()
+        env.update(
+            MOCK_CLOCK=str(clock),
+            MOCK_EXECUTABLE=str(executable),
+            MOCK_ROOT=str(root),
+            MOCK_PROFILE="settle-profile",
+            MOCK_ID=identifier,
+            MOCK_DETAIL_ADVANCE="20",
+        )
+        process = subprocess.Popen([sys.executable, str(worker)], env=env)
+        process.wait(timeout=10)
+        assert process.returncode == 0
+    starts = [float(line.split()[-1]) for line in log.read_text().splitlines()]
+    assert starts == [0.0, 23.0]
 
 
 def test_production_model_seam_distinct_keys_are_independent(tmp_path):
@@ -1669,6 +1702,7 @@ def test_production_model_seam_rejects_unsafe_state_without_ask(tmp_path, corrup
     assert not log.exists() or " ask " not in log.read_text()
 
 
+@pytest.mark.skip(reason="superseded by production-model subprocess oracle")
 def test_durable_pacing_kill_owner_successor_respects_cooldown(tmp_path):
     """Killing the lock owner releases the lock but successor preserves cooldown."""
     pacing_dir = _durable_pacing_dir(tmp_path)
@@ -1757,6 +1791,7 @@ else:
     assert successor_saw == owner_ts == "100.0"
 
 
+@pytest.mark.skip(reason="superseded by production-model subprocess oracle")
 def test_durable_pacing_different_keys_are_independent(tmp_path):
     """Two different transport keys do not interfere."""
     pacing_dir = _durable_pacing_dir(tmp_path)

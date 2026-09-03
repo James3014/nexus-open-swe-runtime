@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -212,22 +213,13 @@ def _validate_lock_file(path: str) -> None:
         raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_LOCK_UNSAFE")
 
 
-def _validate_state_file(path: str, *, clock: Callable[[], float] | None = None) -> None:
-    """Fail-closed validation of a pacing state file before use."""
-    if not os.path.lexists(path):
-        return
-    try:
-        st = os.lstat(path)
-    except OSError:
-        return
-    if stat.S_ISLNK(st.st_mode):
-        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
-    if not stat.S_ISREG(st.st_mode):
-        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
-    if st.st_mode & 0o077:
-        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
-    if st.st_uid != os.getuid():
-        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
+def _read_validated_state(
+    path: str,
+    *,
+    expected_key: str | None = None,
+    clock: Callable[[], float] | None = None,
+) -> DurablePacingState | None:
+    """Read and validate one inode through one descriptor-bound operation."""
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         try:
@@ -244,16 +236,25 @@ def _validate_state_file(path: str, *, clock: Callable[[], float] | None = None)
         finally:
             if fd >= 0:
                 os.close(fd)
+    except FileNotFoundError:
+        return None
     except OpenCLIWebModelError:
         raise
-    except (OSError, ValueError) as exc:
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE") from exc
+        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED") from exc
+    except ValueError as exc:
         raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED") from exc
     if not isinstance(raw, Mapping):
         raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED")
     if raw.get("schema") != _DURABLE_STATE_SCHEMA:
         raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED")
-    if not isinstance(raw.get("key"), str) or not raw.get("key"):
+    key = raw.get("key")
+    if not isinstance(key, str) or not key:
         raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED")
+    if expected_key is not None and key != expected_key:
+        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_IDENTITY_UNKNOWN")
     for field_name in ("last_send_started", "last_response_finished"):
         value = raw.get(field_name)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -269,32 +270,24 @@ def _validate_state_file(path: str, *, clock: Callable[[], float] | None = None)
                     raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
                 if now - value > _DURABLE_CLOCK_SKEW_PAST:
                     raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
+    return DurablePacingState(
+        key=key,
+        last_send_started=float(raw["last_send_started"]),
+        last_response_finished=float(raw["last_response_finished"]),
+    )
+
+
+def _validate_state_file(path: str, *, clock: Callable[[], float] | None = None) -> None:
+    """Fail-closed validation of a pacing state file before use."""
+    _read_validated_state(path, clock=clock)
 
 
 def _read_durable_state(path: str) -> DurablePacingState:
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        try:
-            opened = os.fstat(fd)
-            if not stat.S_ISREG(opened.st_mode) or opened.st_mode & 0o077:
-                return DurablePacingState()
-            with os.fdopen(fd, encoding="utf-8") as fh:
-                fd = -1
-                raw = json.load(fh)
-        finally:
-            if fd >= 0:
-                os.close(fd)
-    except (OSError, ValueError):
+        state = _read_validated_state(path)
+    except OpenCLIWebModelError:
         return DurablePacingState()
-    if not isinstance(raw, Mapping):
-        return DurablePacingState()
-    if raw.get("schema") != _DURABLE_STATE_SCHEMA:
-        return DurablePacingState()
-    return DurablePacingState(
-        key=str(raw.get("key") or ""),
-        last_send_started=float(raw.get("last_send_started") or 0.0),
-        last_response_finished=float(raw.get("last_response_finished") or 0.0),
-    )
+    return state or DurablePacingState()
 
 
 def _write_durable_state(path: str, state: DurablePacingState) -> None:
@@ -305,7 +298,7 @@ def _write_durable_state(path: str, state: DurablePacingState) -> None:
         "last_response_finished": state.last_response_finished,
     }
     parent = os.path.dirname(path)
-    os.makedirs(parent, mode=_PACING_DIR_MODE, exist_ok=True)
+    _ensure_pacing_dir(parent)
     fd, tmp = tempfile.mkstemp(prefix=".pacing.", dir=parent, suffix=".json")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -314,6 +307,9 @@ def _write_durable_state(path: str, state: DurablePacingState) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp, _STATE_FILE_MODE)
+        parent_stat = os.stat(parent)
+        if parent_stat.st_uid != os.getuid() or parent_stat.st_mode & 0o077:
+            raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
         os.replace(tmp, path)
         os.chmod(path, _STATE_FILE_MODE)
         dir_fd = os.open(parent, os.O_RDONLY)
@@ -366,10 +362,14 @@ class DurablePacingBackend:
         lock = DurablePacingLock(self._lock_path)
         lock.acquire()
         try:
-            _validate_state_file(self._state_path, clock=self._clock)
-            state = _read_durable_state(self._state_path)
-            if state.key and state.key != self._key:
-                raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_IDENTITY_UNKNOWN")
+            state = (
+                _read_validated_state(
+                    self._state_path,
+                    expected_key=self._key,
+                    clock=self._clock,
+                )
+                or DurablePacingState()
+            )
             yield state
         finally:
             lock.release()
@@ -384,11 +384,14 @@ class DurablePacingBackend:
         return self._lock_path
 
     def persisted_state(self) -> DurablePacingState:
-        _validate_state_file(self._state_path, clock=self._clock)
-        state = _read_durable_state(self._state_path)
-        if state.key and state.key != self._key:
-            raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_IDENTITY_UNKNOWN")
-        return state
+        return (
+            _read_validated_state(
+                self._state_path,
+                expected_key=self._key,
+                clock=self._clock,
+            )
+            or DurablePacingState()
+        )
 
     def write_state(self, state: DurablePacingState) -> None:
         if state.key != self._key:
