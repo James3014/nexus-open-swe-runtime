@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -1466,6 +1467,9 @@ elif command == "ask":
     with log_path.open("a", encoding="utf-8") as fh:
         fh.write(f"{{os.environ.get('MOCK_ID', '')}} ask {{now}}\\n")
     if os.environ.get("MOCK_WAIT_FOR_KILL") == "1":
+        child_pid_path = os.environ.get("MOCK_CHILD_PID_FILE")
+        if child_pid_path:
+            pathlib.Path(child_pid_path).write_text(str(os.getpid()), encoding="utf-8")
         pathlib.Path(os.environ["MOCK_READY"]).touch()
         while not pathlib.Path(os.environ["MOCK_RELEASE"]).exists():
             time.sleep(0.01)
@@ -1534,8 +1538,9 @@ def test_production_model_seam_paces_restart_and_kill_owner(tmp_path):
                 MOCK_WAIT_FOR_KILL="1",
                 MOCK_READY=str(tmp_path / "owner.ready"),
                 MOCK_RELEASE=str(tmp_path / "owner.release"),
+                MOCK_CHILD_PID_FILE=str(tmp_path / "owner.child.pid"),
             )
-        return subprocess.Popen([sys.executable, str(worker)], env=env)
+        return subprocess.Popen([sys.executable, str(worker)], env=env, start_new_session=True)
 
     first = launch("first")
     first.wait(timeout=10)
@@ -1548,6 +1553,7 @@ def test_production_model_seam_paces_restart_and_kill_owner(tmp_path):
 
     owner = launch("owner", wait_for_kill=True)
     ready = tmp_path / "owner.ready"
+    child_pid_file = tmp_path / "owner.child.pid"
     deadline = time.monotonic() + 10
     while not ready.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
@@ -1556,9 +1562,23 @@ def test_production_model_seam_paces_restart_and_kill_owner(tmp_path):
     time.sleep(0.1)
     assert successor.poll() is None
     owner.kill()
+    try:
+        os.killpg(owner.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
     owner.wait(timeout=10)
     successor.wait(timeout=10)
     assert successor.returncode == 0
+    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail(f"mock OpenCLI child {child_pid} survived owner cleanup")
     starts = [float(line.split()[-1]) for line in log.read_text().splitlines()]
     assert starts[-1] == 45.0
     assert len(starts) == 4
