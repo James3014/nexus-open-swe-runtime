@@ -4,11 +4,14 @@ import hashlib
 import json
 import os
 import subprocess
+import stat
+import tempfile
 import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from langchain_core.language_models.chat_models import BaseChatModel, LanguageModelInput
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
@@ -17,6 +20,16 @@ from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import PrivateAttr
+
+try:
+    import fcntl as _fcntl
+except ImportError:
+    _fcntl = None  # type: ignore[assignment]
+
+try:
+    import pathlib as _pathlib
+except ImportError:
+    _pathlib = None  # type: ignore[assignment]
 
 OPENCLI_WEB_PROTOCOL = "nexus.opencli_web_chat.v1"
 _ALLOWED_LEVELS = frozenset({"fast", "balanced", "advanced", "very-high", "pro"})
@@ -103,6 +116,227 @@ def _release_shared_pacing_state(key: tuple[str, str, str], state: _PacingState)
             _evict_idle_pacing_states()
 
 
+# ---------------------------------------------------------------------------
+# Durable cross-process / restart pacing gate
+# ---------------------------------------------------------------------------
+
+_DURABLE_MIN_SEND_INTERVAL = _MIN_WEB_SEND_INTERVAL_SECONDS
+_DURABLE_MIN_RESPONSE_SETTLE = _POST_RESPONSE_SETTLE_SECONDS
+_DURABLE_STATE_SCHEMA = "nexus.opencli_durable_pacing.v1"
+_DURABLE_CLOCK_SKEW_FUTURE = 300.0
+_DURABLE_CLOCK_SKEW_PAST = 86400.0
+_PACING_DIR_MODE = 0o700
+_STATE_FILE_MODE = 0o600
+_LOCK_FILE_MODE = 0o600
+
+
+def _durable_pacing_key(
+    executable: str, profile: str, site_session: str
+) -> str:
+    """Hashed transport identity for durable pacing files."""
+    material = f"{executable}\0{profile}\0{site_session}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+@dataclass
+class DurablePacingState:
+    """On-disk pacing record: timestamps only, no plaintext identity."""
+
+    key: str = ""
+    last_send_started: float = 0.0
+    last_response_finished: float = 0.0
+
+
+@dataclass
+class DurablePacingLock:
+    """Manages an fcntl.flock on a lock file under pacing_dir."""
+
+    lock_path: str
+    _fd: int = -1
+
+    def acquire(self) -> None:
+        if _fcntl is None:
+            raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_FLOCK_UNAVAILABLE")
+        self._fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            _fcntl.flock(self._fd, _fcntl.LOCK_EX)
+        except Exception:
+            os.close(self._fd)
+            self._fd = -1
+            raise
+
+    def release(self) -> None:
+        if self._fd >= 0:
+            try:
+                _fcntl.flock(self._fd, _fcntl.LOCK_UN)
+            finally:
+                os.close(self._fd)
+                self._fd = -1
+
+    def __enter__(self) -> "DurablePacingLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.release()
+
+
+def _ensure_pacing_dir(pacing_dir: str) -> None:
+    os.makedirs(pacing_dir, mode=_PACING_DIR_MODE, exist_ok=True)
+    os.chmod(pacing_dir, _PACING_DIR_MODE)
+
+
+def _validate_state_file(path: str, *, clock: Callable[[], float] | None = None) -> None:
+    """Fail-closed validation of a pacing state file before use."""
+    if not os.path.isfile(path):
+        return
+    if os.path.islink(path):
+        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    if stat.S_ISLNK(st.st_mode):
+        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
+    if not stat.S_ISREG(st.st_mode):
+        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
+    if st.st_mode & 0o077:
+        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
+    if st.st_uid != os.getuid():
+        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
+    if _pathlib is not None:
+        try:
+            raw = json.loads(_pathlib.Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+    else:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except (OSError, ValueError):
+            return
+    if not isinstance(raw, Mapping):
+        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED")
+    if raw.get("schema") != _DURABLE_STATE_SCHEMA:
+        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED")
+    if not isinstance(raw.get("key"), str) or not raw.get("key"):
+        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED")
+    for field_name in ("last_send_started", "last_response_finished"):
+        value = raw.get(field_name)
+        if not isinstance(value, (int, float)):
+            raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED")
+    if clock is not None:
+        now = clock()
+        for field_name in ("last_send_started", "last_response_finished"):
+            value = raw.get(field_name)
+            if isinstance(value, (int, float)) and value > 0:
+                if value > now + _DURABLE_CLOCK_SKEW_FUTURE:
+                    raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
+                if now - value > _DURABLE_CLOCK_SKEW_PAST:
+                    raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
+
+
+def _read_durable_state(path: str) -> DurablePacingState:
+    if _pathlib is not None:
+        try:
+            raw = json.loads(_pathlib.Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return DurablePacingState()
+    else:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except (OSError, ValueError):
+            return DurablePacingState()
+    if not isinstance(raw, Mapping):
+        return DurablePacingState()
+    if raw.get("schema") != _DURABLE_STATE_SCHEMA:
+        return DurablePacingState()
+    return DurablePacingState(
+        key=str(raw.get("key") or ""),
+        last_send_started=float(raw.get("last_send_started") or 0.0),
+        last_response_finished=float(raw.get("last_response_finished") or 0.0),
+    )
+
+
+def _write_durable_state(path: str, state: DurablePacingState) -> None:
+    payload = {
+        "schema": _DURABLE_STATE_SCHEMA,
+        "key": state.key,
+        "last_send_started": state.last_send_started,
+        "last_response_finished": state.last_response_finished,
+    }
+    parent = os.path.dirname(path)
+    os.makedirs(parent, mode=_PACING_DIR_MODE, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".pacing.", dir=parent, suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, sort_keys=True, separators=(",", ":"))
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, _STATE_FILE_MODE)
+        os.replace(tmp, path)
+        os.chmod(path, _STATE_FILE_MODE)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+class DurablePacingBackend:
+    """Cross-process/restart pacing gate using fcntl.flock + atomic timestamp state.
+
+    Stores only hashed transport identity and send/response timestamps.  No
+    plaintext profile, session, executable, prompts, or conversation state.
+    """
+
+    def __init__(
+        self,
+        runtime_state_root: str,
+        *,
+        executable: str,
+        profile: str,
+        site_session: str,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._key = _durable_pacing_key(executable, profile, site_session)
+        pacing_dir = os.path.join(runtime_state_root, "pacing")
+        _ensure_pacing_dir(pacing_dir)
+        self._state_path = os.path.join(pacing_dir, f"{self._key}.json")
+        self._lock_path = os.path.join(pacing_dir, f"{self._key}.lock")
+        self._clock = clock
+
+    @contextmanager
+    def acquire_send_lock(self) -> Iterator[DurablePacingState]:
+        """Acquire flock, validate state, yield current state."""
+        lock = DurablePacingLock(self._lock_path)
+        lock.acquire()
+        try:
+            _validate_state_file(self._state_path, clock=self._clock)
+            yield _read_durable_state(self._state_path)
+        except BaseException:
+            lock.release()
+            raise
+
+    def release_send_lock(self, lock: DurablePacingLock) -> None:
+        lock.release()
+
+    def state_path(self) -> str:
+        return self._state_path
+
+    def lock_path(self) -> str:
+        return self._lock_path
+
+    def persisted_state(self) -> DurablePacingState:
+        _validate_state_file(self._state_path, clock=self._clock)
+        return _read_durable_state(self._state_path)
+
+    def write_state(self, state: DurablePacingState) -> None:
+        _write_durable_state(self._state_path, state)
+
+
 class OpenCLIWebModelError(RuntimeError):
     """Bounded failure from the ChatGPT Web transport."""
 
@@ -181,12 +415,25 @@ class OpenCLIWebChatModel(BaseChatModel):
     timeout_seconds: int = 120
     site_session: str = "ephemeral"
     disable_streaming: bool = True
+    runtime_state_root: str | None = None
     _conversation_id: str | None = PrivateAttr(default=None)
     _sleep: Callable[[float], None] = PrivateAttr(default=time.sleep)
     _clock: Callable[[], float] = PrivateAttr(default=time.monotonic)
     _pacing_state: _PacingState = PrivateAttr(default_factory=_PacingState)
     _web_turn_count: int = PrivateAttr(default=0)
     _budget_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
+    _durable_pacing_backend: DurablePacingBackend | None = PrivateAttr(default=None)
+
+    def model_post_init(self, __context: Any) -> None:
+        super().model_post_init(__context) if hasattr(super(), "model_post_init") else None
+        if self.runtime_state_root and self.profile:
+            self._durable_pacing_backend = DurablePacingBackend(
+                self.runtime_state_root,
+                executable=self.executable,
+                profile=self.profile,
+                site_session=self.site_session,
+                clock=self._clock,
+            )
 
     @property
     def model_name(self) -> str:
@@ -516,56 +763,104 @@ class OpenCLIWebChatModel(BaseChatModel):
     def _send_and_reconcile(self, prompt: str, *, budget_reserved: bool = False) -> str:
         if not budget_reserved:
             self._reserve_web_turn()
+        if self._durable_pacing_backend is not None:
+            return self._durable_send_and_reconcile(prompt)
+        return self._inprocess_send_and_reconcile(prompt)
+
+    def _inprocess_send_and_reconcile(self, prompt: str) -> str:
         pacing_state, pacing_key = self._begin_web_turn()
-        response_finished = False
+        response_ref = [False]
         try:
-            try:
-                prompt_envelope = json.loads(prompt)
-            except json.JSONDecodeError:
-                prompt_envelope = {}
-            turn_id = (
-                str(prompt_envelope.get("turn_id") or "")
-                if isinstance(prompt_envelope, Mapping)
-                else ""
-            )
-            argv = [self.executable, "chatgpt", "ask", prompt]
-            if self._conversation_id:
-                argv.extend(["--conversation", self._conversation_id])
-            else:
-                argv.append("--new")
-            argv.extend([
-                "--wait",
-                "true",
-                "--timeout",
-                str(self.timeout_seconds),
-                "--site-session",
-                self.site_session,
-                "-f",
-                "json",
-            ])
-            try:
-                stdout = self._run(argv)
-            except OpenCLIWebModelError as exc:
-                if str(exc) == "OPENCLI_WEB_BUSY":
-                    self._cooldown_and_probe_status()
-                if str(exc) != "OPENCLI_WEB_TIMEOUT" or not turn_id:
-                    raise
-                response = self._reconcile_timeout(turn_id)
-                response_finished = True
-                return response
-            conversation_id, _immediate_response = self._extract_ask_result(stdout)
-            if self._conversation_id and conversation_id != self._conversation_id:
-                raise OpenCLIWebModelError("OPENCLI_WEB_CONVERSATION_ID_MISMATCH")
-            self._conversation_id = conversation_id
-            response = self._detail_response(conversation_id, wait=True, turn_id=turn_id)
-            response_finished = True
-            return response
+            return self._execute_web_send(prompt, response_finished_ref=response_ref)
         finally:
             self._finish_web_turn(
                 pacing_state,
                 pacing_key,
-                response_finished=response_finished,
+                response_finished=response_ref[0],
             )
+
+    def _execute_web_send(self, prompt: str, *, response_finished_ref: list[bool] | None) -> str:
+        try:
+            prompt_envelope = json.loads(prompt)
+        except json.JSONDecodeError:
+            prompt_envelope = {}
+        turn_id = (
+            str(prompt_envelope.get("turn_id") or "")
+            if isinstance(prompt_envelope, Mapping)
+            else ""
+        )
+        argv = [self.executable, "chatgpt", "ask", prompt]
+        if self._conversation_id:
+            argv.extend(["--conversation", self._conversation_id])
+        else:
+            argv.append("--new")
+        argv.extend([
+            "--wait",
+            "true",
+            "--timeout",
+            str(self.timeout_seconds),
+            "--site-session",
+            self.site_session,
+            "-f",
+            "json",
+        ])
+        try:
+            stdout = self._run(argv)
+        except OpenCLIWebModelError as exc:
+            if str(exc) == "OPENCLI_WEB_BUSY":
+                self._cooldown_and_probe_status()
+            if str(exc) != "OPENCLI_WEB_TIMEOUT" or not turn_id:
+                raise
+            if response_finished_ref is not None:
+                response_finished_ref[0] = True
+            return self._reconcile_timeout(turn_id)
+        conversation_id, _immediate_response = self._extract_ask_result(stdout)
+        if self._conversation_id and conversation_id != self._conversation_id:
+            raise OpenCLIWebModelError("OPENCLI_WEB_CONVERSATION_ID_MISMATCH")
+        self._conversation_id = conversation_id
+        response = self._detail_response(conversation_id, wait=True, turn_id=turn_id)
+        if response_finished_ref is not None:
+            response_finished_ref[0] = True
+        return response
+
+    def _durable_send_and_reconcile(self, prompt: str) -> str:
+        backend = self._durable_pacing_backend
+        assert backend is not None
+        response_ref = [False]
+        with backend.acquire_send_lock() as durable_state:
+            now = self._clock()
+            eligible_at = now
+            if durable_state.last_send_started > 0:
+                eligible_at = max(
+                    eligible_at,
+                    durable_state.last_send_started + _DURABLE_MIN_SEND_INTERVAL,
+                )
+            if durable_state.last_response_finished > 0:
+                eligible_at = max(
+                    eligible_at,
+                    durable_state.last_response_finished + _DURABLE_MIN_RESPONSE_SETTLE,
+                )
+            if eligible_at > now:
+                self._sleep(eligible_at - now)
+            send_time = self._clock()
+            new_state = DurablePacingState(
+                key=durable_state.key,
+                last_send_started=send_time,
+                last_response_finished=durable_state.last_response_finished,
+            )
+            _write_durable_state(backend.state_path(), new_state)
+        try:
+            response = self._execute_web_send(prompt, response_finished_ref=response_ref)
+        finally:
+            if response_ref[0]:
+                with backend.acquire_send_lock() as fresh_state:
+                    finish_state = DurablePacingState(
+                        key=fresh_state.key,
+                        last_send_started=fresh_state.last_send_started,
+                        last_response_finished=self._clock(),
+                    )
+                    _write_durable_state(backend.state_path(), finish_state)
+        return response
 
     @staticmethod
     def _is_complete_protocol_response(response: str) -> bool:

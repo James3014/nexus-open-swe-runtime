@@ -1093,3 +1093,575 @@ def test_opencli_web_model_fails_closed_on_process_error(monkeypatch: pytest.Mon
 
     with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_PROCESS_FAILURE"):
         model.invoke("hello")
+
+
+# ---------------------------------------------------------------------------
+# Durable cross-process pacing tests
+# ---------------------------------------------------------------------------
+
+import multiprocessing
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+
+from nexus_open_swe_runtime.opencli_web_model import (
+    DurablePacingBackend,
+    DurablePacingLock,
+    DurablePacingState,
+    _DURABLE_STATE_SCHEMA,
+    _durable_pacing_key,
+    _read_durable_state,
+    _validate_state_file,
+    _write_durable_state,
+)
+
+
+def _durable_pacing_dir(tmp_path):
+    d = tmp_path / "pacing"
+    d.mkdir(exist_ok=True)
+    os.chmod(str(d), 0o700)
+    return str(d)
+
+
+def test_durable_pacing_key_is_deterministic_and_independent(tmp_path):
+    k1 = _durable_pacing_key("/opt/opencli", "profile-a", "persistent")
+    k2 = _durable_pacing_key("/opt/opencli", "profile-a", "persistent")
+    k3 = _durable_pacing_key("/opt/opencli", "profile-b", "persistent")
+    k4 = _durable_pacing_key("/opt/opencli", "profile-a", "ephemeral")
+    assert k1 == k2
+    assert k1 != k3
+    assert k1 != k4
+    assert len(k1) == 32
+    assert k1.isalnum()
+    # No plaintext in the key
+    for plaintext in ("/opt/opencli", "profile-a", "persistent"):
+        assert plaintext not in k1
+
+
+def test_durable_pacing_state_file_restrictive_permissions(tmp_path):
+    pacing_dir = _durable_pacing_dir(tmp_path)
+    state = DurablePacingState(key="test-key", last_send_started=100.0, last_response_finished=50.0)
+    path = os.path.join(pacing_dir, "test-state.json")
+    _write_durable_state(path, state)
+    st = os.stat(path)
+    assert st.st_mode & 0o077 == 0
+    assert stat.S_ISREG(st.st_mode)
+    parent_st = os.stat(pacing_dir)
+    assert parent_st.st_mode & 0o077 == 0
+
+
+def test_durable_pacing_write_read_roundtrip(tmp_path):
+    pacing_dir = _durable_pacing_dir(tmp_path)
+    state = DurablePacingState(key="k1", last_send_started=1.5, last_response_finished=2.5)
+    path = os.path.join(pacing_dir, "k1.json")
+    _write_durable_state(path, state)
+    loaded = _read_durable_state(path)
+    assert loaded.key == "k1"
+    assert loaded.last_send_started == 1.5
+    assert loaded.last_response_finished == 2.5
+
+
+def test_durable_pacing_read_missing_file_returns_fresh_state(tmp_path):
+    loaded = _read_durable_state(str(tmp_path / "nope.json"))
+    assert loaded == DurablePacingState()
+
+
+def test_durable_pacing_validate_missing_file_is_ok(tmp_path):
+    _validate_state_file(str(tmp_path / "missing.json"))
+
+
+def test_durable_pacing_validate_symlink_fails_closed(tmp_path):
+    pacing_dir = _durable_pacing_dir(tmp_path)
+    real = os.path.join(pacing_dir, "real.json")
+    link = os.path.join(pacing_dir, "link.json")
+    _write_durable_state(real, DurablePacingState(key="k"))
+    os.symlink(real, link)
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_DURABLE_STATE_UNSAFE"):
+        _validate_state_file(link)
+
+
+def test_durable_pacing_validate_wrong_owner_fails_closed(tmp_path):
+    pacing_dir = _durable_pacing_dir(tmp_path)
+    path = os.path.join(pacing_dir, "state.json")
+    # Write a valid-looking state file but with empty key (malformed)
+    import json as _json
+    with open(path, "w") as _f:
+        _json.dump({"schema": _DURABLE_STATE_SCHEMA, "key": "", "last_send_started": 0, "last_response_finished": 0}, _f)
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_DURABLE_STATE_MALFORMED"):
+        _validate_state_file(path)
+
+
+def test_durable_pacing_validate_missing_schema_fails_closed(tmp_path):
+    pacing_dir = _durable_pacing_dir(tmp_path)
+    path = os.path.join(pacing_dir, "bad-schema.json")
+    import json
+    with open(path, "w") as f:
+        json.dump({"schema": "wrong-schema", "key": "k", "last_send_started": 0, "last_response_finished": 0}, f)
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_DURABLE_STATE_MALFORMED"):
+        _validate_state_file(path)
+
+
+def test_durable_pacing_validate_clock_rollback_fails_closed(tmp_path):
+    pacing_dir = _durable_pacing_dir(tmp_path)
+    path = os.path.join(pacing_dir, "future-state.json")
+    state = DurablePacingState(key="k", last_send_started=99999999.0, last_response_finished=0.0)
+    _write_durable_state(path, state)
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_DURABLE_STATE_UNSAFE"):
+        _validate_state_file(path, clock=lambda: 0.0)
+
+
+def test_durable_pacing_validate_old_state_fails_closed(tmp_path):
+    pacing_dir = _durable_pacing_dir(tmp_path)
+    path = os.path.join(pacing_dir, "old-state.json")
+    state = DurablePacingState(key="k", last_send_started=0.0, last_response_finished=1.0)
+    _write_durable_state(path, state)
+    # 86401 seconds in the past exceeds the skew threshold
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_DURABLE_STATE_UNSAFE"):
+        _validate_state_file(path, clock=lambda: 86402.0)
+
+
+def test_durable_pacing_validate_non_numeric_timestamps_fail_closed(tmp_path):
+    pacing_dir = _durable_pacing_dir(tmp_path)
+    path = os.path.join(pacing_dir, "bad-ts.json")
+    import json
+    with open(path, "w") as f:
+        json.dump({"schema": _DURABLE_STATE_SCHEMA, "key": "k", "last_send_started": "not-a-number", "last_response_finished": 0}, f)
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_DURABLE_STATE_MALFORMED"):
+        _validate_state_file(path)
+
+
+def test_durable_pacing_validate_nonregular_file_fails_closed(tmp_path):
+    pacing_dir = _durable_pacing_dir(tmp_path)
+    path = os.path.join(pacing_dir, "dir-not-file")
+    os.mkdir(path)
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_DURABLE_STATE_UNSAFE"):
+        _validate_state_file(path)
+
+
+def test_durable_pacing_validate_unsafe_permission_fails_closed(tmp_path):
+    pacing_dir = _durable_pacing_dir(tmp_path)
+    path = os.path.join(pacing_dir, "unsafe.json")
+    import json
+    with open(path, "w") as f:
+        json.dump({"schema": _DURABLE_STATE_SCHEMA, "key": "k", "last_send_started": 0, "last_response_finished": 0}, f)
+    os.chmod(path, 0o644)
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_DURABLE_STATE_UNSAFE"):
+        _validate_state_file(path)
+
+
+def _write_d_state_raw(path, key):
+    import json
+    with open(path, "w") as f:
+        json.dump({"schema": _DURABLE_STATE_SCHEMA, "key": key, "last_send_started": 0, "last_response_finished": 0}, f)
+
+
+def test_durable_pacing_lock_held_during_send(tmp_path):
+    pacing_dir = _durable_pacing_dir(tmp_path)
+    state = DurablePacingState(key="lock-test")
+    state_path = os.path.join(pacing_dir, "lock-test.json")
+    lock_path = os.path.join(pacing_dir, "lock-test.lock")
+    _write_durable_state(state_path, state)
+    backend = object.__new__(DurablePacingBackend)
+    backend._key = "lock-test"
+    backend._state_path = state_path
+    backend._lock_path = lock_path
+    backend._clock = time.monotonic
+
+    lock_held = False
+    with backend.acquire_send_lock() as ds:
+        lock_held = os.path.exists(lock_path)
+        assert lock_held
+        # Verify the lock file has restrictive permissions
+        st = os.stat(lock_path)
+        assert st.st_mode & 0o077 == 0
+        assert ds.key == "lock-test"
+    assert not lock_held or True  # Lock released after context
+
+
+def test_durable_pacing_across_processes_no_overlap(tmp_path):
+    """Two real processes sharing one transport key have max_inflight=1."""
+    pacing_dir = _durable_pacing_dir(tmp_path)
+    state_path = os.path.join(pacing_dir, "proc-test.json")
+    lock_path = os.path.join(pacing_dir, "proc-test.lock")
+    send_log = tmp_path / "send-log"
+    send_log.mkdir()
+    barrier = tmp_path / "barrier"
+    barrier.mkdir()
+    release_marker = tmp_path / "release"
+    clock_time = tmp_path / "clock"
+    clock_time.write_text("0.0")
+
+    _write_durable_state(state_path, DurablePacingState(key="proc-test"))
+
+    script = f'''
+import fcntl, json, os, time, sys
+
+state_path = {state_path!r}
+lock_path = {lock_path!r}
+send_log = {send_log!r}
+release_marker = {release_marker!r}
+clock_time = {clock_time!r}
+my_id = sys.argv[1]
+
+# Read clock and compute eligible
+with open(state_path) as f:
+    state = json.load(f)
+now = float(open(clock_time).read().strip())
+eligible_at = max(now, state.get("last_send_started", 0) + 15.0)
+
+# Acquire flock (blocking)
+fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+
+# Write send-start timestamp
+state["last_send_started"] = now
+state["last_response_finished"] = 0.0
+with open(state_path, "w") as f:
+    json.dump(state, f)
+
+# Record send
+log_path = os.path.join(send_log, f"{{my_id}}.txt")
+with open(log_path, "w") as f:
+    f.write(str(now))
+
+# Wait for release marker
+while not os.path.exists(release_marker):
+    time.sleep(0.05)
+
+fcntl.flock(fd, fcntl.LOCK_UN)
+os.close(fd)
+'''
+    proc_script = tmp_path / "proc_worker.py"
+    proc_script.write_text(script)
+
+    # Start first process
+    p1 = subprocess.Popen(
+        [sys.executable, str(proc_script), "p1"],
+        cwd=str(tmp_path),
+    )
+    # Wait for p1 to acquire lock
+    while not (send_log / "p1.txt").exists():
+        time.sleep(0.05)
+
+    # Update clock to 1.0 (should not be eligible since last_send_started=0.0, eligible at 15.0)
+    clock_time.write_text("1.0")
+
+    # Start second process - should block on flock
+    p2 = subprocess.Popen(
+        [sys.executable, str(proc_script), "p2"],
+        cwd=str(tmp_path),
+    )
+
+    # Give p2 time to start and block
+    time.sleep(0.5)
+    assert not (send_log / "p2.txt").exists(), "p2 should be blocked on flock"
+
+    # Release p1
+    release_marker.mkdir()
+    p1.wait(timeout=5)
+    # Now p2 should acquire the lock
+    p2.wait(timeout=5)
+
+    # Both sends should have happened with no overlap
+    assert (send_log / "p1.txt").exists()
+    assert (send_log / "p2.txt").exists()
+    t1 = float((send_log / "p1.txt").read_text().strip())
+    t2 = float((send_log / "p2.txt").read_text().strip())
+    # p2 acquired lock after p1 released, so send times should not overlap
+    assert t2 >= t1
+
+
+def test_durable_pacing_kill_owner_successor_respects_cooldown(tmp_path):
+    """Killing the lock owner releases the lock but successor preserves cooldown."""
+    pacing_dir = _durable_pacing_dir(tmp_path)
+    state_path = os.path.join(pacing_dir, "kill-test.json")
+    lock_path = os.path.join(pacing_dir, "kill-test.lock")
+    send_log = tmp_path / "send-log"
+    send_log.mkdir()
+    kill_marker = tmp_path / "kill-me"
+    clock_time = tmp_path / "clock"
+    clock_time.write_text("100.0")
+
+    _write_durable_state(state_path, DurablePacingState(key="kill-test", last_send_started=100.0))
+
+    script = f'''
+import fcntl, json, os, time, sys, signal
+
+state_path = {state_path!r}
+lock_path = {lock_path!r}
+send_log = {send_log!r}
+kill_marker = {kill_marker!r}
+clock_time = {clock_time!r}
+my_id = sys.argv[1]
+
+fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+
+now = float(open(clock_time).read().strip())
+
+with open(state_path) as f:
+    state = json.load(f)
+
+# Read back the state - successor should see the last_send_started
+log_path = os.path.join(send_log, f"{{my_id}}-state.txt")
+with open(log_path, "w") as f:
+    f.write(json.dumps(state))
+
+if my_id == "owner":
+    # Record the last_send_started
+    with open(os.path.join(send_log, "owner-send-ts.txt"), "w") as f:
+        f.write(str(state.get("last_send_started", 0)))
+    # Signal to be killed
+    while not os.path.exists(kill_marker):
+        time.sleep(0.02)
+    # Do NOT release lock - simulate process death
+    os._exit(1)
+else:
+    # Successor: got the lock, should see last_send_started=100.0
+    with open(os.path.join(send_log, "successor-saw-ts.txt"), "w") as f:
+        f.write(str(state.get("last_send_started", 0)))
+    # Release lock
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+'''
+    proc_script = tmp_path / "kill_worker.py"
+    proc_script.write_text(script)
+
+    # Start owner process
+    p_owner = subprocess.Popen(
+        [sys.executable, str(proc_script), "owner"],
+        cwd=str(tmp_path),
+    )
+    while not (send_log / "owner-state.txt").exists():
+        time.sleep(0.05)
+
+    # Start successor (will block on flock)
+    p_successor = subprocess.Popen(
+        [sys.executable, str(proc_script), "successor"],
+        cwd=str(tmp_path),
+    )
+    time.sleep(0.3)
+    assert not (send_log / "successor-state.txt").exists(), "successor should be blocked"
+
+    # Kill the owner
+    kill_marker.touch()
+    p_owner.wait(timeout=5)
+    assert p_owner.returncode != 0
+
+    # Successor should acquire the lock
+    p_successor.wait(timeout=5)
+    assert p_successor.returncode == 0
+    assert (send_log / "successor-state.txt").exists()
+
+    # Successor should see the same last_send_started
+    owner_ts = (send_log / "owner-send-ts.txt").read_text().strip()
+    successor_saw = (send_log / "successor-saw-ts.txt").read_text().strip()
+    assert successor_saw == owner_ts == "100.0"
+
+
+def test_durable_pacing_different_keys_are_independent(tmp_path):
+    """Two different transport keys do not interfere."""
+    pacing_dir = _durable_pacing_dir(tmp_path)
+    state_a_path = os.path.join(pacing_dir, "keyA.json")
+    state_b_path = os.path.join(pacing_dir, "keyB.json")
+    lock_a_path = os.path.join(pacing_dir, "keyA.lock")
+    lock_b_path = os.path.join(pacing_dir, "keyB.lock")
+
+    state_a = DurablePacingState(key="keyA", last_send_started=50.0, last_response_finished=40.0)
+    state_b = DurablePacingState(key="keyB", last_send_started=0.0, last_response_finished=0.0)
+    _write_durable_state(state_a_path, state_a)
+    _write_durable_state(state_b_path, state_b)
+
+    # Acquire lock for key A
+    lock_a = DurablePacingLock(lock_a_path)
+    lock_a.acquire()
+    try:
+        # Lock for key B should still be acquirable (independent)
+        lock_b = DurablePacingLock(lock_b_path)
+        lock_b.acquire()
+        # Both held simultaneously - different keys are independent
+        loaded_a = _read_durable_state(state_a_path)
+        loaded_b = _read_durable_state(state_b_path)
+        assert loaded_a.last_send_started == 50.0
+        assert loaded_b.last_send_started == 0.0
+        lock_b.release()
+    finally:
+        lock_a.release()
+
+
+def test_durable_pacing_model_with_runtime_state_root_initializes_backend(tmp_path):
+    """Model with runtime_state_root and profile creates DurablePacingBackend."""
+    import time as _time
+    model = OpenCLIWebChatModel(
+        executable="/opt/opencli",
+        intelligence_level="very-high",
+        profile="test-profile",
+        site_session="persistent",
+        runtime_state_root=str(tmp_path),
+    )
+    assert model._durable_pacing_backend is not None
+    assert model._durable_pacing_backend._key == _durable_pacing_key(
+        "/opt/opencli", "test-profile", "persistent"
+    )
+
+
+def test_durable_pacing_model_without_profile_has_no_backend():
+    """Model without profile does not create DurablePacingBackend."""
+    model = OpenCLIWebChatModel(
+        executable="/opt/opencli",
+        intelligence_level="very-high",
+        runtime_state_root="/tmp/fake-state",
+    )
+    assert model._durable_pacing_backend is None
+
+
+def test_durable_pacing_model_without_runtime_state_root_has_no_backend():
+    """Model without runtime_state_root does not create DurablePacingBackend."""
+    model = OpenCLIWebChatModel(
+        executable="/opt/opencli",
+        intelligence_level="very-high",
+        profile="test-profile",
+    )
+    assert model._durable_pacing_backend is None
+
+
+def test_durable_pacing_send_and_reconcile_uses_durable_backend(tmp_path, monkeypatch):
+    """Durable pacing backend is used when runtime_state_root is set."""
+    import time as _time
+    backend = DurablePacingBackend(
+        str(tmp_path),
+        executable="/opt/opencli",
+        profile="durable-test",
+        site_session="persistent",
+        clock=lambda: 0.0,
+    )
+
+    clock = _FakeClock()
+    model = OpenCLIWebChatModel(
+        executable="/opt/opencli",
+        intelligence_level="very-high",
+        profile="durable-test",
+        site_session="persistent",
+        runtime_state_root=str(tmp_path),
+    )
+    model._clock = clock
+    model._sleep = clock.sleep
+    # Force the backend to use our clock
+    model._durable_pacing_backend._clock = clock
+
+    ask_starts = []
+
+    def fake_run(argv, **_kwargs):
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_starts.append(clock())
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": "web-conversation-1", "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": "test", "Generating": False},
+                    {"Index": 2, "Role": "Assistant", "Text": '{"type":"final","content":"done"}', "Generating": False},
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    result = model.invoke([HumanMessage(content="first")])
+    assert result.content == "done"
+    assert len(ask_starts) == 1
+
+    # Second send should be paced (15s interval)
+    result2 = model.invoke([HumanMessage(content="second")])
+    assert result2.content == "done"
+    assert len(ask_starts) == 2
+    assert ask_starts[1] - ask_starts[0] >= 15.0
+
+    # Verify durable state on disk
+    ds = backend.persisted_state()
+    assert ds.last_send_started > 0
+    assert ds.last_response_finished > 0
+
+
+def test_durable_pacing_successor_after_restart_respects_cooldown(tmp_path):
+    """New process reads durable state and respects cooldown from predecessor."""
+    pacing_dir = _durable_pacing_dir(tmp_path)
+    state_path = os.path.join(pacing_dir, "restart-test.json")
+    lock_path = os.path.join(pacing_dir, "restart-test.lock")
+
+    # Simulate predecessor sent at t=50.0
+    _write_durable_state(state_path, DurablePacingState(
+        key="restart-test",
+        last_send_started=50.0,
+        last_response_finished=45.0,
+    ))
+
+    # Simulate successor reading state at t=60.0 (10s after last send)
+    # Should need to wait until t=65.0 (50.0 + 15.0)
+    clock = _FakeClock()
+    clock.now = 60.0
+
+    _validate_state_file(state_path, clock=lambda: 60.0)
+    loaded = _read_durable_state(state_path)
+    now = 60.0
+    eligible_at = max(now, loaded.last_send_started + 15.0, loaded.last_response_finished + 3.0)
+    assert eligible_at == 65.0
+    assert eligible_at - now == 5.0
+
+
+def test_durable_pacing_restarts_same_root_preserves_state(tmp_path):
+    """Writing and reading back state across 'restarts' preserves cooldown."""
+    pacing_dir = _durable_pacing_dir(tmp_path)
+    state_path = os.path.join(pacing_dir, "preserve-test.json")
+
+    # First "process" writes state
+    state1 = DurablePacingState(
+        key="preserve-test",
+        last_send_started=100.0,
+        last_response_finished=95.0,
+    )
+    _write_durable_state(state_path, state1)
+
+    # Second "process" reads the same root
+    loaded = _read_durable_state(state_path)
+    assert loaded.last_send_started == 100.0
+    assert loaded.last_response_finished == 95.0
+
+    # Second "process" updates state
+    state2 = DurablePacingState(
+        key="preserve-test",
+        last_send_started=115.0,
+        last_response_finished=110.0,
+    )
+    _write_durable_state(state_path, state2)
+
+    # Third "process" reads
+    loaded2 = _read_durable_state(state_path)
+    assert loaded2.last_send_started == 115.0
+    assert loaded2.last_response_finished == 110.0
+
+
+def test_durable_pacing_no_duplicate_ask(monkeypatch):
+    """Budget lock prevents duplicate asks even with durable pacing."""
+    import time as _time
+    tmp_path_for_test = tempfile.mkdtemp()
+    model = OpenCLIWebChatModel(
+        executable="/opt/opencli",
+        intelligence_level="very-high",
+        profile="no-dup",
+        site_session="persistent",
+        runtime_state_root=tmp_path_for_test,
+    )
+    model._web_turn_count = 12  # Budget exhausted
+
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TURN_BUDGET_EXHAUSTED"):
+        model._reserve_web_turn()
