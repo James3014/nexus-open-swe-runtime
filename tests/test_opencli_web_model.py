@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import tool
+
 from nexus_open_swe_runtime import cli
 from nexus_open_swe_runtime import opencli_web_model as web_model
 from nexus_open_swe_runtime.opencli_web_model import (

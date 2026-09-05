@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
 from nexus_open_swe_runtime import cli
 
 
