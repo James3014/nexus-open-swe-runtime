@@ -434,6 +434,7 @@ def _base_result(request: Mapping[str, Any], *, kind: str, status: str) -> dict[
         "schema": RESULT_SCHEMA,
         "kind": kind,
         "status": status,
+        "operation_id": str(request.get("operation_id") or ""),
         "provider_id": str(request.get("provider_id") or ""),
         "model_id": str(request.get("model_id") or ""),
         "process_started": False,

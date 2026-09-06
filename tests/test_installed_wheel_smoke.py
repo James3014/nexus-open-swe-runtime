@@ -1,4 +1,11 @@
-"""Test that built standalone nexus-open-swe-runtime wheel installs and executes cleanly."""
+"""Test that built standalone nexus-open-swe-runtime wheel installs and executes cleanly.
+
+Strict fail-closed acceptance:
+- Build failure => TEST FAILURE
+- Wheel missing => TEST FAILURE
+- Wheel install failure => TEST FAILURE
+- Installed probe failure => TEST FAILURE
+"""
 
 import json
 import subprocess
@@ -13,13 +20,13 @@ def test_installed_wheel_smoke_in_isolated_venv(tmp_path: Path):
     dist_dir = repo_root / "dist"
     wheels = sorted(dist_dir.glob("nexus_open_swe_runtime-*.whl"))
     if not wheels:
-        try:
-            subprocess.run(["uv", "build"], cwd=str(repo_root), check=True)
-            wheels = sorted(dist_dir.glob("nexus_open_swe_runtime-*.whl"))
-        except Exception:
-            pass
+        res_build = subprocess.run(["uv", "build"], cwd=str(repo_root), capture_output=True, text=True)
+        if res_build.returncode != 0:
+            pytest.fail(f"Failed to build nexus-open-swe-runtime wheel: {res_build.stderr}")
+        wheels = sorted(dist_dir.glob("nexus_open_swe_runtime-*.whl"))
+
     if not wheels:
-        pytest.skip("No nexus-open-swe-runtime wheel found in dist/ and uv build not available.")
+        pytest.fail("No nexus-open-swe-runtime wheel found in dist/ after build attempt.")
 
     target_wheel = wheels[-1]
 
@@ -80,3 +87,26 @@ def test_installed_wheel_smoke_in_isolated_venv(tmp_path: Path):
     assert bad_data["status"] == "OPEN_SWE_RUNTIME_PROTOCOL_FAILED"
     assert bad_data["process_started"] is False
     assert bad_data["retry_safe"] is False
+
+    # 5. Invoke frozen legacy client protocol fixture (reconcile non-existent operation)
+    # Origin: Nexus-new nexus/services/open_swe_external_intelligence.py (v1 request schema)
+    frozen_reconcile_req = json.dumps({
+        "schema": "nexus.open_swe_runtime.request.v1",
+        "operation": "semantic_reconcile",
+        "operation_id": "0" * 64,
+        "runtime_state_root": str(tmp_path / "runtime_state"),
+    })
+    res_reconcile = subprocess.run(
+        [str(venv_runtime_bin)],
+        input=frozen_reconcile_req,
+        cwd=str(outside_dir),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    reconcile_data = json.loads(res_reconcile.stdout)
+    assert reconcile_data["schema"] == "nexus.open_swe_runtime.result.v1"
+    assert reconcile_data["kind"] == "semantic"
+    assert reconcile_data["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert reconcile_data["outcome_unknown"] is True
+    assert reconcile_data["retry_safe"] is False

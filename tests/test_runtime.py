@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -288,7 +289,9 @@ def test_runtime_state_files_are_restrictive_and_contain_no_environment(tmp_path
     text = state_file.read_text(encoding="utf-8")
     assert "GEMINI_API_KEY" not in text
     assert "GITHUB_TOKEN" not in text
+    assert "GH_TOKEN" not in text
     assert "sentinel-provider-secret" not in text
+    assert "sentinel-github-secret" not in text
     assert state_file.stat().st_mode & 0o077 == 0
 
 
@@ -358,4 +361,144 @@ def test_persisted_operation_state_preserves_identity_across_restart(tmp_path: P
     res2 = cli.dispatch(reconcile_req)
     assert res2 == res1
     assert graph.calls == 1  # No re-dispatch
+
+
+def test_child_environment_containment_excludes_controller_and_github_tokens(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "leak-github-token")
+    monkeypatch.setenv("GH_TOKEN", "leak-gh-token")
+    monkeypatch.setenv("CONTROLLER_TOKEN", "leak-controller-token")
+    monkeypatch.setenv("OPENCLI_ALLOWED", "kept-value")
+
+    from nexus_open_swe_runtime.opencli_web_model import OpenCLIWebChatModel
+
+    model = OpenCLIWebChatModel(model="chatgpt")
+    env = model._environment()
+    assert "GITHUB_TOKEN" not in env
+    assert "GH_TOKEN" not in env
+    assert "CONTROLLER_TOKEN" not in env
+    assert "leak-github-token" not in env.values()
+    assert "leak-gh-token" not in env.values()
+    assert env.get("OPENCLI_ALLOWED") == "kept-value"
+
+
+def test_semantic_ambiguous_timeout_hostile_reconciliation_no_second_send(tmp_path: Path):
+    """Verify that a timeout or lost ack marks outcome_unknown=True, retry_safe=False,
+    and hostile retry/reconciliation NEVER causes a second semantic send.
+    Later authoritative result is read back idempotently without duplicate send.
+    """
+    request = _semantic_request(tmp_path)
+    op_id = request["operation_id"]
+    state_root = Path(request["runtime_state_root"])
+
+    # Simulate timeout during graph invoke
+    timeout_graph = FakeGraph(cli.SEMANTIC_TOOLS, error=TimeoutError("remote gateway timeout"))
+
+    res1 = cli._semantic_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: object(),
+        graph_factory=lambda *_args: timeout_graph,
+    )
+
+    # 1. First send resulted in timeout error during processing
+    assert timeout_graph.calls == 1
+    assert res1["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert res1["outcome_unknown"] is True
+    assert res1["retry_safe"] is False
+    assert res1["process_started"] is True
+    assert res1["operation_id"] == op_id
+
+    # 2. Hostile resend with semantic_run on same operation_id MUST NOT dispatch a second send
+    res2 = cli._semantic_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: object(),
+        graph_factory=lambda *_args: timeout_graph,
+    )
+    assert timeout_graph.calls == 1  # ZERO additional send
+    assert res2["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert res2["outcome_unknown"] is True
+    assert res2["retry_safe"] is False
+
+    # 3. Hostile reconcile MUST NOT dispatch a second send
+    reconcile_req = {
+        "schema": cli.REQUEST_SCHEMA,
+        "operation": "semantic_reconcile",
+        "operation_id": op_id,
+        "runtime_state_root": str(state_root),
+    }
+    res3 = cli.dispatch(reconcile_req)
+    assert timeout_graph.calls == 1  # Still 1
+    assert res3["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert res3["outcome_unknown"] is True
+    assert res3["retry_safe"] is False
+
+    # 4. Later authoritative state discovery writes terminal result
+    authoritative_payload = {
+        **res1,
+        "status": "INTELLIGENCE_COMPLETED",
+        "raw": cli._canonical_json({"finding": "authoritative_completed"}),
+        "outcome_unknown": False,
+        "finished_at": cli._now(),
+    }
+    cli._atomic_json(state_root / "operations" / f"{op_id}.json", authoritative_payload)
+
+    # 5. Subsequent reconcile seamlessly transitions without sending again
+    res4 = cli.dispatch(reconcile_req)
+    assert timeout_graph.calls == 1  # Still exactly 1
+    assert res4["status"] == "INTELLIGENCE_COMPLETED"
+    assert res4["outcome_unknown"] is False
+    assert res4["operation_id"] == op_id
+
+
+def test_legacy_client_contract_frozen_fixture(tmp_path: Path):
+    """Verify repository-local contract compatibility with frozen client request fixture.
+    Fixture origin: Nexus-new revision, nexus/services/open_swe_external_intelligence.py.
+    Protocol: nexus.open_swe_runtime.request.v1 / nexus.open_swe_runtime.result.v1.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "sample.py").write_text("print('hello')\n", encoding="utf-8")
+    state_root = tmp_path / "state"
+
+    # Frozen client-shaped request as constructed by Nexus-new OpenSWEExternalIntelligenceTransport
+    frozen_client_request = {
+        "schema": "nexus.open_swe_runtime.request.v1",
+        "operation": "semantic_run",
+        "operation_id": "e" * 64,
+        "provider_id": "google_genai",
+        "model_id": "gemini-test",
+        "repository_root": str(repo),
+        "runtime_state_root": str(state_root),
+        "prompt": "Find all print calls in sample.py",
+        "transport_config": None,
+    }
+
+    graph = FakeGraph(
+        cli.SEMANTIC_TOOLS,
+        _record("record_finding", {
+            "schema": "external_execution_envelope.v1",
+            "findings": [{"file": "sample.py", "line": 1}],
+        }),
+    )
+
+    result = cli._semantic_run(
+        frozen_client_request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: object(),
+        graph_factory=lambda *_args: graph,
+    )
+
+    # Assert exact v1 result schema contract expected by Nexus-new
+    assert result["schema"] == "nexus.open_swe_runtime.result.v1"
+    assert result["kind"] == "semantic"
+    assert result["status"] == "INTELLIGENCE_COMPLETED"
+    assert result["operation_id"] == "e" * 64
+    assert result["process_started"] is True
+    assert result["outcome_unknown"] is False
+    assert result["retry_safe"] is False
+    assert "raw" in result
+    envelope = json.loads(result["raw"])
+    assert envelope["schema"] == "external_execution_envelope.v1"
+
 
