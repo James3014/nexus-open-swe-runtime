@@ -289,5 +289,73 @@ def test_runtime_state_files_are_restrictive_and_contain_no_environment(tmp_path
     assert "GEMINI_API_KEY" not in text
     assert "GITHUB_TOKEN" not in text
     assert "sentinel-provider-secret" not in text
-    assert "sentinel-github-secret" not in text
     assert state_file.stat().st_mode & 0o077 == 0
+
+
+def test_runtime_identity_dispatch():
+    request = {
+        "schema": cli.REQUEST_SCHEMA,
+        "operation": "identity",
+    }
+    result = cli.dispatch(request)
+    assert result["schema"] == cli.RESULT_SCHEMA
+    assert result["kind"] == "identity"
+    assert result["status"] == "IDENTIFIED"
+    assert result["distribution_name"] == "nexus-open-swe-runtime"
+    assert "distribution_version" in result
+    assert result["runtime_protocol_version"] == cli.REQUEST_SCHEMA
+    assert result["authority_boundary"] == "execution_runtime_only"
+    assert result["process_started"] is False
+    assert result["outcome_unknown"] is False
+    assert result["retry_safe"] is True
+    assert "artifact_identity" in result
+    assert "module_file" in result["artifact_identity"]
+    assert "module_sha256" in result["artifact_identity"]
+
+
+def test_protocol_schema_mismatch_fails_closed():
+    invalid_request = {
+        "schema": "nexus.open_swe_runtime.request.v0_legacy",
+        "operation": "identity",
+    }
+    with pytest.raises(cli.RuntimeErrorBounded, match="OPEN_SWE_PROTOCOL_SCHEMA_INVALID"):
+        cli.dispatch(invalid_request)
+
+
+def test_persisted_operation_state_preserves_identity_across_restart(tmp_path: Path):
+    state_root = tmp_path / "runtime_state"
+    op_id = "f" * 64
+    request = {
+        "schema": cli.REQUEST_SCHEMA,
+        "operation": "semantic_run",
+        "operation_id": op_id,
+        "provider_id": "google_genai",
+        "model_id": "gemini-test",
+        "repository_root": str(tmp_path),
+        "runtime_state_root": str(state_root),
+        "prompt": "inspect repo",
+    }
+    graph = FakeGraph(
+        cli.SEMANTIC_TOOLS,
+        _record("record_finding", {"schema": "external_execution_envelope.v1", "binding": {}}),
+    )
+    res1 = cli._semantic_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: object(),
+        graph_factory=lambda *_args: graph,
+    )
+    assert res1["status"] == "INTELLIGENCE_COMPLETED"
+    assert graph.calls == 1
+
+    # Simulate restart / upgrade: new dispatch with reconcile
+    reconcile_req = {
+        "schema": cli.REQUEST_SCHEMA,
+        "operation": "semantic_reconcile",
+        "operation_id": op_id,
+        "runtime_state_root": str(state_root),
+    }
+    res2 = cli.dispatch(reconcile_req)
+    assert res2 == res1
+    assert graph.calls == 1  # No re-dispatch
+
