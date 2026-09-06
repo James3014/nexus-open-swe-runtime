@@ -534,7 +534,11 @@ class OpenCLIWebChatModel(BaseChatModel):
         return self.bind(tools=formatted, **kwargs)
 
     def _environment(self) -> dict[str, str]:
-        env = os.environ.copy()
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not (k.startswith("GITHUB_") or k.startswith("GH_") or "TOKEN" in k and "PROVIDER" not in k and "OPENCLI" not in k)
+        }
         if self.profile:
             env["OPENCLI_PROFILE"] = self.profile
         return env

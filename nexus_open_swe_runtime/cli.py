@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import tempfile
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
@@ -433,6 +434,7 @@ def _base_result(request: Mapping[str, Any], *, kind: str, status: str) -> dict[
         "schema": RESULT_SCHEMA,
         "kind": kind,
         "status": status,
+        "operation_id": str(request.get("operation_id") or ""),
         "provider_id": str(request.get("provider_id") or ""),
         "model_id": str(request.get("model_id") or ""),
         "process_started": False,
@@ -773,6 +775,36 @@ def _worker_reconcile(request: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _identity_result(request: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        dist_ver = version("nexus-open-swe-runtime")
+    except PackageNotFoundError:
+        dist_ver = "0.1.0"
+
+    module_path = Path(__file__).resolve()
+    try:
+        module_sha256 = hashlib.sha256(module_path.read_bytes()).hexdigest()
+    except OSError:
+        module_sha256 = "unavailable"
+
+    result = _base_result(request, kind="identity", status="IDENTIFIED")
+    result.update(
+        distribution_name="nexus-open-swe-runtime",
+        distribution_version=dist_ver,
+        runtime_protocol_version=REQUEST_SCHEMA,
+        artifact_identity={
+            "module_file": str(module_path),
+            "module_sha256": module_sha256,
+            "deepagents_version": _deepagents_version(),
+        },
+        authority_boundary="execution_runtime_only",
+        process_started=False,
+        outcome_unknown=False,
+        retry_safe=True,
+    )
+    return result
+
+
 def dispatch(
     request: Mapping[str, Any],
     *,
@@ -782,6 +814,8 @@ def dispatch(
     if request.get("schema") != REQUEST_SCHEMA:
         raise RuntimeErrorBounded("OPEN_SWE_PROTOCOL_SCHEMA_INVALID")
     operation = request.get("operation")
+    if operation == "identity":
+        return _identity_result(request)
     if operation == "semantic_run":
         return semantic_runner(request)
     if operation == "semantic_reconcile":
@@ -794,6 +828,14 @@ def dispatch(
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] in {"--identity", "-i"}:
+        identity_req = {"schema": REQUEST_SCHEMA, "operation": "identity"}
+        print(_canonical_json(_identity_result(identity_req)))
+        return 0
+    if len(sys.argv) > 1 and sys.argv[1] in {"--help", "-h"}:
+        print("usage: nexus-open-swe-runtime [--identity] [--help]")
+        print("External Open SWE execution runtime communicating via stdin/stdout JSON protocol.")
+        return 0
     try:
         request = json.loads(input())
         if not isinstance(request, dict):
@@ -819,6 +861,7 @@ def main() -> int:
         }
     print(_canonical_json(result))
     return 0
+
 
 
 if __name__ == "__main__":
