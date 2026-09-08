@@ -508,6 +508,7 @@ class OpenCLIWebChatModel(BaseChatModel):
     runtime_state_root: str | None = None
     opencli_profile: str = ""
     _conversation_id: str | None = PrivateAttr(default=None)
+    _late_readback_used: bool = PrivateAttr(default=False)
     _sleep: Callable[[float], None] = PrivateAttr(default=time.sleep)
     # Durable pacing uses epoch wall-clock timestamps so state survives reboot.
     _clock: Callable[[], float] = PrivateAttr(default=time.time)
@@ -612,12 +613,15 @@ class OpenCLIWebChatModel(BaseChatModel):
             raise OpenCLIWebModelError("OPENCLI_WEB_TIMEOUT") from exc
         if result.returncode != 0:
             diagnostic = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
-            if "timed out" in diagnostic and "may still complete" in diagnostic:
-                raise OpenCLIWebModelError("OPENCLI_WEB_TIMEOUT")
             if any(marker in diagnostic for marker in _HARD_BLOCK_MARKERS):
                 raise OpenCLIWebModelError("OPENCLI_WEB_HARD_BLOCK")
             if any(marker in diagnostic for marker in _BUSY_MARKERS):
                 raise OpenCLIWebModelError("OPENCLI_WEB_BUSY")
+            if (
+                result.returncode == 75
+                and ("timed out" in diagnostic or "did not finish" in diagnostic)
+            ) or ("timed out" in diagnostic and "may still complete" in diagnostic):
+                raise OpenCLIWebModelError("OPENCLI_WEB_TIMEOUT")
             raise OpenCLIWebModelError("OPENCLI_WEB_PROCESS_FAILURE")
         return result.stdout or ""
 
@@ -758,6 +762,19 @@ class OpenCLIWebChatModel(BaseChatModel):
         return result
 
     def _detail_response(self, conversation_id: str, *, wait: bool, turn_id: str = "") -> str:
+        try:
+            return self._detail_response_once(conversation_id, wait=wait, turn_id=turn_id)
+        except OpenCLIWebModelError as exc:
+            if (
+                not wait
+                or str(exc) != "OPENCLI_WEB_TIMEOUT"
+                or self._late_readback_used
+            ):
+                raise
+            self._late_readback_used = True
+            return self._detail_response_once(conversation_id, wait=False, turn_id=turn_id)
+
+    def _detail_response_once(self, conversation_id: str, *, wait: bool, turn_id: str = "") -> str:
         readback_timeout = max(self.timeout_seconds, 30) if wait else self.timeout_seconds
         detail = self._run([
             self.executable,
@@ -899,6 +916,7 @@ class OpenCLIWebChatModel(BaseChatModel):
             )
 
     def _execute_web_send(self, prompt: str, *, response_finished_ref: list[bool] | None) -> str:
+        self._late_readback_used = False
         try:
             prompt_envelope = json.loads(prompt)
         except json.JSONDecodeError:
