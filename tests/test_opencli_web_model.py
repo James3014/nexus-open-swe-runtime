@@ -477,6 +477,92 @@ def test_opencli_web_model_translates_declared_tool_call(monkeypatch: pytest.Mon
 @pytest.mark.parametrize(
     "tool_name", ["record_finding", "record_diagnosis", "record_worker_result"]
 )
+def test_opencli_web_model_translates_declared_terminal_record_direct_form(tool_name):
+    declared = [
+        {"type": "function", "function": {"name": tool_name, "parameters": {"type": "object"}}}
+    ]
+
+    result = OpenCLIWebChatModel._response_message(
+        json.dumps({"type": tool_name, "envelope": {"status": "recorded"}}),
+        declared,
+    )
+
+    assert result.content == ""
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0]["name"] == tool_name
+    assert result.tool_calls[0]["args"] == {"envelope": {"status": "recorded"}}
+    legacy = OpenCLIWebChatModel._response_message(
+        json.dumps(
+            {
+                "type": "tool_call",
+                "name": tool_name,
+                "arguments": {"envelope": {"status": "recorded"}},
+            }
+        ),
+        declared,
+    )
+    assert legacy.tool_calls[0]["args"] == result.tool_calls[0]["args"]
+
+
+def test_opencli_web_model_direct_terminal_form_preserves_recorded_payload():
+    declared = [
+        {"type": "function", "function": {"name": "record_finding", "parameters": {"type": "object"}}}
+    ]
+    message = OpenCLIWebChatModel._response_message(
+        '{"type":"record_finding","envelope":{"status":"recorded"}}', declared
+    )
+
+    assert cli._recorded_payload({"messages": [message]}, "record_finding") == {
+        "status": "recorded"
+    }
+
+
+def test_opencli_web_model_prompt_prefers_direct_terminal_recorders():
+    declared = [
+        {
+            "type": "function",
+            "function": {"name": "record_finding", "parameters": {"type": "object"}},
+        },
+        {"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}},
+    ]
+
+    prompt = json.loads(
+        OpenCLIWebChatModel()._render_prompt(
+            [HumanMessage(content="record the finding")], declared, None
+        )
+    )
+
+    rules = " ".join(prompt["rules"])
+    assert "record_finding" in rules
+    assert "direct" in rules
+    assert "MUST use" in rules
+    assert "never wrap" in rules
+    assert "generic tool_call" in rules
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        '{"type":"record_finding","envelope":[]}',
+        '{"type":"record_finding","envelope":{},"extra":true}',
+        '{"type":"read_file","envelope":{}}',
+        '{"type":"record_diagnosis","envelope":{}}',
+        '{"type":"record_finding","envelope":{"status":"a","status":"b"}}',
+        '{"type":"record_finding","envelope":{"status":"recorded"},"type":"final"}',
+    ],
+)
+def test_opencli_web_model_rejects_invalid_direct_terminal_record_form(response):
+    declared = [
+        {"type": "function", "function": {"name": "record_finding", "parameters": {"type": "object"}}}
+    ]
+
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TOOL_CALL_INVALID"):
+        OpenCLIWebChatModel._response_message(response, declared)
+
+
+@pytest.mark.parametrize(
+    "tool_name", ["record_finding", "record_diagnosis", "record_worker_result"]
+)
 def test_opencli_web_model_finishes_locally_after_terminal_recorder_tool(tool_name):
     model = OpenCLIWebChatModel(executable="/opt/opencli", intelligence_level="balanced")
     model._select_intelligence_level = lambda: (_ for _ in ()).throw(
