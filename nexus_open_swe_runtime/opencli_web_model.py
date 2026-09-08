@@ -980,8 +980,15 @@ class OpenCLIWebChatModel(BaseChatModel):
             if new_conversation:
                 raise
             return self._reconcile_timeout(turn_id)
+        prior_conversation_id = self._conversation_id
         conversation_id, _immediate_response = self._extract_ask_result(stdout)
-        if self._conversation_id and not new_conversation and conversation_id != self._conversation_id:
+        if new_conversation and prior_conversation_id == conversation_id:
+            raise OpenCLIWebModelError("OPENCLI_WEB_CONVERSATION_ID_MISMATCH")
+        if (
+            prior_conversation_id
+            and not new_conversation
+            and conversation_id != prior_conversation_id
+        ):
             raise OpenCLIWebModelError("OPENCLI_WEB_CONVERSATION_ID_MISMATCH")
         self._conversation_id = conversation_id
         response = self._detail_response(conversation_id, wait=True, turn_id=turn_id)
