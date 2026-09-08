@@ -438,6 +438,23 @@ class OpenCLIWebModelError(RuntimeError):
     """Bounded failure from the ChatGPT Web transport."""
 
 
+class _IncompleteDetailError(OpenCLIWebModelError):
+    """Incomplete detail response carrying the exact physical snapshot."""
+
+    def __init__(self, detail_stdout: str):
+        super().__init__("OPENCLI_WEB_RECONCILE_INCOMPLETE")
+        self.detail_stdout = detail_stdout
+
+
+class _ResumeBoundTurn(OpenCLIWebModelError):
+    """Signal one validated resume after the current pacing turn unwinds."""
+
+    def __init__(self, prompt: str, turn_id: str):
+        super().__init__("OPENCLI_WEB_RESUME_REQUIRED")
+        self.prompt = prompt
+        self.turn_id = turn_id
+
+
 def _message_role(message: BaseMessage) -> str:
     if message.type == "human":
         return "user"
@@ -542,6 +559,7 @@ class OpenCLIWebChatModel(BaseChatModel):
     opencli_profile: str = ""
     _conversation_id: str | None = PrivateAttr(default=None)
     _late_readback_used: bool = PrivateAttr(default=False)
+    _repair_resume_used: bool = PrivateAttr(default=False)
     _sleep: Callable[[float], None] = PrivateAttr(default=time.sleep)
     # Durable pacing uses epoch wall-clock timestamps so state survives reboot.
     _clock: Callable[[], float] = PrivateAttr(default=time.time)
@@ -831,6 +849,59 @@ class OpenCLIWebChatModel(BaseChatModel):
                 matches += 1
         return matches == 1
 
+    @staticmethod
+    def _repair_resume_ready(stdout: str, turn_id: str) -> bool:
+        """Return whether one physical detail proves a repair turn can resume."""
+        try:
+            rows = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise OpenCLIWebModelError("OPENCLI_WEB_RECONCILE_INVALID") from exc
+        if not isinstance(rows, list):
+            raise OpenCLIWebModelError("OPENCLI_WEB_RECONCILE_INVALID")
+        matches: list[int] = []
+        for index, row in enumerate(rows):
+            if not isinstance(row, Mapping) or row.get("Role") != "User":
+                continue
+            text = row.get("Text")
+            if isinstance(text, str) and _user_turn_id(text) == turn_id:
+                matches.append(index)
+        if len(matches) != 1:
+            raise OpenCLIWebModelError("OPENCLI_WEB_TURN_IDENTITY_UNKNOWN")
+        user_index = matches[0]
+        user_row = rows[user_index]
+        if not isinstance(user_row, Mapping) or user_row.get("Generating") is not False:
+            return False
+        return not rows[user_index + 1 :]
+
+    @staticmethod
+    def _repair_resume_prompt(
+        prompt: str,
+        *,
+        conversation_id: str,
+        expected_turn_id: str,
+    ) -> str:
+        try:
+            envelope = json.loads(prompt, object_pairs_hook=_reject_duplicate_json_keys)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise OpenCLIWebModelError("OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID") from exc
+        if not isinstance(envelope, Mapping):
+            raise OpenCLIWebModelError("OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID")
+        resume = {
+            "protocol": envelope.get("protocol", OPENCLI_WEB_PROTOCOL),
+            "turn_id": "turn_resume_"
+            + hashlib.sha256(
+                f"{conversation_id}\0{expected_turn_id}".encode("utf-8")
+            ).hexdigest()[:20],
+            "rules": envelope.get("rules", []),
+            "tools": envelope.get("tools", []),
+            "tool_choice": envelope.get("tool_choice", "none"),
+            "instruction": (
+                "Resume the immediately preceding response. Return exactly one complete JSON object "
+                "preserving its intended response, tool name, and arguments; do not add prose or markdown."
+            ),
+        }
+        return json.dumps(resume, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
     def _detail_response(self, conversation_id: str, *, wait: bool, turn_id: str = "") -> str:
         try:
             return self._detail_response_once(conversation_id, wait=wait, turn_id=turn_id)
@@ -862,7 +933,12 @@ class OpenCLIWebChatModel(BaseChatModel):
             "-f",
             "json",
         ])
-        return self._extract_detail_response(detail, turn_id)
+        try:
+            return self._extract_detail_response(detail, turn_id)
+        except OpenCLIWebModelError as exc:
+            if str(exc) == "OPENCLI_WEB_RECONCILE_INCOMPLETE":
+                raise _IncompleteDetailError(detail) from exc
+            raise
 
     def _session_pacing_state(self) -> _PacingState:
         if not self.opencli_profile:
@@ -927,9 +1003,40 @@ class OpenCLIWebChatModel(BaseChatModel):
         if pacing_key is not None:
             _release_shared_pacing_state(pacing_key, state)
 
-    def _reconcile_timeout(self, turn_id: str) -> str:
+    def _resume_bound_turn_once(
+        self,
+        turn_id: str,
+        detail_error: _IncompleteDetailError,
+        resume_prompt: str | None,
+    ) -> str:
+        if not self._repair_resume_ready(detail_error.detail_stdout, turn_id):
+            raise detail_error
+        if self._repair_resume_used:
+            raise OpenCLIWebModelError("OPENCLI_WEB_REPAIR_RESUME_EXHAUSTED") from detail_error
+        self._repair_resume_used = True
+        if resume_prompt is None:
+            resume_prompt = json.dumps(
+                {
+                    "protocol": OPENCLI_WEB_PROTOCOL,
+                    "turn_id": turn_id,
+                    "tools": [],
+                    "tool_choice": "none",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        raise _ResumeBoundTurn(resume_prompt, turn_id)
+
+    def _reconcile_timeout(self, turn_id: str, resume_prompt: str | None = None) -> str:
         if self._conversation_id:
-            return self._detail_response(self._conversation_id, wait=True, turn_id=turn_id)
+            try:
+                return self._detail_response(self._conversation_id, wait=True, turn_id=turn_id)
+            except _IncompleteDetailError as exc:
+                return self._resume_bound_turn_once(
+                    turn_id,
+                    exc,
+                    resume_prompt,
+                )
         history = self._run([
             self.executable,
             "chatgpt",
@@ -966,6 +1073,7 @@ class OpenCLIWebChatModel(BaseChatModel):
         self,
         turn_id: str,
         prior_conversation_id: str | None,
+        resume_prompt: str | None = None,
     ) -> str:
         """Recover one timed-out fresh repair from bounded read-only history."""
         history = self._run([
@@ -1000,8 +1108,16 @@ class OpenCLIWebChatModel(BaseChatModel):
                 matches.append(conversation_id)
         if len(matches) != 1:
             raise OpenCLIWebModelError("OPENCLI_WEB_TIMEOUT_RECONCILE_UNKNOWN")
-        self._conversation_id = matches[0]
-        return self._detail_response(matches[0], wait=True, turn_id=turn_id)
+        conversation_id = matches[0]
+        self._conversation_id = conversation_id
+        try:
+            return self._detail_response(conversation_id, wait=True, turn_id=turn_id)
+        except _IncompleteDetailError as exc:
+            return self._resume_bound_turn_once(
+                turn_id,
+                exc,
+                resume_prompt,
+            )
 
     def _reserve_web_turn(self) -> None:
         with self._budget_lock:
@@ -1018,15 +1134,28 @@ class OpenCLIWebChatModel(BaseChatModel):
     ) -> str:
         if not budget_reserved:
             self._reserve_web_turn()
-        if self._durable_pacing_backend is not None:
-            return self._durable_send_and_reconcile(
-                prompt,
-                new_conversation=new_conversation,
-            )
-        return self._inprocess_send_and_reconcile(
-            prompt,
-            new_conversation=new_conversation,
-        )
+        while True:
+            try:
+                if self._durable_pacing_backend is not None:
+                    return self._durable_send_and_reconcile(
+                        prompt,
+                        new_conversation=new_conversation,
+                    )
+                return self._inprocess_send_and_reconcile(
+                    prompt,
+                    new_conversation=new_conversation,
+                )
+            except _ResumeBoundTurn as signal:
+                conversation_id = self._conversation_id
+                if not conversation_id:
+                    raise OpenCLIWebModelError("OPENCLI_WEB_CONVERSATION_ID_INVALID") from signal
+                prompt = self._repair_resume_prompt(
+                    signal.prompt,
+                    conversation_id=conversation_id,
+                    expected_turn_id=signal.turn_id,
+                )
+                self._reserve_web_turn()
+                new_conversation = False
 
     def _inprocess_send_and_reconcile(
         self,
@@ -1096,9 +1225,10 @@ class OpenCLIWebChatModel(BaseChatModel):
                     return self._reconcile_fresh_repair_timeout(
                         turn_id,
                         prior_conversation_id,
+                        prompt,
                     )
                 raise
-            return self._reconcile_timeout(turn_id)
+            return self._reconcile_timeout(turn_id, prompt)
         conversation_id, _immediate_response = self._extract_ask_result(stdout)
         if new_conversation and prior_conversation_id == conversation_id:
             raise OpenCLIWebModelError("OPENCLI_WEB_CONVERSATION_ID_MISMATCH")
