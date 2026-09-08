@@ -1285,7 +1285,7 @@ def test_opencli_web_model_rejects_repair_reusing_original_conversation(
     assert detail_count == 3
 
 
-def test_opencli_web_model_repair_ask_timeout_fails_closed_without_history(
+def test_opencli_web_model_repair_ask_timeout_fails_closed_without_history_match(
     monkeypatch: pytest.MonkeyPatch,
 ):
     ask_count = 0
@@ -1314,6 +1314,15 @@ def test_opencli_web_model_repair_ask_timeout_fails_closed_without_history(
                 stderr="",
             )
         if args[1:3] == ["chatgpt", "detail"]:
+            if args[3] == "unrelated-conversation":
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps([
+                        {"Index": 1, "Role": "User", "Text": "other turn", "Generating": False},
+                        {"Index": 2, "Role": "Assistant", "Text": "unrelated", "Generating": False},
+                    ]),
+                    stderr="",
+                )
             return SimpleNamespace(
                 returncode=0,
                 stdout=json.dumps([
@@ -1328,7 +1337,11 @@ def test_opencli_web_model_repair_ask_timeout_fails_closed_without_history(
                 stderr="",
             )
         if args[1:3] == ["chatgpt", "history"]:
-            raise AssertionError("repair timeout must not scan history")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"Id": "unrelated-conversation"}]),
+                stderr="",
+            )
         raise AssertionError(args)
 
     monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
@@ -1336,11 +1349,209 @@ def test_opencli_web_model_repair_ask_timeout_fails_closed_without_history(
     model._clock = clock
     model._sleep = clock.sleep
 
-    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TIMEOUT"):
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TIMEOUT_RECONCILE_UNKNOWN"):
         model.invoke([HumanMessage(content="inspect README")])
 
     assert ask_count == 2
-    assert "history" not in commands
+    assert commands.count("ask") == 2
+    assert commands.count("history") == 1
+
+
+@pytest.mark.parametrize(
+    ("history_rows", "candidate_details", "expected_error"),
+    [
+        ([{"Id": "fresh-a"}], {"fresh-a": True}, None),
+        ([{"Id": "fresh-a"}], {"fresh-a": False}, "UNKNOWN"),
+        ([{"Id": "fresh-a"}, {"Id": "fresh-b"}], {"fresh-a": True, "fresh-b": True}, "UNKNOWN"),
+        ([{"Id": "original-conversation"}], {"original-conversation": True}, "UNKNOWN"),
+        (
+            [{"Id": "original-conversation"}, {"Id": "fresh-a"}],
+            {"original-conversation": True, "fresh-a": True},
+            None,
+        ),
+    ],
+)
+def test_opencli_web_model_reconciles_timed_out_fresh_repair_by_unique_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    history_rows: list[dict[str, str]],
+    candidate_details: dict[str, bool],
+    expected_error: str | None,
+):
+    ask_count = 0
+    latest_prompt = ""
+    commands: list[list[str]] = []
+    run_envs: list[dict[str, str]] = []
+    clock = _FakeClock()
+    original_id = "original-conversation"
+
+    def fake_run(argv, **_kwargs):
+        nonlocal ask_count, latest_prompt
+        args = list(argv)
+        commands.append(args)
+        run_envs.append(dict(_kwargs.get("env") or {}))
+        assert args[args.index("--site-session") + 1] == "ephemeral"
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_count += 1
+            latest_prompt = args[3]
+            if ask_count == 2:
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="Browser exec command timed out; it may still complete in the browser.",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": original_id, "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "history"]:
+            assert args[3:] == ["--limit", "12", "--site-session", "ephemeral", "-f", "json"]
+            return SimpleNamespace(returncode=0, stdout=json.dumps(history_rows), stderr="")
+        if args[1:3] == ["chatgpt", "detail"]:
+            conversation_id = args[3]
+            if conversation_id == original_id:
+                response = '{"type":"final","content":"done"}}'
+                user_text = latest_prompt
+            elif candidate_details.get(conversation_id):
+                response = '{"type":"final","content":"done"}'
+                user_text = json.dumps({"turn_id": "turn_repair_expected"})
+            else:
+                response = "unrelated"
+                user_text = "other turn"
+            # The actual repair turn id is supplied after the first ask; this
+            # keeps the fixture independent of its hash implementation.
+            if (
+                conversation_id != original_id
+                and candidate_details.get(conversation_id)
+                and "turn_repair_" in latest_prompt
+            ):
+                user_text = latest_prompt
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": user_text, "Generating": False},
+                    {"Index": 2, "Role": "Assistant", "Text": response, "Generating": False},
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    model = OpenCLIWebChatModel(
+        executable="/opt/opencli",
+        intelligence_level="very-high",
+        opencli_profile="repair-profile",
+        site_session="ephemeral",
+    )
+    model._clock = clock
+    model._sleep = clock.sleep
+
+    if expected_error:
+        with pytest.raises(OpenCLIWebModelError, match=f"OPENCLI_WEB_TIMEOUT_RECONCILE_{expected_error}"):
+            model.bind_tools([]).invoke("inspect README")
+    else:
+        result = model.bind_tools([]).invoke("inspect README")
+        assert result.content == "done"
+    assert ask_count == 2
+    assert sum(args[1:3] == ["chatgpt", "ask"] for args in commands) == 2
+    assert all(env.get("OPENCLI_PROFILE") == "repair-profile" for env in run_envs)
+
+
+def test_opencli_web_model_fresh_repair_identity_requires_exact_unique_json_turn():
+    turn_id = "turn_repair_exact"
+    exact = json.dumps([
+        {"Role": "User", "Text": json.dumps({"turn_id": turn_id})},
+    ])
+    suffix = json.dumps([
+        {"Role": "User", "Text": json.dumps({"turn_id": turn_id + "-suffix"})},
+    ])
+    duplicate = json.dumps([
+        {"Role": "User", "Text": '{"turn_id":"turn_repair_exact","turn_id":"other"}'},
+    ])
+    repeated = json.dumps([
+        {"Role": "User", "Text": json.dumps({"turn_id": turn_id})},
+        {"Role": "User", "Text": json.dumps({"turn_id": turn_id})},
+    ])
+
+    assert OpenCLIWebChatModel._contains_exact_turn_id(exact, turn_id)
+    assert not OpenCLIWebChatModel._contains_exact_turn_id(suffix, turn_id)
+    assert not OpenCLIWebChatModel._contains_exact_turn_id(duplicate, turn_id)
+    assert not OpenCLIWebChatModel._contains_exact_turn_id(repeated, turn_id)
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TURN_IDENTITY_UNKNOWN"):
+        OpenCLIWebChatModel._extract_detail_response(
+            json.dumps([
+                {"Role": "User", "Text": json.dumps({"turn_id": turn_id})},
+                {"Role": "User", "Text": json.dumps({"turn_id": "later"})},
+                {"Role": "Assistant", "Text": '{"type":"final","content":"wrong"}', "Generating": False},
+            ]),
+            turn_id,
+        )
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TURN_IDENTITY_UNKNOWN"):
+        OpenCLIWebChatModel._extract_detail_response(
+            json.dumps([
+                {
+                    "Role": "User",
+                    "Text": json.dumps({"turn_id": turn_id + "-suffix", "note": turn_id}),
+                },
+                {"Role": "Assistant", "Text": '{"type":"final","content":"wrong"}', "Generating": False},
+            ]),
+            turn_id,
+        )
+
+
+def test_opencli_web_model_fresh_repair_reconciliation_stops_at_bounded_history(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    model = OpenCLIWebChatModel(
+        executable="/opt/opencli",
+        opencli_profile="repair-profile",
+        site_session="ephemeral",
+    )
+    ids = [f"conversation-{index}" for index in range(13)]
+    calls: list[list[str]] = []
+
+    def fake_run(argv):
+        args = list(argv)
+        calls.append(args)
+        if args[1:3] == ["chatgpt", "history"]:
+            return json.dumps([{"Id": value} for value in ids])
+        if args[1:3] == ["chatgpt", "detail"]:
+            return json.dumps([{"Role": "User", "Text": "other"}])
+        raise AssertionError(args)
+
+    monkeypatch.setattr(model, "_run", fake_run)
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TIMEOUT_RECONCILE_UNKNOWN"):
+        model._reconcile_fresh_repair_timeout("turn_repair_missing", "original")
+
+    history = calls[0]
+    assert history[history.index("--limit") + 1] == "12"
+    assert len([args for args in calls if args[1:3] == ["chatgpt", "detail"]]) == 12
+
+
+@pytest.mark.parametrize("failure_command", ["history", "detail"])
+def test_opencli_web_model_fresh_repair_reconciliation_propagates_readback_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_command: str,
+):
+    model = OpenCLIWebChatModel(
+        executable="/opt/opencli",
+        opencli_profile="repair-profile",
+        site_session="ephemeral",
+    )
+
+    def fake_run(argv):
+        command = list(argv)[2]
+        if command == failure_command:
+            raise OpenCLIWebModelError("OPENCLI_WEB_PROCESS_FAILURE")
+        if command == "history":
+            return json.dumps([{"Id": "candidate"}])
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(model, "_run", fake_run)
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_PROCESS_FAILURE"):
+        model._reconcile_fresh_repair_timeout("turn_repair_failure", "original")
 
 
 def test_opencli_web_model_protocol_repair_consumes_turn_budget_without_second_ask(

@@ -43,6 +43,7 @@ _BUSY_MARKERS = ("busy", "rate control", "rate-control", "too many requests")
 _MIN_WEB_SEND_INTERVAL_SECONDS = 15.0
 _POST_RESPONSE_SETTLE_SECONDS = 3.0
 _MAX_WEB_TURNS_PER_OPERATION = 12
+_MAX_HISTORY_CANDIDATES = 12
 _TERMINAL_RECORDER_TOOLS = frozenset({"record_finding", "record_diagnosis", "record_worker_result"})
 
 
@@ -53,6 +54,16 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise ValueError("duplicate JSON object key")
         result[key] = value
     return result
+
+
+def _user_turn_id(text: str) -> str | None:
+    try:
+        envelope = json.loads(text, object_pairs_hook=_reject_duplicate_json_keys)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(envelope, Mapping) and isinstance(envelope.get("turn_id"), str):
+        return envelope["turn_id"]
+    return None
 
 
 @dataclass
@@ -742,12 +753,15 @@ class OpenCLIWebChatModel(BaseChatModel):
                 for index, row in enumerate(rows)
                 if isinstance(row, Mapping)
                 and row.get("Role") == "User"
-                and expected_turn_id in str(row.get("Text") or "")
+                and isinstance(row.get("Text"), str)
+                and _user_turn_id(row["Text"]) == expected_turn_id
             ]
             if len(matching_user_indexes) != 1:
                 raise OpenCLIWebModelError("OPENCLI_WEB_TURN_IDENTITY_UNKNOWN")
             start = matching_user_indexes[0] + 1
         for row in rows[start:]:
+            if expected_turn_id and isinstance(row, Mapping) and row.get("Role") == "User":
+                raise OpenCLIWebModelError("OPENCLI_WEB_TURN_IDENTITY_UNKNOWN")
             if not isinstance(row, Mapping) or row.get("Role") != "Assistant":
                 continue
             text = row.get("Text")
@@ -765,10 +779,30 @@ class OpenCLIWebChatModel(BaseChatModel):
         if not isinstance(rows, list):
             raise OpenCLIWebModelError("OPENCLI_WEB_HISTORY_INVALID")
         result: list[str] = []
-        for row in rows[:12]:
+        for row in rows[:_MAX_HISTORY_CANDIDATES]:
             if isinstance(row, Mapping) and isinstance(row.get("Id"), str):
                 result.append(str(row["Id"]))
         return result
+
+    @staticmethod
+    def _contains_exact_turn_id(stdout: str, turn_id: str) -> bool:
+        """Return whether one detail payload contains the exact user turn."""
+        try:
+            rows = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise OpenCLIWebModelError("OPENCLI_WEB_RECONCILE_INVALID") from exc
+        if not isinstance(rows, list):
+            raise OpenCLIWebModelError("OPENCLI_WEB_RECONCILE_INVALID")
+        matches = 0
+        for row in rows:
+            if not isinstance(row, Mapping) or row.get("Role") != "User":
+                continue
+            text = row.get("Text")
+            if not isinstance(text, str):
+                continue
+            if _user_turn_id(text) == turn_id:
+                matches += 1
+        return matches == 1
 
     def _detail_response(self, conversation_id: str, *, wait: bool, turn_id: str = "") -> str:
         try:
@@ -873,6 +907,8 @@ class OpenCLIWebChatModel(BaseChatModel):
             self.executable,
             "chatgpt",
             "history",
+            "--limit",
+            str(_MAX_HISTORY_CANDIDATES),
             "--site-session",
             self.site_session,
             "-f",
@@ -893,6 +929,47 @@ class OpenCLIWebChatModel(BaseChatModel):
                 "json",
             ])
             if turn_id in detail:
+                matches.append(conversation_id)
+        if len(matches) != 1:
+            raise OpenCLIWebModelError("OPENCLI_WEB_TIMEOUT_RECONCILE_UNKNOWN")
+        self._conversation_id = matches[0]
+        return self._detail_response(matches[0], wait=True, turn_id=turn_id)
+
+    def _reconcile_fresh_repair_timeout(
+        self,
+        turn_id: str,
+        prior_conversation_id: str | None,
+    ) -> str:
+        """Recover one timed-out fresh repair from bounded read-only history."""
+        history = self._run([
+            self.executable,
+            "chatgpt",
+            "history",
+            "--limit",
+            str(_MAX_HISTORY_CANDIDATES),
+            "--site-session",
+            self.site_session,
+            "-f",
+            "json",
+        ])
+        candidate_ids = list(dict.fromkeys(self._extract_history_ids(history)))
+        matches: list[str] = []
+        for conversation_id in candidate_ids[:_MAX_HISTORY_CANDIDATES]:
+            if not conversation_id or conversation_id == prior_conversation_id:
+                continue
+            detail = self._run([
+                self.executable,
+                "chatgpt",
+                "detail",
+                conversation_id,
+                "--wait",
+                "false",
+                "--site-session",
+                self.site_session,
+                "-f",
+                "json",
+            ])
+            if self._contains_exact_turn_id(detail, turn_id):
                 matches.append(conversation_id)
         if len(matches) != 1:
             raise OpenCLIWebModelError("OPENCLI_WEB_TIMEOUT_RECONCILE_UNKNOWN")
@@ -962,6 +1039,7 @@ class OpenCLIWebChatModel(BaseChatModel):
             if isinstance(prompt_envelope, Mapping)
             else ""
         )
+        prior_conversation_id = self._conversation_id
         argv = [self.executable, "chatgpt", "ask", prompt]
         if self._conversation_id and not new_conversation:
             argv.extend(["--conversation", self._conversation_id])
@@ -987,9 +1065,13 @@ class OpenCLIWebChatModel(BaseChatModel):
             if response_finished_ref is not None:
                 response_finished_ref[0] = True
             if new_conversation:
+                if turn_id.startswith("turn_repair_"):
+                    return self._reconcile_fresh_repair_timeout(
+                        turn_id,
+                        prior_conversation_id,
+                    )
                 raise
             return self._reconcile_timeout(turn_id)
-        prior_conversation_id = self._conversation_id
         conversation_id, _immediate_response = self._extract_ask_result(stdout)
         if new_conversation and prior_conversation_id == conversation_id:
             raise OpenCLIWebModelError("OPENCLI_WEB_CONVERSATION_ID_MISMATCH")
