@@ -896,18 +896,39 @@ class OpenCLIWebChatModel(BaseChatModel):
                 raise OpenCLIWebModelError("OPENCLI_WEB_TURN_BUDGET_EXHAUSTED")
             self._web_turn_count += 1
 
-    def _send_and_reconcile(self, prompt: str, *, budget_reserved: bool = False) -> str:
+    def _send_and_reconcile(
+        self,
+        prompt: str,
+        *,
+        budget_reserved: bool = False,
+        new_conversation: bool = False,
+    ) -> str:
         if not budget_reserved:
             self._reserve_web_turn()
         if self._durable_pacing_backend is not None:
-            return self._durable_send_and_reconcile(prompt)
-        return self._inprocess_send_and_reconcile(prompt)
+            return self._durable_send_and_reconcile(
+                prompt,
+                new_conversation=new_conversation,
+            )
+        return self._inprocess_send_and_reconcile(
+            prompt,
+            new_conversation=new_conversation,
+        )
 
-    def _inprocess_send_and_reconcile(self, prompt: str) -> str:
+    def _inprocess_send_and_reconcile(
+        self,
+        prompt: str,
+        *,
+        new_conversation: bool = False,
+    ) -> str:
         pacing_state, pacing_key = self._begin_web_turn()
         response_ref = [False]
         try:
-            return self._execute_web_send(prompt, response_finished_ref=response_ref)
+            return self._execute_web_send(
+                prompt,
+                response_finished_ref=response_ref,
+                new_conversation=new_conversation,
+            )
         finally:
             self._finish_web_turn(
                 pacing_state,
@@ -915,7 +936,13 @@ class OpenCLIWebChatModel(BaseChatModel):
                 response_finished=response_ref[0],
             )
 
-    def _execute_web_send(self, prompt: str, *, response_finished_ref: list[bool] | None) -> str:
+    def _execute_web_send(
+        self,
+        prompt: str,
+        *,
+        response_finished_ref: list[bool] | None,
+        new_conversation: bool = False,
+    ) -> str:
         self._late_readback_used = False
         try:
             prompt_envelope = json.loads(prompt)
@@ -927,7 +954,7 @@ class OpenCLIWebChatModel(BaseChatModel):
             else ""
         )
         argv = [self.executable, "chatgpt", "ask", prompt]
-        if self._conversation_id:
+        if self._conversation_id and not new_conversation:
             argv.extend(["--conversation", self._conversation_id])
         else:
             argv.append("--new")
@@ -950,9 +977,11 @@ class OpenCLIWebChatModel(BaseChatModel):
                 raise
             if response_finished_ref is not None:
                 response_finished_ref[0] = True
+            if new_conversation:
+                raise
             return self._reconcile_timeout(turn_id)
         conversation_id, _immediate_response = self._extract_ask_result(stdout)
-        if self._conversation_id and conversation_id != self._conversation_id:
+        if self._conversation_id and not new_conversation and conversation_id != self._conversation_id:
             raise OpenCLIWebModelError("OPENCLI_WEB_CONVERSATION_ID_MISMATCH")
         self._conversation_id = conversation_id
         response = self._detail_response(conversation_id, wait=True, turn_id=turn_id)
@@ -960,7 +989,12 @@ class OpenCLIWebChatModel(BaseChatModel):
             response_finished_ref[0] = True
         return response
 
-    def _durable_send_and_reconcile(self, prompt: str) -> str:
+    def _durable_send_and_reconcile(
+        self,
+        prompt: str,
+        *,
+        new_conversation: bool = False,
+    ) -> str:
         backend = self._durable_pacing_backend
         if backend is None:
             raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_BACKEND_UNAVAILABLE")
@@ -987,7 +1021,11 @@ class OpenCLIWebChatModel(BaseChatModel):
                 last_response_finished=durable_state.last_response_finished,
             )
             _write_durable_state(backend.state_path(), new_state)
-            response = self._execute_web_send(prompt, response_finished_ref=response_ref)
+            response = self._execute_web_send(
+                prompt,
+                response_finished_ref=response_ref,
+                new_conversation=new_conversation,
+            )
             if response_ref[0]:
                 finish_state = DurablePacingState(
                     key=new_state.key,
@@ -1041,6 +1079,9 @@ class OpenCLIWebChatModel(BaseChatModel):
             {
                 "protocol": OPENCLI_WEB_PROTOCOL,
                 "turn_id": repair_turn_id,
+                "invalid_response": invalid_response,
+                "tools": [],
+                "tool_choice": "none",
                 "instruction": (
                     "Your immediately previous response was incomplete or invalid for the declared JSON "
                     "protocol. Repeat the same intended response as exactly one complete JSON object only. "
@@ -1051,7 +1092,10 @@ class OpenCLIWebChatModel(BaseChatModel):
             sort_keys=True,
             separators=(",", ":"),
         )
-        response = self._send_and_reconcile(repair_prompt)
+        response = self._send_and_reconcile(
+            repair_prompt,
+            new_conversation=True,
+        )
         if not self._is_complete_protocol_response(response):
             raise OpenCLIWebModelError("OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID")
         return response

@@ -965,11 +965,13 @@ def test_opencli_web_model_repairs_truncated_protocol_response_before_tool_execu
     latest_prompt = ""
     ask_prompts: list[str] = []
     ask_starts: list[float] = []
+    calls: list[list[str]] = []
     clock = _FakeClock()
 
     def fake_run(argv, **_kwargs):
         nonlocal ask_count, latest_prompt
         args = list(argv)
+        calls.append(args)
         if args[1:3] == ["chatgpt", "model"]:
             return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
         if args[1:3] == ["chatgpt", "ask"]:
@@ -979,7 +981,7 @@ def test_opencli_web_model_repairs_truncated_protocol_response_before_tool_execu
             ask_starts.append(clock())
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([{"conversationId": "web-conversation-1", "response": ""}]),
+                stdout=json.dumps([{"conversationId": f"web-conversation-{ask_count}", "response": ""}]),
                 stderr="",
             )
         if args[1:3] == ["chatgpt", "detail"]:
@@ -1015,10 +1017,72 @@ def test_opencli_web_model_repairs_truncated_protocol_response_before_tool_execu
 
     assert ask_count == 2
     assert ask_starts == [0.0, 15.0]
-    assert json.loads(ask_prompts[1])["turn_id"].startswith("turn_repair_")
+    initial_ask = next(
+        args
+        for args in calls
+        if args[1:3] == ["chatgpt", "ask"] and json.loads(args[3])["turn_id"].startswith("turn_")
+        and not json.loads(args[3])["turn_id"].startswith("turn_repair_")
+    )
+    repair_prompt = json.loads(ask_prompts[1])
+    assert repair_prompt["turn_id"].startswith("turn_repair_")
+    assert repair_prompt["invalid_response"] == (
+        '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README'
+    )
+    assert repair_prompt["tools"] == []
+    assert repair_prompt["tool_choice"] == "none"
+    assert initial_ask[initial_ask.index("--new")] == "--new"
+    repair_ask = next(
+        args for args in calls if args[1:3] == ["chatgpt", "ask"] and "turn_repair_" in args[3]
+    )
+    assert repair_ask[1:3] == ["chatgpt", "ask"]
+    assert "--new" in repair_ask
+    assert "--conversation" not in repair_ask
     assert model._web_turn_count == 2
     assert result.tool_calls[0]["name"] == "read_file"
     assert result.tool_calls[0]["args"] == {"file_path": "README.md"}
+
+
+def test_opencli_web_model_fails_closed_when_protocol_repair_is_still_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    ask_count = 0
+    latest_prompt = ""
+    clock = _FakeClock()
+
+    def fake_run(argv, **_kwargs):
+        nonlocal ask_count, latest_prompt
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_count += 1
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": f"web-conversation-{ask_count}", "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {"Index": 2, "Role": "Assistant", "Text": "{", "Generating": False},
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model._clock = clock
+    model._sleep = clock.sleep
+
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID"):
+        model.invoke([HumanMessage(content="inspect README")])
+
+    assert ask_count == 2
+    assert model._web_turn_count == 2
 
 
 def test_opencli_web_model_protocol_repair_consumes_turn_budget_without_second_ask(
