@@ -47,6 +47,19 @@ _MAX_HISTORY_CANDIDATES = 12
 _TERMINAL_RECORDER_TOOLS = frozenset({"record_finding", "record_diagnosis", "record_worker_result"})
 
 
+def _direct_terminal_recorder(envelope: Mapping[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """Return a strict direct terminal-record form and its internal arguments."""
+    if set(envelope) != {"type", "envelope"}:
+        return None
+    name = envelope.get("type")
+    payload = envelope.get("envelope")
+    if not isinstance(name, str) or name not in _TERMINAL_RECORDER_TOOLS:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    return name, {"envelope": dict(payload)}
+
+
 def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -712,7 +725,7 @@ class OpenCLIWebChatModel(BaseChatModel):
             "role": "model_transport_only",
             "rules": [
                 "Repository tools are executed by the external Open SWE runtime, not by ChatGPT Web.",
-                "If a tool is needed, return one JSON object with type=tool_call, name, and arguments.",
+                "If a non-terminal tool is needed, return one JSON object with type=tool_call, name, and arguments.",
                 "If no tool is needed, return one JSON object with type=final and content.",
                 "Do not claim that a tool ran unless a later tool message reports its result.",
             ],
@@ -720,6 +733,20 @@ class OpenCLIWebChatModel(BaseChatModel):
             "tools": tool_payloads,
             "tool_choice": tool_choice or "auto",
         }
+        declared_terminal = sorted(
+            _TERMINAL_RECORDER_TOOLS.intersection(
+                name for tool in tools if (name := _tool_name(tool))
+            )
+        )
+        if declared_terminal:
+            envelope["rules"].insert(
+                1,
+                "For declared terminal recorder tools "
+                + ", ".join(declared_terminal)
+                + " MUST use the direct JSON form "
+                + "{type:<tool_name>,envelope:{...}}; never wrap a terminal recorder in generic tool_call. "
+                + "Use generic tool_call only for non-terminal tools.",
+            )
         return json.dumps(envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
     @staticmethod
@@ -1136,8 +1163,8 @@ class OpenCLIWebChatModel(BaseChatModel):
     @staticmethod
     def _is_complete_protocol_response(response: str) -> bool:
         try:
-            envelope = json.loads(response)
-        except json.JSONDecodeError:
+            envelope = json.loads(response, object_pairs_hook=_reject_duplicate_json_keys)
+        except (json.JSONDecodeError, ValueError):
             return False
         if not isinstance(envelope, Mapping):
             return False
@@ -1148,7 +1175,7 @@ class OpenCLIWebChatModel(BaseChatModel):
             return isinstance(envelope.get("name"), str) and isinstance(
                 envelope.get("arguments"), Mapping
             )
-        return False
+        return _direct_terminal_recorder(envelope) is not None
 
     @staticmethod
     def _repair_matches_invalid_response(invalid_response: str, repaired_response: str) -> bool:
@@ -1241,16 +1268,30 @@ class OpenCLIWebChatModel(BaseChatModel):
     def _response_message(response: str, tools: Sequence[Mapping[str, Any]]) -> AIMessage:
         allowed = {name for tool in tools if (name := _tool_name(tool))}
         try:
-            envelope = json.loads(response)
-        except json.JSONDecodeError:
-            return AIMessage(content=response)
+            envelope = json.loads(response, object_pairs_hook=_reject_duplicate_json_keys)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise OpenCLIWebModelError("OPENCLI_WEB_TOOL_CALL_INVALID") from exc
         if not isinstance(envelope, Mapping):
-            return AIMessage(content=response)
+            raise OpenCLIWebModelError("OPENCLI_WEB_TOOL_CALL_INVALID")
         kind = envelope.get("type")
         if kind == "final" and isinstance(envelope.get("content"), str):
             return AIMessage(content=str(envelope["content"]))
         if kind != "tool_call":
-            return AIMessage(content=response)
+            direct = _direct_terminal_recorder(envelope)
+            if direct is None or direct[0] not in allowed:
+                raise OpenCLIWebModelError("OPENCLI_WEB_TOOL_CALL_INVALID")
+            name, args = direct
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": name,
+                        "args": args,
+                        "id": _tool_call_id(name, args, response),
+                        "type": "tool_call",
+                    }
+                ],
+            )
         name = envelope.get("name")
         arguments = envelope.get("arguments")
         if not isinstance(name, str) or name not in allowed or not isinstance(arguments, Mapping):
