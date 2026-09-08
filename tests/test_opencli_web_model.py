@@ -958,18 +958,22 @@ def test_opencli_web_model_refreshes_incomplete_readback_without_redispatch(
     assert result.tool_calls[0]["args"] == {"file_path": "README.md"}
 
 
-def test_opencli_web_model_repairs_truncated_protocol_response_before_tool_execution(
+def test_opencli_web_model_repairs_protocol_response_with_trailing_junk(
     monkeypatch: pytest.MonkeyPatch,
 ):
     ask_count = 0
     latest_prompt = ""
     ask_prompts: list[str] = []
     ask_starts: list[float] = []
+    calls: list[list[str]] = []
+    run_envs: list[dict[str, str]] = []
     clock = _FakeClock()
 
     def fake_run(argv, **_kwargs):
         nonlocal ask_count, latest_prompt
         args = list(argv)
+        calls.append(args)
+        run_envs.append(dict(_kwargs.get("env") or {}))
         if args[1:3] == ["chatgpt", "model"]:
             return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
         if args[1:3] == ["chatgpt", "ask"]:
@@ -979,14 +983,14 @@ def test_opencli_web_model_repairs_truncated_protocol_response_before_tool_execu
             ask_starts.append(clock())
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([{"conversationId": "web-conversation-1", "response": ""}]),
+                stdout=json.dumps([{"conversationId": f"web-conversation-{ask_count}", "response": ""}]),
                 stderr="",
             )
         if args[1:3] == ["chatgpt", "detail"]:
             text = (
                 '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}'
                 if ask_count >= 2
-                else '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README'
+                else '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}}'
             )
             return SimpleNamespace(
                 returncode=0,
@@ -1008,17 +1012,335 @@ def test_opencli_web_model_repairs_truncated_protocol_response_before_tool_execu
         """Read one repository file."""
         return file_path
 
-    model = OpenCLIWebChatModel(executable="/opt/opencli", intelligence_level="very-high")
+    model = OpenCLIWebChatModel(
+        executable="/opt/opencli",
+        intelligence_level="very-high",
+        opencli_profile="repair-profile",
+        site_session="ephemeral",
+    )
     model._clock = clock
     model._sleep = clock.sleep
     result = model.bind_tools([read_file]).invoke("inspect README")
 
     assert ask_count == 2
     assert ask_starts == [0.0, 15.0]
-    assert json.loads(ask_prompts[1])["turn_id"].startswith("turn_repair_")
+    initial_ask = next(
+        args
+        for args in calls
+        if args[1:3] == ["chatgpt", "ask"] and json.loads(args[3])["turn_id"].startswith("turn_")
+        and not json.loads(args[3])["turn_id"].startswith("turn_repair_")
+    )
+    repair_prompt = json.loads(ask_prompts[1])
+    assert repair_prompt["turn_id"].startswith("turn_repair_")
+    assert repair_prompt["invalid_response"] == (
+        '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}}'
+    )
+    assert repair_prompt["tools"] == []
+    assert repair_prompt["tool_choice"] == "none"
+    assert initial_ask[initial_ask.index("--new")] == "--new"
+    repair_ask = next(
+        args for args in calls if args[1:3] == ["chatgpt", "ask"] and "turn_repair_" in args[3]
+    )
+    assert repair_ask[1:3] == ["chatgpt", "ask"]
+    assert "--new" in repair_ask
+    assert "--conversation" not in repair_ask
+    assert all(env["OPENCLI_PROFILE"] == "repair-profile" for env in run_envs)
+    assert all(
+        args[args.index("--site-session") + 1] == "ephemeral"
+        for args in calls
+        if args[1:3] in (["chatgpt", "model"], ["chatgpt", "ask"], ["chatgpt", "detail"])
+    )
     assert model._web_turn_count == 2
     assert result.tool_calls[0]["name"] == "read_file"
     assert result.tool_calls[0]["args"] == {"file_path": "README.md"}
+
+
+def test_opencli_web_model_fails_closed_when_protocol_repair_is_still_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    ask_count = 0
+    latest_prompt = ""
+    clock = _FakeClock()
+
+    def fake_run(argv, **_kwargs):
+        nonlocal ask_count, latest_prompt
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_count += 1
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": f"web-conversation-{ask_count}", "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {"Index": 2, "Role": "Assistant", "Text": "{", "Generating": False},
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model._clock = clock
+    model._sleep = clock.sleep
+
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID"):
+        model.invoke([HumanMessage(content="inspect README")])
+
+    assert ask_count == 1
+    assert model._web_turn_count == 1
+
+
+@pytest.mark.parametrize(
+    ("invalid_response", "repaired_response"),
+    [
+        (
+            '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}}',
+            '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}',
+        ),
+    ],
+)
+def test_opencli_web_model_repair_preserves_protocol_object(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_response: str,
+    repaired_response: str,
+):
+    ask_count = 0
+    latest_prompt = ""
+    clock = _FakeClock()
+
+    def fake_run(argv, **_kwargs):
+        nonlocal ask_count, latest_prompt
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_count += 1
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": f"conversation-{ask_count}", "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            response = invalid_response if ask_count == 1 else repaired_response
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {"Index": 2, "Role": "Assistant", "Text": response, "Generating": False},
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+
+    @tool
+    def read_file(file_path: str) -> str:
+        """Read one repository file."""
+        return file_path
+
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model._clock = clock
+    model._sleep = clock.sleep
+    result = model.bind_tools([read_file]).invoke("inspect README")
+
+    assert ask_count == 2
+    assert result.tool_calls[0]["args"] == {"file_path": "README.md"}
+
+
+def test_opencli_web_model_rejects_repair_argument_drift_for_allowed_tool(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    ask_count = 0
+    latest_prompt = ""
+    clock = _FakeClock()
+
+    def fake_run(argv, **_kwargs):
+        nonlocal ask_count, latest_prompt
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_count += 1
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": f"conversation-{ask_count}", "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            response = (
+                '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}}'
+                if ask_count == 1
+                else '{"type":"tool_call","name":"read_file","arguments":{"file_path":"pyproject.toml"}}'
+            )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {"Index": 2, "Role": "Assistant", "Text": response, "Generating": False},
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+
+    @tool
+    def read_file(file_path: str) -> str:
+        """Read one repository file."""
+        return file_path
+
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model._clock = clock
+    model._sleep = clock.sleep
+
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID"):
+        model.bind_tools([read_file]).invoke("inspect README")
+
+    assert ask_count == 2
+
+
+@pytest.mark.parametrize(
+    ("invalid_response", "repaired_response"),
+    [
+        (
+            '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md","file_path":"pyproject.toml"}}}',
+            '{"type":"tool_call","name":"read_file","arguments":{"file_path":"pyproject.toml"}}',
+        ),
+        (
+            '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md","approved":true}}}',
+            '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md","approved":1}}',
+        ),
+    ],
+)
+def test_opencli_web_model_rejects_non_exact_repair_json_equivalence(
+    invalid_response: str,
+    repaired_response: str,
+):
+    assert not OpenCLIWebChatModel._repair_matches_invalid_response(
+        invalid_response,
+        repaired_response,
+    )
+
+
+def test_opencli_web_model_rejects_repair_reusing_original_conversation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    ask_count = 0
+    detail_count = 0
+    latest_prompt = ""
+    clock = _FakeClock()
+
+    def fake_run(argv, **_kwargs):
+        nonlocal ask_count, detail_count, latest_prompt
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_count += 1
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": "bound-conversation", "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            detail_count += 1
+            response = (
+                '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}'
+                if ask_count >= 2
+                else '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}}'
+            )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {"Index": 2, "Role": "Assistant", "Text": response, "Generating": False},
+                ]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "history"]:
+            raise AssertionError("repair must not scan history")
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model._clock = clock
+    model._sleep = clock.sleep
+
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_CONVERSATION_ID_MISMATCH"):
+        model.invoke([HumanMessage(content="inspect README")])
+
+    assert ask_count == 2
+    assert detail_count == 3
+
+
+def test_opencli_web_model_repair_ask_timeout_fails_closed_without_history(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    ask_count = 0
+    latest_prompt = ""
+    commands: list[str] = []
+    clock = _FakeClock()
+
+    def fake_run(argv, **_kwargs):
+        nonlocal ask_count, latest_prompt
+        args = list(argv)
+        commands.append(args[2])
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_count += 1
+            latest_prompt = args[3]
+            if ask_count == 2:
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="Browser exec command timed out; it may still complete in the browser.",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": "original-conversation", "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {
+                        "Index": 2,
+                        "Role": "Assistant",
+                        "Text": '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}}',
+                        "Generating": False,
+                    },
+                ]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "history"]:
+            raise AssertionError("repair timeout must not scan history")
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model._clock = clock
+    model._sleep = clock.sleep
+
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TIMEOUT"):
+        model.invoke([HumanMessage(content="inspect README")])
+
+    assert ask_count == 2
+    assert "history" not in commands
 
 
 def test_opencli_web_model_protocol_repair_consumes_turn_budget_without_second_ask(
@@ -1059,7 +1381,7 @@ def test_opencli_web_model_protocol_repair_consumes_turn_budget_without_second_a
     model._web_turn_count = 11
     _use_fake_clock(model)
 
-    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TURN_BUDGET_EXHAUSTED"):
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID"):
         model.invoke([HumanMessage(content="last admitted turn")])
 
     assert ask_count == 1
