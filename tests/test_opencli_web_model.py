@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 
 from nexus_open_swe_runtime import cli
@@ -444,6 +444,80 @@ def test_opencli_web_model_translates_declared_tool_call(monkeypatch: pytest.Mon
     assert result.tool_calls[0]["args"] == {"file_path": "README.md"}
     prompt = json.loads(calls[1][0][3])
     assert prompt["tools"][0]["function"]["name"] == "read_file"
+
+
+@pytest.mark.parametrize(
+    "tool_name", ["record_finding", "record_diagnosis", "record_worker_result"]
+)
+def test_opencli_web_model_finishes_locally_after_terminal_recorder_tool(tool_name):
+    model = OpenCLIWebChatModel(executable="/opt/opencli", intelligence_level="balanced")
+    model._select_intelligence_level = lambda: (_ for _ in ()).throw(
+        AssertionError("terminal recorder completion must not start another Web turn")
+    )
+    declared = [
+        {"type": "function", "function": {"name": tool_name, "parameters": {"type": "object"}}}
+    ]
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": tool_name,
+                    "args": {"envelope": {"status": "recorded"}},
+                    "id": "terminal-call-1",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(
+            content='{"status":"recorded"}',
+            tool_call_id="terminal-call-1",
+            name=tool_name,
+        ),
+    ]
+
+    result = model._generate(messages, tools=declared).generations[0].message
+
+    assert result.content == "Terminal recorder completed."
+    assert result.tool_calls == []
+    assert model._web_turn_count == 0
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_call_id", "content"),
+    [
+        ("read_file", "terminal-call-1", '{"status":"recorded"}'),
+        ("record_finding", "different-call", '{"status":"recorded"}'),
+        ("record_finding", "terminal-call-1", "not-json"),
+    ],
+)
+def test_opencli_web_model_does_not_short_circuit_unproven_terminal_tool(
+    tool_name, tool_call_id, content
+):
+    model = OpenCLIWebChatModel(executable="/opt/opencli", intelligence_level="balanced")
+    model._select_intelligence_level = lambda: (_ for _ in ()).throw(
+        AssertionError("normal Web path reached")
+    )
+    declared = [
+        {"type": "function", "function": {"name": tool_name, "parameters": {"type": "object"}}}
+    ]
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": tool_name,
+                    "args": {"envelope": {"status": "recorded"}},
+                    "id": "terminal-call-1",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(content=content, tool_call_id=tool_call_id, name=tool_name),
+    ]
+
+    with pytest.raises(AssertionError, match="normal Web path reached"):
+        model._generate(messages, tools=declared)
 
 
 def test_opencli_web_model_reuses_exact_conversation_for_next_model_turn(

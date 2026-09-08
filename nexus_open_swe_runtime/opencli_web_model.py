@@ -42,6 +42,7 @@ _BUSY_MARKERS = ("busy", "rate control", "rate-control", "too many requests")
 _MIN_WEB_SEND_INTERVAL_SECONDS = 15.0
 _POST_RESPONSE_SETTLE_SECONDS = 3.0
 _MAX_WEB_TURNS_PER_OPERATION = 12
+_TERMINAL_RECORDER_TOOLS = frozenset({"record_finding", "record_diagnosis", "record_worker_result"})
 
 
 @dataclass
@@ -446,6 +447,34 @@ def _tool_name(tool: Mapping[str, Any]) -> str:
         return ""
     name = function.get("name")
     return str(name) if isinstance(name, str) else ""
+
+
+def _terminal_recorder_completed(
+    messages: Sequence[BaseMessage], tools: Sequence[Mapping[str, Any]]
+) -> bool:
+    if len(messages) < 2 or not isinstance(messages[-1], ToolMessage):
+        return False
+    tool_result = messages[-1]
+    if getattr(tool_result, "status", "success") == "error":
+        return False
+    if not isinstance(tool_result.content, str):
+        return False
+    try:
+        recorded = json.loads(tool_result.content)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(recorded, Mapping):
+        return False
+
+    request = messages[-2]
+    if not isinstance(request, AIMessage) or len(request.tool_calls) != 1:
+        return False
+    call = request.tool_calls[0]
+    if str(call.get("id") or "") != str(tool_result.tool_call_id or ""):
+        return False
+    name = str(call.get("name") or "")
+    declared = {declared_name for tool in tools if (declared_name := _tool_name(tool))}
+    return name in _TERMINAL_RECORDER_TOOLS and name in declared
 
 
 def _tool_call_id(name: str, arguments: Mapping[str, Any], raw: str) -> str:
@@ -1034,6 +1063,10 @@ class OpenCLIWebChatModel(BaseChatModel):
         tool_choice = kwargs.get("tool_choice")
         if tool_choice is not None and not isinstance(tool_choice, str):
             raise OpenCLIWebModelError("OPENCLI_WEB_TOOL_CHOICE_INVALID")
+
+        if _terminal_recorder_completed(messages, normalized_tools):
+            message = AIMessage(content="Terminal recorder completed.")
+            return ChatResult(generations=[ChatGeneration(message=message)])
 
         self._reserve_web_turn()
         self._select_intelligence_level()
