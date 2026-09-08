@@ -151,7 +151,6 @@ def test_worker_supported_diagnosis_produces_bounded_result_and_workspace_index(
     assert result["worker_identity_sha256"] == "c" * 64
     assert (workspace / "a.py").read_text(encoding="utf-8") == "VALUE = 2\n"
     request["operation"] = "worker_reconcile"
-    request["operation_id"] = "d" * 64
     request["prompt"] = ""
     request["artifact_path"] = ""
     reconciled = cli.dispatch(request)
@@ -218,6 +217,179 @@ def test_worker_ambiguous_repair_is_durable_unknown_and_not_reexecuted(tmp_path)
     assert second == first
     assert diagnosis.calls == 1
     assert repair.calls == 1
+
+
+def test_worker_reconcile_does_not_substitute_completed_operation_from_stale_workspace_index(tmp_path):
+    """A workspace index entry for operation A cannot complete target operation B."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+    operation_a = "a" * 64
+    operation_b = "b" * 64
+    completed_a = {
+        "schema": cli.RESULT_SCHEMA,
+        "kind": "worker",
+        "status": "COMPLETED",
+        "operation_id": operation_a,
+        "directory": str(workspace.resolve()),
+        "process_started": True,
+        "outcome_unknown": False,
+        "retry_safe": False,
+    }
+    cli._atomic_json(
+        state_root / "operations" / f"{operation_a}.json", completed_a
+    )
+    cli._atomic_json(
+        state_root / "workspaces" / f"{cli._sha256(str(workspace.resolve()))}.json",
+        completed_a,
+    )
+    cli._atomic_json(
+        state_root / "operations" / f"{operation_b}.json",
+        {
+            **completed_a,
+            "operation_id": operation_b,
+            "status": "STARTED",
+            "outcome_unknown": False,
+        },
+    )
+
+    result = cli.dispatch(
+        {
+            "schema": cli.REQUEST_SCHEMA,
+            "operation": "worker_reconcile",
+            "operation_id": operation_b,
+            "runtime_state_root": str(state_root),
+            "workspace_path": str(workspace),
+        }
+    )
+
+    assert result["operation_id"] == operation_b
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["outcome_unknown"] is True
+
+
+def test_worker_reconcile_fails_closed_on_same_operation_material_mismatch(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    other_workspace = tmp_path / "other-workspace"
+    other_workspace.mkdir()
+    state_root = tmp_path / "state"
+    operation_id = "c" * 64
+    cli._atomic_json(
+        state_root / "operations" / f"{operation_id}.json",
+        {
+            "schema": cli.RESULT_SCHEMA,
+            "kind": "worker",
+            "status": "COMPLETED",
+            "operation_id": operation_id,
+            "directory": str(workspace.resolve()),
+            "provider_id": "provider-a",
+            "model_id": "model-a",
+            "worker_identity_sha256": "d" * 64,
+            "process_started": True,
+            "outcome_unknown": False,
+            "retry_safe": False,
+        },
+    )
+
+    result = cli.dispatch(
+        {
+            "schema": cli.REQUEST_SCHEMA,
+            "operation": "worker_reconcile",
+            "operation_id": operation_id,
+            "runtime_state_root": str(state_root),
+            "workspace_path": str(other_workspace),
+            "provider_id": "provider-a",
+            "model_id": "model-a",
+            "worker_identity_sha256": "d" * 64,
+        }
+    )
+
+    assert result["operation_id"] == operation_id
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["outcome_unknown"] is True
+
+
+def test_worker_replay_with_changed_material_does_not_return_cached_terminal_or_redispatch(tmp_path):
+    request = _worker_request(tmp_path)
+    workspace = Path(request["workspace_path"])
+    operation_id = request["operation_id"]
+    terminal = {
+        "schema": cli.RESULT_SCHEMA,
+        "kind": "worker",
+        "status": "COMPLETED",
+        "operation_id": operation_id,
+        "directory": str(workspace.resolve()),
+        "provider_id": request["provider_id"],
+        "model_id": request["model_id"],
+        "worker_identity_sha256": request["worker_identity_sha256"],
+        "process_started": True,
+        "outcome_unknown": False,
+        "retry_safe": False,
+    }
+    cli._atomic_json(
+        Path(request["runtime_state_root"]) / "operations" / f"{operation_id}.json",
+        terminal,
+    )
+    changed = dict(request)
+    changed["workspace_path"] = str(tmp_path / "changed-workspace")
+    graph = FakeGraph(cli.REPAIR_TOOLS)
+
+    result = cli._worker_run(
+        changed,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: object(),
+        diagnosis_factory=lambda *_args: graph,
+        repair_factory=lambda *_args: graph,
+    )
+
+    assert result["operation_id"] == operation_id
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["outcome_unknown"] is True
+    assert graph.calls == 0
+
+
+@pytest.mark.parametrize(
+    "material",
+    ["prompt", "artifact", "session", "operation", "provider_id", "model_id", "worker_identity_sha256"],
+)
+def test_worker_replay_changed_execution_material_fails_closed(tmp_path, material):
+    request = _worker_request(tmp_path)
+    started = cli._write_started(request, "worker")
+    terminal = {**started, "status": "COMPLETED", "finished_at": cli._now()}
+    cli._atomic_json(
+        Path(request["runtime_state_root"]) / "operations" / f"{request['operation_id']}.json",
+        terminal,
+    )
+    changed = dict(request)
+    if material == "prompt":
+        changed["prompt"] = request["prompt"] + " changed"
+    elif material == "artifact":
+        Path(request["artifact_path"]).write_text('{"failure":"changed"}\n', encoding="utf-8")
+    elif material == "session":
+        changed["session_id"] = "ses_open_swe_changed"
+    elif material == "operation":
+        changed["operation"] = "worker_continue"
+    elif material == "provider_id":
+        changed["provider_id"] = ""
+    elif material == "model_id":
+        changed["model_id"] = ""
+    else:
+        changed["worker_identity_sha256"] = ""
+
+    graph = FakeGraph(cli.REPAIR_TOOLS)
+    result = cli._worker_run(
+        changed,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: object(),
+        diagnosis_factory=lambda *_args: graph,
+        repair_factory=lambda *_args: graph,
+    )
+
+    assert result["operation_id"] == request["operation_id"]
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["outcome_unknown"] is True
+    assert graph.calls == 0
 
 
 def test_scoped_repair_backend_rejects_out_of_scope_write(tmp_path):
@@ -500,5 +672,3 @@ def test_legacy_client_contract_frozen_fixture(tmp_path: Path):
     assert "raw" in result
     envelope = json.loads(result["raw"])
     assert envelope["schema"] == "external_execution_envelope.v1"
-
-
