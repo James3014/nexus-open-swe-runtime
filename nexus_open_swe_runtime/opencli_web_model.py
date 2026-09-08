@@ -15,7 +15,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
-from langchain_core.language_models.chat_models import BaseChatModel, LanguageModelInput
+from langchain_core.language_models.base import LangSmithParams, LanguageModelInput
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import Runnable
@@ -502,11 +503,10 @@ class OpenCLIWebChatModel(BaseChatModel):
 
     executable: str = "opencli"
     intelligence_level: str = "very-high"
-    profile: str = ""
     timeout_seconds: int = 120
     site_session: str = "ephemeral"
-    disable_streaming: bool = True
     runtime_state_root: str | None = None
+    opencli_profile: str = ""
     _conversation_id: str | None = PrivateAttr(default=None)
     _sleep: Callable[[float], None] = PrivateAttr(default=time.sleep)
     # Durable pacing uses epoch wall-clock timestamps so state survives reboot.
@@ -516,13 +516,36 @@ class OpenCLIWebChatModel(BaseChatModel):
     _budget_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
     _durable_pacing_backend: DurablePacingBackend | None = PrivateAttr(default=None)
 
+    def __init__(self, **data: Any) -> None:
+        if "profile" in data:
+            legacy_profile = data.pop("profile")
+            if isinstance(legacy_profile, str):
+                canonical_profile = data.get("opencli_profile", "")
+                if canonical_profile not in ("", legacy_profile):
+                    raise ValueError("profile and opencli_profile must match")
+                data["opencli_profile"] = legacy_profile
+            else:
+                data["profile"] = legacy_profile
+        else:
+            data.setdefault("opencli_profile", "")
+        data.setdefault("disable_streaming", True)
+        super().__init__(**data)
+        self._initialize_durable_pacing()
+
     def model_post_init(self, __context: Any) -> None:
         super().model_post_init(__context) if hasattr(super(), "model_post_init") else None
-        if self.runtime_state_root and self.profile:
+        self._initialize_durable_pacing()
+
+    def _initialize_durable_pacing(self) -> None:
+        if (
+            self.runtime_state_root
+            and self.opencli_profile
+            and self._durable_pacing_backend is None
+        ):
             self._durable_pacing_backend = DurablePacingBackend(
                 self.runtime_state_root,
                 executable=self.executable,
-                profile=self.profile,
+                profile=self.opencli_profile,
                 site_session=self.site_session,
                 clock=self._clock,
             )
@@ -536,8 +559,8 @@ class OpenCLIWebChatModel(BaseChatModel):
     def _llm_type(self) -> str:
         return "opencli-chatgpt-web"
 
-    def _get_ls_params(self, stop: list[str] | None = None, **kwargs: Any) -> dict[str, Any]:
-        params = dict(super()._get_ls_params(stop=stop, **kwargs))
+    def _get_ls_params(self, stop: list[str] | None = None, **kwargs: Any) -> LangSmithParams:
+        params = super()._get_ls_params(stop=stop, **kwargs)
         params["ls_provider"] = "opencli_chatgpt"
         params["ls_model_name"] = self.intelligence_level
         return params
@@ -568,8 +591,8 @@ class OpenCLIWebChatModel(BaseChatModel):
             for k, v in os.environ.items()
             if not (k.startswith("GITHUB_") or k.startswith("GH_") or "TOKEN" in k and "PROVIDER" not in k and "OPENCLI" not in k)
         }
-        if self.profile:
-            env["OPENCLI_PROFILE"] = self.profile
+        if self.opencli_profile:
+            env["OPENCLI_PROFILE"] = self.opencli_profile
         return env
 
     def _run(self, argv: Sequence[str]) -> str:
@@ -755,15 +778,15 @@ class OpenCLIWebChatModel(BaseChatModel):
         return self._extract_detail_response(detail, turn_id)
 
     def _session_pacing_state(self) -> _PacingState:
-        if not self.profile:
+        if not self.opencli_profile:
             return self._pacing_state
         return _shared_pacing_state(self._pacing_key(), clock=self._clock)
 
     def _pacing_key(self) -> tuple[str, str, str]:
-        return (self.executable, self.profile, self.site_session)
+        return (self.executable, self.opencli_profile, self.site_session)
 
     def _begin_web_turn(self) -> tuple[_PacingState, tuple[str, str, str] | None]:
-        pacing_key = self._pacing_key() if self.profile else None
+        pacing_key = self._pacing_key() if self.opencli_profile else None
         state = (
             _shared_pacing_state(pacing_key, borrow=True, clock=self._clock)
             if pacing_key is not None
