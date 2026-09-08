@@ -770,7 +770,7 @@ def _worker_run(
     try:
         task_id, unit_id, allowed_paths, session_id = _worker_context(request, prompt)
         runtime = runtime_loader()
-        model = model_factory(
+        diagnosis_model = model_factory(
             runtime,
             provider,
             model_id,
@@ -778,11 +778,8 @@ def _worker_run(
             request.get("runtime_state_root"),
         )
         profile_key = f"{provider}:{model_id}"
-        diagnosis_graph = diagnosis_factory(model, workspace, runtime, profile_key)
-        repair_graph = repair_factory(model, workspace, runtime, allowed_paths, profile_key)
+        diagnosis_graph = diagnosis_factory(diagnosis_model, workspace, runtime, profile_key)
         if set(executable_tool_surface(diagnosis_graph)) != DIAGNOSIS_TOOLS:
-            raise RuntimeErrorBounded("OPEN_SWE_TOOL_SURFACE_INVALID")
-        if set(executable_tool_surface(repair_graph)) != REPAIR_TOOLS:
             raise RuntimeErrorBounded("OPEN_SWE_TOOL_SURFACE_INVALID")
         evidence = artifact.read_text(encoding="utf-8")
         diagnosis_output = diagnosis_graph.invoke(
@@ -826,6 +823,26 @@ def _worker_run(
                         raise RuntimeErrorBounded("OPEN_SWE_DIAGNOSIS_EVIDENCE_INVALID")
             repair_admitted = True
             repair_phase_count = 1
+            repair_model = model_factory(
+                runtime,
+                provider,
+                model_id,
+                request.get("transport_config"),
+                request.get("runtime_state_root"),
+            )
+            if repair_model is diagnosis_model:
+                raise RuntimeErrorBounded("OPEN_SWE_PHASE_MODEL_REUSE")
+            if provider == "opencli_chatgpt" and getattr(repair_model, "_conversation_id", None):
+                raise RuntimeErrorBounded("OPENCLI_WEB_REPAIR_CONVERSATION_REUSE")
+            repair_graph = repair_factory(
+                repair_model,
+                workspace,
+                runtime,
+                allowed_paths,
+                profile_key,
+            )
+            if set(executable_tool_surface(repair_graph)) != REPAIR_TOOLS:
+                raise RuntimeErrorBounded("OPEN_SWE_TOOL_SURFACE_INVALID")
             repair_output = repair_graph.invoke(
                 {
                     "messages": [
