@@ -1200,6 +1200,205 @@ def test_opencli_web_model_reconciles_bound_timeout_without_history_scan(
     assert "history" not in commands
 
 
+def test_opencli_web_model_recovers_bound_timeout_with_one_late_readback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    ask_count = 0
+    detail_waits: list[str] = []
+    commands: list[str] = []
+    latest_prompt = ""
+
+    def fake_run(argv, **_kwargs):
+        nonlocal ask_count, latest_prompt
+        args = list(argv)
+        commands.append(args[2])
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_count += 1
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="Browser exec command timed out; it may still complete in the browser.",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            wait = args[args.index("--wait") + 1]
+            detail_waits.append(wait)
+            if wait == "true":
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="Browser exec command timed out; it may still complete in the browser.",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {
+                        "Index": 2,
+                        "Role": "Assistant",
+                        "Text": '{"type":"final","content":"late"}',
+                        "Generating": False,
+                    },
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model._conversation_id = "bound-conversation"
+
+    assert model.invoke([HumanMessage(content="bound timeout")]).content == "late"
+    assert ask_count == 1
+    assert detail_waits == ["true", "false"]
+    assert "history" not in commands
+
+
+def test_opencli_web_model_recovers_detail_timeout_after_successful_ask(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    ask_count = 0
+    detail_waits: list[str] = []
+    commands: list[str] = []
+    latest_prompt = ""
+
+    def fake_run(argv, **_kwargs):
+        nonlocal ask_count, latest_prompt
+        args = list(argv)
+        commands.append(args[2])
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_count += 1
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": "bound-conversation", "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            wait = args[args.index("--wait") + 1]
+            detail_waits.append(wait)
+            if wait == "true":
+                return SimpleNamespace(
+                    returncode=75,
+                    stdout="",
+                    stderr="chatgpt detail timed out after 120s; Conversation did not finish.",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {
+                        "Index": 2,
+                        "Role": "Assistant",
+                        "Text": '{"type":"final","content":"late after ask"}',
+                        "Generating": False,
+                    },
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+
+    assert model.invoke([HumanMessage(content="detail timeout")]).content == "late after ask"
+    assert ask_count == 1
+    assert detail_waits == ["true", "false"]
+    assert "history" not in commands
+
+
+@pytest.mark.parametrize(
+    ("assistant_rows", "error"),
+    [
+        (
+            [
+                {
+                    "Index": 2,
+                    "Role": "Assistant",
+                    "Text": '{"type":"final","content":"still generating"}',
+                    "Generating": True,
+                },
+            ],
+            "OPENCLI_WEB_RECONCILE_INCOMPLETE",
+        ),
+        (
+            [
+                {
+                    "Index": 2,
+                    "Role": "User",
+                    "Text": "different turn",
+                    "Generating": False,
+                },
+                {
+                    "Index": 3,
+                    "Role": "Assistant",
+                    "Text": '{"type":"final","content":"ambiguous"}',
+                    "Generating": False,
+                },
+            ],
+            "OPENCLI_WEB_TURN_IDENTITY_UNKNOWN",
+        ),
+    ],
+)
+def test_opencli_web_model_fails_closed_on_invalid_late_readback(
+    monkeypatch: pytest.MonkeyPatch,
+    assistant_rows: list[dict[str, object]],
+    error: str,
+):
+    ask_count = 0
+    detail_waits: list[str] = []
+    commands: list[str] = []
+    latest_prompt = ""
+
+    def fake_run(argv, **_kwargs):
+        nonlocal ask_count, latest_prompt
+        args = list(argv)
+        commands.append(args[2])
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_count += 1
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="Browser exec command timed out; it may still complete in the browser.",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            wait = args[args.index("--wait") + 1]
+            detail_waits.append(wait)
+            if wait == "true":
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="Browser exec command timed out; it may still complete in the browser.",
+                )
+            rows = (
+                [
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                ]
+                if error != "OPENCLI_WEB_TURN_IDENTITY_UNKNOWN"
+                else []
+            )
+            rows.extend(assistant_rows)
+            return SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr="")
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model._conversation_id = "bound-conversation"
+
+    with pytest.raises(OpenCLIWebModelError, match=error):
+        model.invoke([HumanMessage(content="bound timeout")])
+    assert ask_count == 1
+    assert detail_waits == ["true", "false"]
+    assert "history" not in commands
+
+
 def test_opencli_web_model_fails_closed_on_process_error(monkeypatch: pytest.MonkeyPatch):
     def fake_run(_argv, **_kwargs):
         return SimpleNamespace(returncode=69, stdout="", stderr="browser unavailable")
@@ -1212,6 +1411,26 @@ def test_opencli_web_model_fails_closed_on_process_error(monkeypatch: pytest.Mon
 
     with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_PROCESS_FAILURE"):
         model.invoke("hello")
+
+
+def test_opencli_web_model_classifies_opencli_detail_timeout_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fake_run(_argv, **_kwargs):
+        return SimpleNamespace(
+            returncode=75,
+            stdout="",
+            stderr="chatgpt detail timed out after 120s; Conversation did not finish.",
+        )
+
+    monkeypatch.setattr(
+        "nexus_open_swe_runtime.opencli_web_model.subprocess.run",
+        fake_run,
+    )
+    model = OpenCLIWebChatModel(executable="opencli", intelligence_level="very-high")
+
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TIMEOUT"):
+        model._run(["opencli", "chatgpt", "detail", "conversation"])
 
 
 # ---------------------------------------------------------------------------
