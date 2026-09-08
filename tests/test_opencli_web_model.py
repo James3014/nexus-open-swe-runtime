@@ -958,7 +958,7 @@ def test_opencli_web_model_refreshes_incomplete_readback_without_redispatch(
     assert result.tool_calls[0]["args"] == {"file_path": "README.md"}
 
 
-def test_opencli_web_model_repairs_truncated_protocol_response_before_tool_execution(
+def test_opencli_web_model_repairs_protocol_response_with_trailing_junk(
     monkeypatch: pytest.MonkeyPatch,
 ):
     ask_count = 0
@@ -990,7 +990,7 @@ def test_opencli_web_model_repairs_truncated_protocol_response_before_tool_execu
             text = (
                 '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}'
                 if ask_count >= 2
-                else '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README'
+                else '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}}'
             )
             return SimpleNamespace(
                 returncode=0,
@@ -1033,7 +1033,7 @@ def test_opencli_web_model_repairs_truncated_protocol_response_before_tool_execu
     repair_prompt = json.loads(ask_prompts[1])
     assert repair_prompt["turn_id"].startswith("turn_repair_")
     assert repair_prompt["invalid_response"] == (
-        '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README'
+        '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}}'
     )
     assert repair_prompt["tools"] == []
     assert repair_prompt["tool_choice"] == "none"
@@ -1094,8 +1094,8 @@ def test_opencli_web_model_fails_closed_when_protocol_repair_is_still_invalid(
     with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID"):
         model.invoke([HumanMessage(content="inspect README")])
 
-    assert ask_count == 2
-    assert model._web_turn_count == 2
+    assert ask_count == 1
+    assert model._web_turn_count == 1
 
 
 @pytest.mark.parametrize(
@@ -1103,10 +1103,6 @@ def test_opencli_web_model_fails_closed_when_protocol_repair_is_still_invalid(
     [
         (
             '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}}',
-            '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}',
-        ),
-        (
-            '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README',
             '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}',
         ),
     ],
@@ -1183,7 +1179,7 @@ def test_opencli_web_model_rejects_repair_argument_drift_for_allowed_tool(
             )
         if args[1:3] == ["chatgpt", "detail"]:
             response = (
-                '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README'
+                '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}}'
                 if ask_count == 1
                 else '{"type":"tool_call","name":"read_file","arguments":{"file_path":"pyproject.toml"}}'
             )
@@ -1214,6 +1210,29 @@ def test_opencli_web_model_rejects_repair_argument_drift_for_allowed_tool(
     assert ask_count == 2
 
 
+@pytest.mark.parametrize(
+    ("invalid_response", "repaired_response"),
+    [
+        (
+            '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md","file_path":"pyproject.toml"}}}',
+            '{"type":"tool_call","name":"read_file","arguments":{"file_path":"pyproject.toml"}}',
+        ),
+        (
+            '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md","approved":true}}}',
+            '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md","approved":1}}',
+        ),
+    ],
+)
+def test_opencli_web_model_rejects_non_exact_repair_json_equivalence(
+    invalid_response: str,
+    repaired_response: str,
+):
+    assert not OpenCLIWebChatModel._repair_matches_invalid_response(
+        invalid_response,
+        repaired_response,
+    )
+
+
 def test_opencli_web_model_rejects_repair_reusing_original_conversation(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1240,7 +1259,7 @@ def test_opencli_web_model_rejects_repair_reusing_original_conversation(
             response = (
                 '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}'
                 if ask_count >= 2
-                else '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README'
+                else '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}}'
             )
             return SimpleNamespace(
                 returncode=0,
@@ -1299,7 +1318,12 @@ def test_opencli_web_model_repair_ask_timeout_fails_closed_without_history(
                 returncode=0,
                 stdout=json.dumps([
                     {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
-                    {"Index": 2, "Role": "Assistant", "Text": "{", "Generating": False},
+                    {
+                        "Index": 2,
+                        "Role": "Assistant",
+                        "Text": '{"type":"tool_call","name":"read_file","arguments":{"file_path":"README.md"}}}',
+                        "Generating": False,
+                    },
                 ]),
                 stderr="",
             )
@@ -1357,7 +1381,7 @@ def test_opencli_web_model_protocol_repair_consumes_turn_budget_without_second_a
     model._web_turn_count = 11
     _use_fake_clock(model)
 
-    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TURN_BUDGET_EXHAUSTED"):
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID"):
         model.invoke([HumanMessage(content="last admitted turn")])
 
     assert ask_count == 1
