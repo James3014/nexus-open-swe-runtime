@@ -1059,6 +1059,20 @@ class OpenCLIWebChatModel(BaseChatModel):
             )
         return False
 
+    @staticmethod
+    def _repair_matches_invalid_response(invalid_response: str, repaired_response: str) -> bool:
+        try:
+            repaired_envelope = json.loads(repaired_response)
+        except json.JSONDecodeError:
+            return False
+        try:
+            invalid_envelope, prefix_end = json.JSONDecoder().raw_decode(invalid_response)
+        except json.JSONDecodeError:
+            return repaired_response.startswith(invalid_response)
+        if prefix_end < len(invalid_response):
+            return repaired_envelope == invalid_envelope
+        return repaired_envelope == invalid_envelope
+
     def _refresh_protocol_response(self, response: str, *, turn_id: str) -> str:
         if self._is_complete_protocol_response(response) or not self._conversation_id:
             return response
@@ -1103,7 +1117,10 @@ class OpenCLIWebChatModel(BaseChatModel):
             repair_prompt,
             new_conversation=True,
         )
-        if not self._is_complete_protocol_response(response):
+        if (
+            not self._is_complete_protocol_response(response)
+            or not self._repair_matches_invalid_response(invalid_response, response)
+        ):
             raise OpenCLIWebModelError("OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID")
         return response
 
