@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -38,6 +40,21 @@ def _record(name: str, envelope: dict):
 
 def _runtime():
     return {"human_message": lambda content: content}
+
+
+def test_cli_rejects_non_object_json_fail_closed() -> None:
+    process = subprocess.run(
+        [sys.executable, str(Path(cli.__file__).resolve())],
+        input="[]\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    result = json.loads(process.stdout)
+    assert process.returncode == 0
+    assert result["status"] == "OPEN_SWE_RUNTIME_PROTOCOL_FAILED"
+    assert result["provider_id"] == ""
+    assert result["model_id"] == ""
 
 
 def _semantic_request(tmp_path: Path) -> dict:

@@ -125,7 +125,7 @@ def test_build_model_selects_opencli_web_bridge_without_langchain_provider():
 
     assert isinstance(model, OpenCLIWebChatModel)
     assert model.executable == "/opt/opencli"
-    assert model.profile == "profile-a"
+    assert model.opencli_profile == "profile-a"
     assert model.site_session == "persistent"
     assert model.timeout_seconds == 240
 
@@ -149,9 +149,37 @@ def test_build_model_ignores_ambient_opencli_binding(monkeypatch: pytest.MonkeyP
     )
 
     assert model.executable == "/opt/opencli"
-    assert model.profile == "correct-profile"
+    assert model.opencli_profile == "correct-profile"
     assert model.site_session == "persistent"
     assert model.timeout_seconds == 120
+
+
+def test_opencli_profile_round_trip_preserves_pacing_identity():
+    model = OpenCLIWebChatModel(
+        executable="/opt/opencli",
+        profile="profile-round-trip",
+        site_session="persistent",
+    )
+
+    restored = OpenCLIWebChatModel.model_validate(model.model_dump())
+
+    assert model.profile is None
+    assert restored.profile is None
+    assert restored.opencli_profile == model.opencli_profile
+    assert restored._pacing_key() == model._pacing_key()
+
+
+def test_opencli_profile_preserves_langchain_profile_and_rejects_conflict():
+    langchain_profile = {"name": "base-profile"}
+    model = OpenCLIWebChatModel(
+        profile=langchain_profile,
+        opencli_profile="canonical-profile",
+    )
+
+    assert model.profile == langchain_profile
+    assert model.opencli_profile == "canonical-profile"
+    with pytest.raises(ValueError, match="must match"):
+        OpenCLIWebChatModel(profile="legacy-profile", opencli_profile="other-profile")
 
 
 def test_build_model_rejects_missing_unknown_and_out_of_range_transport_config():

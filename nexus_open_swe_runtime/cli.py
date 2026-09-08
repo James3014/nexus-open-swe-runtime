@@ -946,6 +946,7 @@ def dispatch(
 
 
 def main() -> int:
+    request: dict[str, Any] | None = None
     if len(sys.argv) > 1 and sys.argv[1] in {"--identity", "-i"}:
         identity_req = {"schema": REQUEST_SCHEMA, "operation": "identity"}
         print(_canonical_json(_identity_result(identity_req)))
@@ -960,10 +961,8 @@ def main() -> int:
             raise RuntimeErrorBounded("OPEN_SWE_PROTOCOL_REQUEST_INVALID")
         result = dispatch(request)
     except Exception as exc:
-        provider = (
-            request.get("provider_id", "") if isinstance(locals().get("request"), dict) else ""
-        )
-        model = request.get("model_id", "") if isinstance(locals().get("request"), dict) else ""
+        provider = request.get("provider_id", "") if isinstance(request, dict) else ""
+        model = request.get("model_id", "") if isinstance(request, dict) else ""
         result = {
             "schema": RESULT_SCHEMA,
             "kind": "protocol",
