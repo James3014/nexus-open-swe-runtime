@@ -61,6 +61,18 @@ To prevent accidental PATH resolution and version skew between older embedded en
    - Ambiguous timeouts produce `OPEN_SWE_OUTCOME_UNKNOWN` (`outcome_unknown: true`). Such operations are reconcile-only; caller clients MUST NOT blindly redispatch them.
 4. **Preserved Generation State**: Upgrading `nexus-open-swe-runtime` reuses the same state directory. Package extraction does not create a fragmented second state universe.
 
+### Target operation reconciliation
+
+Reconciliation is bound to the request's exact `operation_id`. The corresponding
+`operations/<operation_id>.json` record is the only completion authority; a
+workspace index is a projection and cannot satisfy a different target operation.
+Workers also persist their resolved workspace and execution-material fingerprint
+(prompt plus artifact path/content) in the operation record. A terminal result
+is returned only when its operation and worker material (when supplied by an
+execution replay request) match; missing or mismatched material, including a
+legacy record without the required workspace binding, yields
+`OPEN_SWE_OUTCOME_UNKNOWN` and never re-dispatches execution.
+
 ## 5. Security & Authority Boundaries
 
 - **Execution Runtime Only**: The runtime possesses zero Workforce admission, Capability routing, Candidate acceptance, or Git commit/push authority.

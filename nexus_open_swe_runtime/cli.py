@@ -451,8 +451,46 @@ def _base_result(request: Mapping[str, Any], *, kind: str, status: str) -> dict[
     }
 
 
+def _worker_material_fingerprint(request: Mapping[str, Any]) -> str | None:
+    prompt = request.get("prompt")
+    artifact_path = request.get("artifact_path")
+    if not isinstance(prompt, str) or not isinstance(artifact_path, str):
+        return None
+    artifact = Path(artifact_path).expanduser().resolve()
+    try:
+        artifact_sha256 = _sha256(artifact.read_bytes())
+    except OSError:
+        artifact_sha256 = "unavailable"
+    return _sha256(
+        _canonical_json(
+            {
+                "operation": request.get("operation"),
+                "session_id": request.get("session_id"),
+                "workspace": str(
+                    Path(str(request.get("workspace_path") or ""))
+                    .expanduser()
+                    .resolve()
+                ),
+                "provider_id": request.get("provider_id"),
+                "model_id": request.get("model_id"),
+                "worker_identity_sha256": request.get("worker_identity_sha256"),
+                "prompt": prompt,
+                "artifact_path": str(artifact),
+                "artifact_sha256": artifact_sha256,
+            }
+        )
+    )
+
+
 def _write_started(request: Mapping[str, Any], kind: str) -> dict[str, Any]:
     state = _base_result(request, kind=kind, status="STARTED")
+    if kind == "worker" and request.get("workspace_path"):
+        state["directory"] = str(
+            Path(str(request["workspace_path"])).expanduser().resolve()
+        )
+        material_fingerprint = _worker_material_fingerprint(request)
+        if material_fingerprint is not None:
+            state["execution_material_sha256"] = material_fingerprint
     state["process_started"] = True
     state["finished_at"] = ""
     _atomic_json(_operation_path(request), state)
@@ -469,8 +507,51 @@ def _write_terminal(request: Mapping[str, Any], result: Mapping[str, Any]) -> di
 
 def _reconcile_operation(request: Mapping[str, Any], *, kind: str) -> dict[str, Any]:
     state = _read_json(_operation_path(request))
-    if state is not None and state.get("status") != "STARTED":
-        return state
+    operation_id = str(request.get("operation_id") or "")
+    if state is not None:
+        if state.get("operation_id") != operation_id or state.get("kind") != kind:
+            state = None
+        elif kind == "worker":
+            expected_workspace = request.get("workspace_path")
+            persisted_workspace = state.get("directory")
+            if not isinstance(expected_workspace, str) or not expected_workspace.strip():
+                state = None
+            else:
+                expected_workspace = str(
+                    Path(str(expected_workspace)).expanduser().resolve()
+                )
+                if (
+                    not isinstance(persisted_workspace, str)
+                    or not persisted_workspace
+                    or persisted_workspace != expected_workspace
+                ):
+                    state = None
+            for field in ("provider_id", "model_id", "worker_identity_sha256"):
+                expected = request.get(field)
+                if expected not in (None, "") and state is not None:
+                    if state.get(field) != expected:
+                        state = None
+                        break
+            if state is not None and request.get("operation") in {
+                "worker_run",
+                "worker_continue",
+            }:
+                expected_material = _worker_material_fingerprint(request)
+                if (
+                    not isinstance(expected_material, str)
+                    or state.get("execution_material_sha256") != expected_material
+                ):
+                    state = None
+                expected_session = request.get("session_id")
+                if (
+                    state is not None
+                    and isinstance(expected_session, str)
+                    and expected_session
+                    and state.get("session_id") != expected_session
+                ):
+                    state = None
+        if state is not None and state.get("status") != "STARTED":
+            return state
     result = _base_result(request, kind=kind, status="OPEN_SWE_OUTCOME_UNKNOWN")
     result.update(process_started=False, outcome_unknown=True, retry_safe=False)
     return result
@@ -626,8 +707,6 @@ def _worker_run(
 ) -> dict[str, Any]:
     existing = _read_json(_operation_path(request))
     if existing is not None:
-        if existing.get("status") != "STARTED":
-            return existing
         return _reconcile_operation(request, kind="worker")
     workspace = Path(str(request.get("workspace_path") or "")).expanduser().resolve()
     artifact = Path(str(request.get("artifact_path") or "")).expanduser().resolve()
@@ -767,18 +846,7 @@ def _worker_run(
 
 
 def _worker_reconcile(request: Mapping[str, Any]) -> dict[str, Any]:
-    state = _read_json(_workspace_index_path(request))
-    if state is not None:
-        return state
-    result = _base_result(request, kind="worker", status="OPEN_SWE_OUTCOME_UNKNOWN")
-    result.update(
-        directory=str(Path(str(request.get("workspace_path") or "")).expanduser().resolve()),
-        process_started=False,
-        outcome_unknown=True,
-        retry_safe=False,
-        worker_identity_sha256=str(request.get("worker_identity_sha256") or ""),
-    )
-    return result
+    return _reconcile_operation(request, kind="worker")
 
 
 def _identity_result(request: Mapping[str, Any]) -> dict[str, Any]:
