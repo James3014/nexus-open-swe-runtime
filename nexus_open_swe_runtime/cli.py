@@ -816,9 +816,14 @@ def _worker_run(
             if not paths:
                 raise RuntimeErrorBounded("OPEN_SWE_DIAGNOSIS_EVIDENCE_MISSING")
             for path in paths:
-                physical = (workspace / _safe_relative_path(path)).resolve()
-                if not physical.is_relative_to(workspace) or not physical.is_file():
+                relative = _safe_relative_path(path)
+                candidate = workspace / relative
+                physical = candidate.resolve()
+                if not physical.is_relative_to(workspace):
                     raise RuntimeErrorBounded("OPEN_SWE_DIAGNOSIS_EVIDENCE_INVALID")
+                if not physical.is_file():
+                    if candidate.is_symlink() or physical.exists() or relative not in allowed_paths:
+                        raise RuntimeErrorBounded("OPEN_SWE_DIAGNOSIS_EVIDENCE_INVALID")
             repair_admitted = True
             repair_phase_count = 1
             repair_output = repair_graph.invoke(

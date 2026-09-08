@@ -726,3 +726,172 @@ def test_legacy_client_contract_frozen_fixture(tmp_path: Path):
     assert "raw" in result
     envelope = json.loads(result["raw"])
     assert envelope["schema"] == "external_execution_envelope.v1"
+
+
+def test_worker_admits_repair_when_absent_create_target_matches_authorized_mutation_path(tmp_path):
+    request = _worker_request(tmp_path)
+    workspace = Path(request["workspace_path"])
+    target_rel = "tests/ops/new_canary.py"
+    target = workspace / target_rel
+    assert not target.exists()
+
+    request["prompt"] = "\n".join(
+        [
+            "task_id=task-1",
+            "unit_id=u1",
+            f'authorized_mutation_paths=["{target_rel}"]',
+            "bounded repair create target",
+        ]
+    )
+
+    diagnosis = FakeGraph(
+        cli.DIAGNOSIS_TOOLS,
+        _record(
+            "record_diagnosis",
+            {
+                "status": "ROOT_CAUSE_SUPPORTED",
+                "summary": "absent create target canary file",
+                "evidence_paths": [f"/{target_rel}"],
+            },
+        ),
+    )
+
+    def _create_target():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("CANARY = True\n", encoding="utf-8")
+
+    repair = FakeGraph(
+        cli.REPAIR_TOOLS,
+        _record("record_worker_result", {"summary": "created canary file"}),
+        effect=_create_target,
+    )
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: object(),
+        diagnosis_factory=lambda *_args: diagnosis,
+        repair_factory=lambda *_args: repair,
+    )
+
+    assert result["status"] == "COMPLETED"
+    assert result["diagnosis_status"] == "ROOT_CAUSE_SUPPORTED"
+    assert result["repair_admitted"] is True
+    assert result["repair_phase_count"] == 1
+    assert target.read_text(encoding="utf-8") == "CANARY = True\n"
+    assert diagnosis.calls == 1
+    assert repair.calls == 1
+
+
+def test_worker_blocks_repair_when_absent_evidence_path_outside_authorized_mutation_paths(tmp_path):
+    request = _worker_request(tmp_path)
+    workspace = Path(request["workspace_path"])
+    initial_files = {p.relative_to(workspace): p.read_bytes() for p in workspace.rglob("*") if p.is_file()}
+    unauthorized_rel = "tests/ops/unauthorized_absent.py"
+    target = workspace / unauthorized_rel
+    assert not target.exists()
+
+    request["prompt"] = "\n".join(
+        [
+            "task_id=task-1",
+            "unit_id=u1",
+            'authorized_mutation_paths=["tests/ops/new_canary.py"]',
+            "bounded repair unauthorized",
+        ]
+    )
+
+    diagnosis = FakeGraph(
+        cli.DIAGNOSIS_TOOLS,
+        _record(
+            "record_diagnosis",
+            {
+                "status": "ROOT_CAUSE_SUPPORTED",
+                "summary": "unauthorized absent file",
+                "evidence_paths": [f"/{unauthorized_rel}"],
+            },
+        ),
+    )
+
+    def _create_unauthorized():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("SHOULD_NOT_EXIST = True\n", encoding="utf-8")
+
+    repair = FakeGraph(
+        cli.REPAIR_TOOLS,
+        _record("record_worker_result", {"summary": "should not be called"}),
+        effect=_create_unauthorized,
+    )
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: object(),
+        diagnosis_factory=lambda *_args: diagnosis,
+        repair_factory=lambda *_args: repair,
+    )
+
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["outcome_unknown"] is True
+    assert result["repair_admitted"] is False
+    assert result["repair_phase_count"] == 0
+    assert repair.calls == 0
+    assert diagnosis.calls == 1
+    current_files = {p.relative_to(workspace): p.read_bytes() for p in workspace.rglob("*") if p.is_file()}
+    assert current_files == initial_files
+    assert not target.exists()
+
+
+def test_worker_blocks_repair_when_authorized_absent_path_is_dangling_symlink(tmp_path):
+    request = _worker_request(tmp_path)
+    workspace = Path(request["workspace_path"])
+    target_rel = "tests/ops/new_canary.py"
+    target = workspace / target_rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.symlink_to("missing-target.py")
+    missing_target = target.parent / "missing-target.py"
+    assert target.is_symlink()
+    assert not target.exists()
+
+    request["prompt"] = "\n".join(
+        [
+            "task_id=task-1",
+            "unit_id=u1",
+            f'authorized_mutation_paths=["{target_rel}"]',
+            "bounded repair dangling symlink",
+        ]
+    )
+
+    diagnosis = FakeGraph(
+        cli.DIAGNOSIS_TOOLS,
+        _record(
+            "record_diagnosis",
+            {
+                "status": "ROOT_CAUSE_SUPPORTED",
+                "summary": "authorized path is a dangling symlink",
+                "evidence_paths": [f"/{target_rel}"],
+            },
+        ),
+    )
+    repair = FakeGraph(
+        cli.REPAIR_TOOLS,
+        _record("record_worker_result", {"summary": "must not run"}),
+        effect=lambda: missing_target.write_text("SHOULD_NOT_EXIST = True\n", encoding="utf-8"),
+    )
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: object(),
+        diagnosis_factory=lambda *_args: diagnosis,
+        repair_factory=lambda *_args: repair,
+    )
+
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["outcome_unknown"] is True
+    assert result["repair_admitted"] is False
+    assert result["repair_phase_count"] == 0
+    assert diagnosis.calls == 1
+    assert repair.calls == 0
+    assert target.is_symlink()
+    assert target.readlink() == Path("missing-target.py")
+    assert not missing_target.exists()
