@@ -230,6 +230,303 @@ def test_worker_supported_diagnosis_produces_bounded_result_and_workspace_index(
     assert repair.calls == 1
 
 
+def test_worker_supported_diagnosis_and_repair_use_distinct_phase_models(tmp_path):
+    request = _worker_request(tmp_path)
+    events: list[str] = []
+    diagnosis = FakeGraph(
+        cli.DIAGNOSIS_TOOLS,
+        _record(
+            "record_diagnosis",
+            {
+                "status": "ROOT_CAUSE_SUPPORTED",
+                "summary": "supported",
+                "evidence_paths": ["a.py"],
+            },
+        ),
+        effect=lambda: events.append("diagnosis_invoke"),
+    )
+    repair = FakeGraph(
+        cli.REPAIR_TOOLS,
+        _record("record_worker_result", {"summary": "repaired"}),
+        effect=lambda: events.append("repair_invoke"),
+    )
+    models: list[object] = []
+    diagnosis_models: list[object] = []
+    repair_models: list[object] = []
+    model_args: list[tuple[object, ...]] = []
+
+    def model_factory(*args):
+        model = object()
+        models.append(model)
+        model_args.append(args)
+        events.append("model")
+        return model
+
+    def diagnosis_factory(model, *_args):
+        diagnosis_models.append(model)
+        events.append("diagnosis_graph")
+        return diagnosis
+
+    def repair_factory(model, *_args):
+        repair_models.append(model)
+        events.append("repair_graph")
+        return repair
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=model_factory,
+        diagnosis_factory=diagnosis_factory,
+        repair_factory=repair_factory,
+    )
+
+    assert result["status"] == "COMPLETED"
+    assert len(models) == 2
+    assert diagnosis_models == [models[0]]
+    assert repair_models == [models[1]]
+    assert models[0] is not models[1]
+    assert len(model_args) == 2
+    assert model_args[0] == model_args[1]
+    assert model_args[0][1:] == (
+        request["provider_id"],
+        request["model_id"],
+        request.get("transport_config"),
+        request["runtime_state_root"],
+    )
+    assert events == ["model", "diagnosis_graph", "diagnosis_invoke", "model", "repair_graph", "repair_invoke"]
+
+
+def test_worker_opencli_repair_phase_starts_without_diagnosis_conversation(tmp_path):
+    request = _worker_request(tmp_path)
+    request.update(
+        {
+            "provider_id": "opencli_chatgpt",
+            "model_id": "very-high",
+            "transport_config": {
+                "executable": "/opt/opencli",
+                "profile": "balanced",
+                "site_session": "ephemeral",
+                "timeout_seconds": 120,
+            },
+        }
+    )
+    diagnosis = FakeGraph(
+        cli.DIAGNOSIS_TOOLS,
+        _record(
+            "record_diagnosis",
+            {
+                "status": "ROOT_CAUSE_SUPPORTED",
+                "summary": "supported",
+                "evidence_paths": ["a.py"],
+            },
+        ),
+    )
+    repair = FakeGraph(
+        cli.REPAIR_TOOLS,
+        _record("record_worker_result", {"summary": "repaired"}),
+    )
+
+    class PhaseModel:
+        def __init__(self):
+            self._conversation_id = None
+
+    models: list[PhaseModel] = []
+
+    def model_factory(*_args):
+        model = PhaseModel()
+        models.append(model)
+        return model
+
+    def diagnosis_factory(model, *_args):
+        model._conversation_id = "diagnosis-conversation"
+        return diagnosis
+
+    def repair_factory(model, *_args):
+        assert model is models[1]
+        assert model._conversation_id is None
+        return repair
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=model_factory,
+        diagnosis_factory=diagnosis_factory,
+        repair_factory=repair_factory,
+    )
+
+    assert result["status"] == "COMPLETED"
+    assert len(models) == 2
+
+
+def test_worker_inconclusive_diagnosis_does_not_construct_repair_phase(tmp_path):
+    request = _worker_request(tmp_path)
+    diagnosis = FakeGraph(
+        cli.DIAGNOSIS_TOOLS,
+        _record(
+            "record_diagnosis",
+            {
+                "status": "INCONCLUSIVE",
+                "summary": "evidence is insufficient",
+                "evidence_paths": [],
+            },
+        ),
+    )
+    model_calls = 0
+    repair_calls = 0
+
+    def model_factory(*_args):
+        nonlocal model_calls
+        model_calls += 1
+        return object()
+
+    def repair_factory(*_args):
+        nonlocal repair_calls
+        repair_calls += 1
+        raise AssertionError("repair graph must not be constructed")
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=model_factory,
+        diagnosis_factory=lambda *_args: diagnosis,
+        repair_factory=repair_factory,
+    )
+
+    assert result["status"] == "COMPLETED"
+    assert result["diagnosis_status"] == "INCONCLUSIVE"
+    assert result["repair_admitted"] is False
+    assert result["repair_phase_count"] == 0
+    assert model_calls == 1
+    assert repair_calls == 0
+
+
+def test_worker_repair_model_construction_failure_is_unknown_without_repair_invocation(tmp_path):
+    request = _worker_request(tmp_path)
+    diagnosis = FakeGraph(
+        cli.DIAGNOSIS_TOOLS,
+        _record(
+            "record_diagnosis",
+            {
+                "status": "ROOT_CAUSE_SUPPORTED",
+                "summary": "supported",
+                "evidence_paths": ["a.py"],
+            },
+        ),
+    )
+    model_calls = 0
+    repair_calls = 0
+
+    def model_factory(*_args):
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls == 2:
+            raise RuntimeError("repair construction failed")
+        return object()
+
+    def repair_factory(*_args):
+        nonlocal repair_calls
+        repair_calls += 1
+        raise AssertionError("repair graph must not be invoked")
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=model_factory,
+        diagnosis_factory=lambda *_args: diagnosis,
+        repair_factory=repair_factory,
+    )
+
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["outcome_unknown"] is True
+    assert result["repair_admitted"] is True
+    assert result["repair_phase_count"] == 1
+    assert model_calls == 2
+    assert repair_calls == 0
+
+
+def test_worker_repair_graph_construction_failure_is_unknown_without_repair_invocation(tmp_path):
+    request = _worker_request(tmp_path)
+    diagnosis = FakeGraph(
+        cli.DIAGNOSIS_TOOLS,
+        _record(
+            "record_diagnosis",
+            {
+                "status": "ROOT_CAUSE_SUPPORTED",
+                "summary": "supported",
+                "evidence_paths": ["a.py"],
+            },
+        ),
+    )
+    models: list[object] = []
+
+    def model_factory(*_args):
+        model = object()
+        models.append(model)
+        return model
+
+    def repair_factory(*_args):
+        raise RuntimeError("repair graph construction failed")
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=model_factory,
+        diagnosis_factory=lambda *_args: diagnosis,
+        repair_factory=repair_factory,
+    )
+
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["outcome_unknown"] is True
+    assert result["repair_admitted"] is True
+    assert result["repair_phase_count"] == 1
+    assert len(models) == 2
+    assert models[0] is not models[1]
+
+
+@pytest.mark.parametrize("evidence_paths", [[], ["missing.py"]])
+def test_worker_invalid_diagnosis_evidence_never_constructs_repair(
+    tmp_path, evidence_paths: list[str]
+):
+    request = _worker_request(tmp_path)
+    diagnosis = FakeGraph(
+        cli.DIAGNOSIS_TOOLS,
+        _record(
+            "record_diagnosis",
+            {
+                "status": "ROOT_CAUSE_SUPPORTED",
+                "summary": "unsupported evidence",
+                "evidence_paths": evidence_paths,
+            },
+        ),
+    )
+    model_calls = 0
+    repair_calls = 0
+
+    def model_factory(*_args):
+        nonlocal model_calls
+        model_calls += 1
+        return object()
+
+    def repair_factory(*_args):
+        nonlocal repair_calls
+        repair_calls += 1
+        raise AssertionError("invalid evidence must block repair construction")
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=model_factory,
+        diagnosis_factory=lambda *_args: diagnosis,
+        repair_factory=repair_factory,
+    )
+
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["repair_admitted"] is False
+    assert result["repair_phase_count"] == 0
+    assert model_calls == 1
+    assert repair_calls == 0
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     [

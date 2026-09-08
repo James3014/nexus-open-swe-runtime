@@ -252,6 +252,70 @@ def test_opencli_web_model_uses_chatgpt_web_and_no_shell(monkeypatch: pytest.Mon
     assert prompt["messages"][-1]["content"] == "inspect the repository"
 
 
+def test_opencli_repair_phase_starts_new_conversation_with_shared_pacing_binding(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    ask_commands: list[list[str]] = []
+    latest_prompt = ""
+
+    def fake_run(argv, **_kwargs):
+        nonlocal latest_prompt
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_commands.append(args)
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": "repair-conversation", "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    [
+                            {"Role": "User", "Text": latest_prompt, "Generating": False},
+                        {
+                            "Role": "Assistant",
+                            "Text": '{"type":"final","content":"repair ok"}',
+                            "Generating": False,
+                        },
+                    ]
+                ),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    kwargs = {
+        "executable": "/opt/opencli",
+        "intelligence_level": "very-high",
+        "opencli_profile": "balanced",
+        "site_session": "ephemeral",
+        "runtime_state_root": str(tmp_path),
+    }
+    diagnosis_model = OpenCLIWebChatModel(**kwargs)
+    diagnosis_model._conversation_id = "diagnosis-conversation"
+    repair_model = OpenCLIWebChatModel(**kwargs)
+
+    assert repair_model._conversation_id is None
+    assert diagnosis_model._pacing_key() == repair_model._pacing_key()
+    assert diagnosis_model._durable_pacing_backend is not None
+    assert repair_model._durable_pacing_backend is not None
+    assert diagnosis_model._durable_pacing_backend.state_path() == repair_model._durable_pacing_backend.state_path()
+    assert diagnosis_model._durable_pacing_backend.lock_path() == repair_model._durable_pacing_backend.lock_path()
+
+    result = repair_model.invoke([HumanMessage(content="repair the supported root cause")])
+
+    assert result.content == "repair ok"
+    assert len(ask_commands) == 1
+    assert "--new" in ask_commands[0]
+    assert "--conversation" not in ask_commands[0]
+
+
 def test_opencli_web_model_rejects_invalid_site_session_before_subprocess(
     monkeypatch: pytest.MonkeyPatch,
 ):
