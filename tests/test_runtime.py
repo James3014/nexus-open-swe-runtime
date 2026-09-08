@@ -83,6 +83,60 @@ def _worker_request(tmp_path: Path) -> dict:
     }
 
 
+@pytest.mark.parametrize(
+    "raw_state",
+    [b"[]", b"null", b'"string"', b"123", b"true", b"{malformed"],
+)
+def test_corrupt_semantic_operation_state_fails_closed_without_effect_or_overwrite(
+    tmp_path, raw_state
+):
+    request = _semantic_request(tmp_path)
+    state_path = cli._operation_path(request)
+    state_path.parent.mkdir(parents=True)
+    state_path.write_bytes(raw_state)
+    graph = FakeGraph(
+        cli.SEMANTIC_TOOLS,
+        _record("record_finding", {"schema": "external_execution_envelope.v1"}),
+    )
+
+    result = cli._semantic_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: object(),
+        graph_factory=lambda *_args: graph,
+    )
+
+    assert result["status"] == "OPEN_SWE_OPERATION_STATE_CORRUPT"
+    assert graph.calls == 0
+    assert state_path.read_bytes() == raw_state
+
+
+@pytest.mark.parametrize(
+    "raw_state",
+    [b"[]", b"null", b'"string"', b"123", b"true", b"{malformed"],
+)
+def test_corrupt_worker_operation_state_fails_closed_without_effect_or_overwrite(
+    tmp_path, raw_state
+):
+    request = _worker_request(tmp_path)
+    state_path = cli._operation_path(request)
+    state_path.parent.mkdir(parents=True)
+    state_path.write_bytes(raw_state)
+    graph = FakeGraph(cli.DIAGNOSIS_TOOLS)
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: object(),
+        diagnosis_factory=lambda *_args: graph,
+        repair_factory=lambda *_args: graph,
+    )
+
+    assert result["status"] == "OPEN_SWE_OPERATION_STATE_CORRUPT"
+    assert graph.calls == 0
+    assert state_path.read_bytes() == raw_state
+
+
 def test_semantic_terminal_result_is_durable_and_reconcile_never_redispatches(tmp_path):
     request = _semantic_request(tmp_path)
     graph = FakeGraph(

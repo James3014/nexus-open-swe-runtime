@@ -435,6 +435,33 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     return value
 
 
+_CORRUPT_OPERATION_STATE = object()
+
+
+def _read_operation_state(path: Path) -> dict[str, Any] | None | object:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError):
+        return _CORRUPT_OPERATION_STATE
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _CORRUPT_OPERATION_STATE
+    return value if isinstance(value, dict) else _CORRUPT_OPERATION_STATE
+
+
+def _corrupt_operation_result(
+    request: Mapping[str, Any], *, kind: str
+) -> dict[str, Any]:
+    result = _base_result(
+        request, kind=kind, status="OPEN_SWE_OPERATION_STATE_CORRUPT"
+    )
+    result.update(error="OPEN_SWE_OPERATION_STATE_CORRUPT")
+    return result
+
+
 def _base_result(request: Mapping[str, Any], *, kind: str, status: str) -> dict[str, Any]:
     return {
         "schema": RESULT_SCHEMA,
@@ -506,7 +533,11 @@ def _write_terminal(request: Mapping[str, Any], result: Mapping[str, Any]) -> di
 
 
 def _reconcile_operation(request: Mapping[str, Any], *, kind: str) -> dict[str, Any]:
-    state = _read_json(_operation_path(request))
+    state = _read_operation_state(_operation_path(request))
+    if state is _CORRUPT_OPERATION_STATE:
+        return _corrupt_operation_result(request, kind=kind)
+    if state is not None and not isinstance(state, dict):
+        return _corrupt_operation_result(request, kind=kind)
     operation_id = str(request.get("operation_id") or "")
     if state is not None:
         if state.get("operation_id") != operation_id or state.get("kind") != kind:
@@ -566,7 +597,11 @@ def _semantic_run(
     ] = _build_model,
     graph_factory: Callable[[Any, Path, Mapping[str, Any], str], Any] = build_semantic_graph,
 ) -> dict[str, Any]:
-    existing = _read_json(_operation_path(request))
+    existing = _read_operation_state(_operation_path(request))
+    if existing is _CORRUPT_OPERATION_STATE:
+        return _corrupt_operation_result(request, kind="semantic")
+    if existing is not None and not isinstance(existing, dict):
+        return _corrupt_operation_result(request, kind="semantic")
     if existing is not None:
         if existing.get("status") != "STARTED":
             return existing
@@ -705,7 +740,11 @@ def _worker_run(
         [Any, Path, Mapping[str, Any], tuple[str, ...], str], Any
     ] = build_repair_graph,
 ) -> dict[str, Any]:
-    existing = _read_json(_operation_path(request))
+    existing = _read_operation_state(_operation_path(request))
+    if existing is _CORRUPT_OPERATION_STATE:
+        return _corrupt_operation_result(request, kind="worker")
+    if existing is not None and not isinstance(existing, dict):
+        return _corrupt_operation_result(request, kind="worker")
     if existing is not None:
         return _reconcile_operation(request, kind="worker")
     workspace = Path(str(request.get("workspace_path") or "")).expanduser().resolve()
