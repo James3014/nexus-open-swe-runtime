@@ -1564,13 +1564,18 @@ def test_v2_target_symlink_rejects(tmp_path):
 
 def _write_v2_mutation(request: dict, envelope: dict, *, refresh_hash: bool = True) -> None:
     artifact = Path(request["artifact_path"])
-    artifact.write_text(cli._canonical_json(envelope), encoding="utf-8")
+    canonical = cli._canonical_json(envelope)
+    artifact.write_text(canonical, encoding="utf-8")
     if refresh_hash:
-        digest = cli._sha256(cli._canonical_json(envelope))
+        digest = cli._sha256(canonical)
         request["prompt"] = "\n".join(
-            digest if line.startswith("envelope_sha256=") else line
+            f"envelope_sha256={digest}" if line.startswith("envelope_sha256=") else line
             for line in request["prompt"].splitlines()
         )
+        assert cli._prompt_field(request["prompt"], "envelope_sha256") == digest
+    assert cli._sha256(artifact.read_bytes()) == cli._prompt_field(
+        request["prompt"], "envelope_sha256"
+    )
 
 
 def _v2_matrix_request(tmp_path: Path, mutate, *, refresh_hash: bool = True) -> dict:
@@ -1581,6 +1586,13 @@ def _v2_matrix_request(tmp_path: Path, mutate, *, refresh_hash: bool = True) -> 
     return request
 
 
+def _mutate_card(request: dict, envelope: dict, old: str, new: str) -> None:
+    card = Path(request["workspace_path"]) / envelope["binding"]["task_card_ref"]
+    content = card.read_text(encoding="utf-8").replace(old, new, 1)
+    card.write_text(content, encoding="utf-8")
+    envelope["binding"]["task_card_hash"] = cli._sha256(card.read_bytes())
+
+
 @pytest.mark.parametrize(
     "name,mutate",
     [
@@ -1589,13 +1601,20 @@ def _v2_matrix_request(tmp_path: Path, mutate, *, refresh_hash: bool = True) -> 
         ("dirty_workspace", lambda _r, _e: None),
         ("card_ref", lambda _r, e: e["binding"].update(task_card_ref="tasks/other.md")),
         ("card_hash", lambda _r, e: e["binding"].update(task_card_hash="a" * 64)),
+        ("card_backtick", lambda r, e: _mutate_card(r, e, "`task-1`", "`task-1")),
+        ("card_status", lambda r, e: _mutate_card(r, e, "`ACTIVE`", "`PAUSED`")),
+        ("card_auto_chain", lambda r, e: _mutate_card(r, e, "- AUTO_CHAIN: `false`", "- AUTO_CHAIN: `true`")),
+        ("card_deletions", lambda r, e: _mutate_card(r, e, "- allow_deletions: `false`", "- allow_deletions: `true`")),
+        ("card_approve", lambda r, e: _mutate_card(r, e, "- worker_may_approve: `false`", "- worker_may_approve: `true`")),
+        ("card_integrate", lambda r, e: _mutate_card(r, e, "- worker_may_integrate: `false`", "- worker_may_integrate: `true`")),
+        ("card_push", lambda r, e: _mutate_card(r, e, "- worker_may_push: `false`", "- worker_may_push: `true`")),
         ("scope_paths", lambda _r, e: e["scope_signal"].update(required_test_edit_paths=["b.py"])),
         ("scope_max_files", lambda _r, e: e["scope_signal"].update(max_files=2)),
         ("scope_read_only", lambda _r, e: e["scope_signal"].update(read_only_authorities=[])),
         ("scope_production", lambda _r, e: e["scope_signal"].update(production_edit_paths=["a.py"])),
         ("scope_migration", lambda _r, e: e["scope_signal"].update(conditional_migration_paths=["a.py"])),
-        ("task_evidence", lambda _r, e: e["evidence_refs"].__setitem__(0, "task_card:tasks/task-card.md@" + "0" * 16)),
-        ("source_evidence", lambda _r, e: e["evidence_refs"].__setitem__(1, "source_absence:a.py@" + "0" * 16)),
+        ("task_evidence", lambda _r, e: e["evidence_refs"].__setitem__(0, "source_absence:a.py@" + "a" * 16)),
+        ("source_evidence", lambda _r, e: e["evidence_refs"].__setitem__(1, "source_absence:b.py@" + "b" * 16)),
         ("inspect_first", lambda _r, e: e["inspect_first"].__setitem__(1, "wrong-entry")),
         ("worker_mapping", lambda _r, _e: _r["worker_identity"].update(worker_id="other")),
         ("worker_hash", lambda _r, _e: _r.update(worker_identity_sha256="0" * 64)),
