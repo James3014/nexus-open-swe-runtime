@@ -471,8 +471,8 @@ def build_repair_graph(
             "access network, use Git/GitHub, commit, approve, merge, release, or deploy. "
             + (
                 "For the final mutation and result, call write_file_and_record_worker_result exactly "
-                "once with the file content and a short factual summary. Keep record_worker_result "
-                "available as the normal recorder when no composite mutation is appropriate."
+                "once with the file content and a short factual summary; this composite action is "
+                "the required terminal action for an admitted single-file repair."
                 if composite
                 else "Call record_worker_result exactly once with a short factual summary."
             )
@@ -683,6 +683,7 @@ def _composite_worker_result(
 
 
 def _persisted_composite_worker_result(
+    operation_journal: DurableOperationJournal,
     effect_journal: DurableEffectJournal,
 ) -> dict[str, Any] | None:
     """Recover this operation's already-persisted composite receipt.
@@ -692,7 +693,35 @@ def _persisted_composite_worker_result(
     receipts from another operation in the shared effects directory are
     ignored and cannot satisfy reconciliation.
     """
-    operation_id = str(effect_journal.identity.operation_id or "")
+    identity = operation_journal.identity
+    if (
+        effect_journal.identity.as_dict() != identity.as_dict()
+        or not identity.composite_admitted
+        or len(identity.allowed_paths) != 1
+    ):
+        return None
+    operation_id = str(identity.operation_id or "")
+    if not operation_id:
+        return None
+    workspace = Path(identity.workspace).resolve()
+    try:
+        allowed_path = _safe_relative_path(identity.allowed_paths[0])
+    except RuntimeErrorBounded:
+        return None
+    expected_path = (workspace / allowed_path).resolve()
+    if not expected_path.is_relative_to(workspace):
+        return None
+    try:
+        operation_state = operation_journal.read()
+    except (OSError, ValueError, RuntimeError):
+        return None
+    turn_id = operation_state.get("turn_id")
+    if not isinstance(turn_id, str) or not turn_id:
+        return None
+    # Rebind the effect journal to the operation's durable turn.  A fresh
+    # process otherwise has no in-memory turn binding and could accidentally
+    # accept an effect from a different turn.
+    effect_journal.bind_turn(turn_id)
     records: list[dict[str, Any]] = []
     for path in sorted(effect_journal.root.glob("effect_*.json")):
         try:
@@ -700,35 +729,79 @@ def _persisted_composite_worker_result(
         except (OSError, ValueError, RuntimeError):
             continue
         receipt = value.get("worker_result") if isinstance(value, Mapping) else None
+        if not isinstance(receipt, Mapping):
+            continue
+        required_receipt = {
+            "schema", "status", "operation_id", "turn_id", "tool_call_id", "effect_id",
+            "tool_name", "path", "postimage_sha256", "summary", "content_sha256",
+            "summary_sha256", "receipt_sha256",
+        }
+        if set(receipt) != required_receipt:
+            continue
+        arguments = value.get("arguments")
+        if not isinstance(arguments, Mapping):
+            continue
+        envelope = arguments.get("envelope")
+        content = arguments.get("content")
+        file_path = arguments.get("file_path")
+        summary = envelope.get("summary") if isinstance(envelope, Mapping) else None
+        tool_name = "write_file_and_record_worker_result"
         if (
-            value.get("status") == "RESULT"
-            and value.get("operation_id") == operation_id
-            and value.get("effect_id") == path.stem
-            and isinstance(receipt, Mapping)
-            and receipt.get("schema") == "nexus.open_swe_runtime.worker_result.v1"
-            and receipt.get("status") == "IMPLEMENTATION_EFFECT_COMPLETE"
-            and value.get("worker_result_sha256") == _sha256(_canonical_json(receipt))
-            and receipt.get("effect_id") == path.stem
-            and receipt.get("operation_id") == operation_id
-            and receipt.get("turn_id") == value.get("turn_id")
-            and receipt.get("tool_call_id") == value.get("tool_call_id")
-            and receipt.get("tool_name") == value.get("tool_name")
-            and receipt.get("path") == value.get("path")
-            and receipt.get("postimage_sha256") == value.get("postimage_sha256")
-            and receipt.get("content_sha256") == _sha256(str(value.get("postimage") or ""))
-            and receipt.get("summary_sha256") == _sha256(
-                str((value.get("arguments") or {}).get("envelope", {}).get("summary") or "")
-            )
+            value.get("status") != "RESULT"
+            or value.get("effect_id") != path.stem
+            or value.get("operation_id") != operation_id
+            or value.get("turn_id") != turn_id
+            or value.get("tool_name") != tool_name
+            or not isinstance(file_path, str)
+            or not isinstance(content, str)
+            or not isinstance(summary, str)
+            or arguments != {
+                "file_path": allowed_path,
+                "content": content,
+                "envelope": {"summary": summary},
+            }
+            or file_path != allowed_path
+            or value.get("path") != str(expected_path)
+            or value.get("postimage") != content
+            or value.get("postimage_sha256") != _sha256(content)
+            or value.get("preimage_sha256") == ""
+            or not isinstance(value.get("tool_call_id"), str)
+            or not value.get("tool_call_id")
         ):
-            records.append(dict(receipt))
+            continue
+        expected_effect_id = "effect_" + _sha256(_canonical_json({
+            "operation_id": operation_id,
+            "turn_id": turn_id,
+            "tool_call_id": value.get("tool_call_id"),
+            "tool_name": tool_name,
+            "arguments": dict(arguments),
+        }))
+        if value.get("effect_id") != expected_effect_id:
+            continue
+        if (
+            receipt.get("schema") != "nexus.open_swe_runtime.worker_result.v1"
+            or receipt.get("status") != "IMPLEMENTATION_EFFECT_COMPLETE"
+            or receipt.get("operation_id") != operation_id
+            or receipt.get("turn_id") != turn_id
+            or receipt.get("tool_call_id") != value.get("tool_call_id")
+            or receipt.get("effect_id") != expected_effect_id
+            or receipt.get("tool_name") != tool_name
+            or receipt.get("path") != str(expected_path)
+            or receipt.get("postimage_sha256") != _sha256(content)
+            or receipt.get("content_sha256") != _sha256(content)
+            or receipt.get("summary") != summary
+            or receipt.get("summary_sha256") != _sha256(summary)
+            or value.get("worker_result_sha256") != _sha256(_canonical_json(receipt))
+        ):
+            continue
+        receipt_material = dict(receipt)
+        receipt_hash = receipt_material.pop("receipt_sha256", None)
+        if receipt_hash != _sha256(_canonical_json(receipt_material)):
+            continue
+        records.append(dict(receipt))
     if len(records) != 1:
         return None
-    receipt = records[0]
-    material = dict(receipt)
-    receipt_hash = material.pop("receipt_sha256", None)
-    if receipt_hash != _sha256(_canonical_json(material)):
-        return None
-    return receipt
+    return records[0]
 
 
 def _prompt_field(prompt: str, name: str) -> str:
@@ -1859,7 +1932,7 @@ def _worker_reconcile(
         effect_journal = DurableEffectJournal(state_root, identity)
         journal.effect_journal = effect_journal
         if identity.composite_admitted:
-            persisted_composite = _persisted_composite_worker_result(effect_journal)
+            persisted_composite = _persisted_composite_worker_result(journal, effect_journal)
             if persisted_composite is not None:
                 result = {
                     **cached, "status": "COMPLETED", "outcome_unknown": False,
