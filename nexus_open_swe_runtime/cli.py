@@ -15,6 +15,8 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping
 
+from langchain_core.messages import AIMessage, ToolMessage
+
 try:
     from .recovery import (
         DurableEffectJournal,
@@ -63,6 +65,15 @@ def _now() -> str:
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
 
 
 def _sha256(value: bytes | str) -> str:
@@ -126,6 +137,7 @@ class ScopedRepairBackend:
         self._root = root.resolve()
         self._allowed = tuple(_safe_relative_path(path) for path in allowed_paths)
         self._effect_journal = effect_journal
+        self._last_effect: Any = None
 
     def _effect(self, tool_name: str, file_path: str, content: str, old: str | None) -> Any:
         if self._effect_journal is None:
@@ -135,9 +147,13 @@ class ScopedRepairBackend:
         if not call_id:
             raise RuntimeError("RECOVERY_TOOL_CALL_ID_MISSING")
         return self._effect_journal.intent(
-            turn_id=turn_id, tool_call_id=call_id, tool_name=tool_name,
+            turn_id=turn_id,
+            tool_call_id=call_id,
+            tool_name=tool_name,
             arguments={"file_path": file_path, "content": content},
-            path=self._root / file_path, preimage=old, postimage=content,
+            path=self._root / file_path,
+            preimage=old,
+            postimage=content,
         )
 
     def _authorize(self, file_path: str) -> None:
@@ -178,11 +194,68 @@ class ScopedRepairBackend:
         old = target.read_text(encoding="utf-8") if target.exists() else None
         effect = self._effect("write_file", _safe_relative_path(file_path), content, old)
         if effect is not None:
+            self._last_effect = effect
             self._effect_journal.recover_write(effect)
             from deepagents.backends.protocol import WriteResult
 
             return WriteResult(path=file_path)
         return self._delegate.write(file_path, content)
+
+    def write_and_record_worker_result(
+        self, file_path: str, content: str, envelope: Mapping[str, Any]
+    ) -> Any:
+        self._authorize(file_path)
+        if not isinstance(envelope, Mapping) or not isinstance(envelope.get("summary"), str):
+            raise RuntimeErrorBounded("OPEN_SWE_COMPOSITE_RESULT_INVALID")
+        target = self._root / _safe_relative_path(file_path)
+        old = target.read_text(encoding="utf-8") if target.exists() else None
+        turn_id = str(self._effect_journal._current_turn_id or "turn_unknown")
+        call_id = str(self._effect_journal._current_tool_call_id or "")
+        if not call_id:
+            # A malformed OpenCLI response is locally projected before the
+            # tool runs.  Its response cannot be parsed by the transport's
+            # journal hook, so reconstruct the exact canonical projected
+            # envelope used by OpenCLI's deterministic call-id function.
+            arguments = {
+                "file_path": _safe_relative_path(file_path),
+                "content": content,
+                "envelope": {"summary": envelope["summary"]},
+            }
+            projected = json.dumps(
+                {
+                    "type": "tool_call",
+                    "name": "write_file_and_record_worker_result",
+                    "arguments": arguments,
+                },
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            call_id = (
+                "opencli_"
+                + _sha256(
+                    _canonical_json({
+                        "name": "write_file_and_record_worker_result",
+                        "arguments": arguments,
+                        "raw": projected,
+                    })
+                )[:24]
+            )
+            self._effect_journal.bind_turn(turn_id, call_id)
+        effect = self._effect_journal.intent(
+            turn_id=turn_id,
+            tool_call_id=call_id,
+            tool_name="write_file_and_record_worker_result",
+            arguments={
+                "file_path": _safe_relative_path(file_path),
+                "content": content,
+                "envelope": {"summary": envelope["summary"]},
+            },
+            path=target,
+            preimage=old,
+            postimage=content,
+        )
+        self._effect_journal.recover_write(effect)
+        return effect
 
     async def awrite(self, file_path: str, content: str) -> Any:
         self._authorize(file_path)
@@ -222,6 +295,7 @@ class ScopedRepairBackend:
         expected, occurrences = replacement
         effect = self._effect("edit_file", _safe_relative_path(file_path), expected, old)
         if effect is not None:
+            self._last_effect = effect
             self._effect_journal.recover_write(effect)
             from deepagents.backends.protocol import EditResult
 
@@ -409,6 +483,7 @@ def build_repair_graph(
     key: str,
     checkpointer: Any | None = None,
     effect_journal: DurableEffectJournal | None = None,
+    composite: bool = False,
 ) -> Any:
     @runtime["tool"]
     def record_worker_result(envelope: dict[str, Any]) -> str:
@@ -418,22 +493,48 @@ def build_repair_graph(
     _profile(runtime, key)
     filesystem = runtime["filesystem_backend"](root_dir=root, virtual_mode=True)
     backend = ScopedRepairBackend(filesystem, root, allowed_paths, effect_journal)
+    composite_tool = None
+    if composite:
+
+        @runtime["tool"]
+        def write_file_and_record_worker_result(
+            file_path: str, content: str, envelope: dict[str, Any]
+        ) -> str:
+            """Atomically apply one authorized write and return its worker result."""
+            if not isinstance(envelope, Mapping) or not isinstance(envelope.get("summary"), str):
+                raise RuntimeErrorBounded("OPEN_SWE_COMPOSITE_RESULT_INVALID")
+            effect = backend.write_and_record_worker_result(file_path, content, envelope)
+            receipt = backend._effect_journal.record_worker_result(effect, envelope)
+            return _canonical_json(receipt)
+
+        composite_tool = write_file_and_record_worker_result
     return runtime["create_deep_agent"](
         model=model,
         system_prompt=(
             "Repair exactly one supported root cause inside an isolated Candidate workspace. "
             f"Authorized mutation paths are {_canonical_json({'paths': list(allowed_paths)})}. "
             "Use only read, write_file, and edit_file tools. Never delete, execute, delegate, "
-            "access network, use Git/GitHub, commit, approve, merge, release, or deploy. Call "
-            "record_worker_result exactly once with a short factual summary."
+            "access network, use Git/GitHub, commit, approve, merge, release, or deploy. "
+            + (
+                "For the final mutation and result, call write_file_and_record_worker_result exactly "
+                "once with the file content and a short factual summary; this composite action is "
+                "the required terminal action for an admitted single-file repair."
+                if composite
+                else "Call record_worker_result exactly once with a short factual summary."
+            )
         ),
-        tools=[record_worker_result],
+        tools=(
+            [record_worker_result, composite_tool]
+            if composite_tool is not None
+            else [record_worker_result]
+        ),
         subagents=[],
         backend=backend,
         middleware=[
             runtime["filesystem_middleware"](
                 backend=backend,
-                tools=["read_file", "ls", "glob", "grep", "write_file", "edit_file"],
+                tools=["read_file", "ls", "glob", "grep", "write_file", "edit_file"]
+                + (["write_file_and_record_worker_result"] if composite else []),
             )
         ],
         checkpointer=checkpointer,
@@ -441,9 +542,15 @@ def build_repair_graph(
 
 
 def _repair_graph(
-    factory: Callable[..., Any], model: Any, workspace: Path, runtime: Mapping[str, Any],
-    allowed_paths: tuple[str, ...], key: str, checkpointer: Any | None,
+    factory: Callable[..., Any],
+    model: Any,
+    workspace: Path,
+    runtime: Mapping[str, Any],
+    allowed_paths: tuple[str, ...],
+    key: str,
+    checkpointer: Any | None,
     effect_journal: DurableEffectJournal | None = None,
+    composite: bool = False,
 ) -> Any:
     if checkpointer is not None:
         try:
@@ -453,6 +560,8 @@ def _repair_graph(
         kwargs: dict[str, Any] = {"checkpointer": checkpointer}
         if "effect_journal" in parameters:
             kwargs["effect_journal"] = effect_journal
+        if "composite" in parameters:
+            kwargs["composite"] = composite
         if "checkpointer" in parameters:
             return factory(model, workspace, runtime, allowed_paths, key, **kwargs)
     if effect_journal is not None:
@@ -461,7 +570,10 @@ def _repair_graph(
         except (TypeError, ValueError):
             parameters = {}
         if "effect_journal" in parameters:
-            return factory(model, workspace, runtime, allowed_paths, key, effect_journal=effect_journal)
+            kwargs = {"effect_journal": effect_journal}
+            if "composite" in parameters:
+                kwargs["composite"] = composite
+            return factory(model, workspace, runtime, allowed_paths, key, **kwargs)
     return factory(model, workspace, runtime, allowed_paths, key)
 
 
@@ -505,6 +617,328 @@ def _recorded_payload(output: Any, tool_name: str) -> dict[str, Any] | None:
             else:
                 return None
     return found[0] if len(found) == 1 else None
+
+
+def _composite_worker_result(
+    output: Any, effect_journal: DurableEffectJournal
+) -> dict[str, Any] | None:
+    """Extract the receipt from this graph's exact composite call/result pair.
+
+    The effect journal is authoritative for the receipt.  In particular, an
+    effect file belonging to another operation or an unrelated tool call must
+    never be selected merely because it happens to contain a worker result.
+    """
+    if not isinstance(output, Mapping):
+        return None
+    messages = output.get("messages")
+    if not isinstance(messages, (list, tuple)):
+        return None
+    pairs: list[tuple[Mapping[str, Any], ToolMessage]] = []
+    for index, message in enumerate(messages[:-1]):
+        if not isinstance(message, AIMessage):
+            continue
+        calls = getattr(message, "tool_calls", None)
+        if not isinstance(calls, list):
+            continue
+        following = messages[index + 1]
+        if (
+            not isinstance(following, ToolMessage)
+            or getattr(following, "status", None) != "success"
+        ):
+            continue
+        for call in calls:
+            if (
+                not isinstance(call, Mapping)
+                or call.get("name") != "write_file_and_record_worker_result"
+            ):
+                continue
+            if str(call.get("id") or "") != str(following.tool_call_id or ""):
+                continue
+            pairs.append((call, following))
+    if len(pairs) != 1:
+        return None
+    call, result = pairs[0]
+    if not isinstance(result.content, str):
+        return None
+    try:
+        receipt = json.loads(result.content, object_pairs_hook=_reject_duplicate_json_keys)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(receipt, Mapping):
+        return None
+    required = {
+        "schema",
+        "status",
+        "operation_id",
+        "turn_id",
+        "tool_call_id",
+        "effect_id",
+        "tool_name",
+        "path",
+        "postimage_sha256",
+        "summary",
+        "content_sha256",
+        "summary_sha256",
+        "receipt_sha256",
+    }
+    if (
+        set(receipt) != required
+        or receipt.get("schema") != "nexus.open_swe_runtime.worker_result.v1"
+        or receipt.get("status") != "IMPLEMENTATION_EFFECT_COMPLETE"
+    ):
+        return None
+    args = call.get("args")
+    if not isinstance(args, Mapping):
+        return None
+    envelope = args.get("envelope")
+    file_path = args.get("file_path")
+    content = args.get("content")
+    summary = envelope.get("summary") if isinstance(envelope, Mapping) else None
+    call_id = str(call.get("id") or "")
+    operation_id = str(effect_journal.identity.operation_id or "")
+    turn_id = str(getattr(effect_journal, "_current_turn_id", "") or "")
+    if (
+        not call_id
+        or not operation_id
+        or not turn_id
+        or not isinstance(file_path, str)
+        or not isinstance(content, str)
+        or not isinstance(summary, str)
+        or receipt.get("operation_id") != operation_id
+        or receipt.get("turn_id") != turn_id
+        or receipt.get("tool_call_id") != call_id
+        or receipt.get("tool_name") != call.get("name")
+        or receipt.get("summary") != summary
+        or receipt.get("content_sha256") != _sha256(content)
+        or receipt.get("postimage_sha256") != _sha256(content)
+        or receipt.get("summary_sha256") != _sha256(summary)
+        or not re.fullmatch(r"effect_[0-9a-f]{64}", str(receipt.get("effect_id") or ""))
+    ):
+        return None
+    arguments = {
+        "file_path": file_path,
+        "content": content,
+        "envelope": {"summary": summary},
+    }
+    expected_effect_id = "effect_" + _sha256(
+        _canonical_json({
+            "operation_id": operation_id,
+            "turn_id": turn_id,
+            "tool_call_id": call_id,
+            "tool_name": call.get("name"),
+            "arguments": arguments,
+        })
+    )
+    if receipt.get("effect_id") != expected_effect_id:
+        return None
+    try:
+        persisted = effect_journal.read(expected_effect_id)
+    except (OSError, ValueError, RuntimeError):
+        return None
+    if (
+        persisted.get("status") != "RESULT"
+        or persisted.get("operation_id") != operation_id
+        or persisted.get("turn_id") != turn_id
+        or persisted.get("tool_call_id") != call_id
+        or persisted.get("tool_name") != call.get("name")
+        or persisted.get("arguments") != arguments
+        or persisted.get("postimage") != content
+        or persisted.get("postimage_sha256") != _sha256(content)
+        or persisted.get("worker_result") != dict(receipt)
+        or persisted.get("worker_result_sha256") != _sha256(_canonical_json(receipt))
+    ):
+        return None
+    material = dict(receipt)
+    material.pop("receipt_sha256", None)
+    if receipt.get("receipt_sha256") != _sha256(_canonical_json(material)):
+        return None
+    return dict(receipt)
+
+
+def _persisted_composite_worker_result(
+    operation_journal: DurableOperationJournal,
+    effect_journal: DurableEffectJournal,
+) -> dict[str, Any] | None:
+    """Recover this operation's already-persisted composite receipt.
+
+    This is used only for restart reconciliation, where the graph output is
+    unavailable.  Records are restricted to the current operation identity;
+    receipts from another operation in the shared effects directory are
+    ignored and cannot satisfy reconciliation.
+    """
+    identity = operation_journal.identity
+    if (
+        effect_journal.identity.as_dict() != identity.as_dict()
+        or not identity.composite_admitted
+        or len(identity.allowed_paths) != 1
+    ):
+        return None
+    operation_id = str(identity.operation_id or "")
+    if not operation_id:
+        return None
+    workspace = Path(identity.workspace).resolve()
+    try:
+        allowed_path = _safe_relative_path(identity.allowed_paths[0])
+    except RuntimeErrorBounded:
+        return None
+    expected_path = (workspace / allowed_path).resolve()
+    if not expected_path.is_relative_to(workspace):
+        return None
+    try:
+        operation_state = operation_journal.read()
+    except (OSError, ValueError, RuntimeError):
+        return None
+    turn_id = operation_state.get("turn_id")
+    recovered_response = operation_state.get("recovered_response")
+    response_sha256 = operation_state.get("response_sha256")
+    if (
+        not isinstance(turn_id, str)
+        or not turn_id
+        or not isinstance(recovered_response, str)
+        or not isinstance(response_sha256, str)
+        or _sha256(recovered_response) != response_sha256
+    ):
+        return None
+    try:
+        recovered_envelope = json.loads(
+            recovered_response, object_pairs_hook=_reject_duplicate_json_keys
+        )
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if (
+        not isinstance(recovered_envelope, Mapping)
+        or set(recovered_envelope) != {"type", "name", "arguments"}
+        or recovered_envelope.get("type") != "tool_call"
+        or recovered_envelope.get("name") != "write_file_and_record_worker_result"
+        or not isinstance(recovered_envelope.get("arguments"), Mapping)
+    ):
+        return None
+    recovered_arguments = recovered_envelope["arguments"]
+    if set(recovered_arguments) != {"file_path", "content", "envelope"}:
+        return None
+    recovered_envelope_args = recovered_arguments.get("envelope")
+    if (
+        not isinstance(recovered_envelope_args, Mapping)
+        or set(recovered_envelope_args) != {"summary"}
+        or not isinstance(recovered_arguments.get("file_path"), str)
+        or not isinstance(recovered_arguments.get("content"), str)
+        or not isinstance(recovered_envelope_args.get("summary"), str)
+    ):
+        return None
+    try:
+        recovered_file_path = _safe_relative_path(recovered_arguments["file_path"])
+    except RuntimeErrorBounded:
+        return None
+    if recovered_file_path != allowed_path:
+        return None
+    recovered_arguments = {
+        "file_path": recovered_file_path,
+        "content": recovered_arguments["content"],
+        "envelope": {"summary": recovered_envelope_args["summary"]},
+    }
+    recovered_call_id = (
+        "opencli_"
+        + _sha256(
+            _canonical_json({
+                "name": "write_file_and_record_worker_result",
+                "arguments": recovered_arguments,
+                "raw": recovered_response,
+            })
+        )[:24]
+    )
+    # Rebind the effect journal to the operation's durable turn.  A fresh
+    # process otherwise has no in-memory turn binding and could accidentally
+    # accept an effect from a different turn.
+    effect_journal.bind_turn(turn_id)
+    records: list[dict[str, Any]] = []
+    for path in sorted(effect_journal.root.glob("effect_*.json")):
+        try:
+            value = effect_journal.read(path.stem)
+        except (OSError, ValueError, RuntimeError):
+            continue
+        receipt = value.get("worker_result") if isinstance(value, Mapping) else None
+        if not isinstance(receipt, Mapping):
+            continue
+        required_receipt = {
+            "schema",
+            "status",
+            "operation_id",
+            "turn_id",
+            "tool_call_id",
+            "effect_id",
+            "tool_name",
+            "path",
+            "postimage_sha256",
+            "summary",
+            "content_sha256",
+            "summary_sha256",
+            "receipt_sha256",
+        }
+        if set(receipt) != required_receipt:
+            continue
+        arguments = value.get("arguments")
+        if not isinstance(arguments, Mapping):
+            continue
+        envelope = arguments.get("envelope")
+        content = arguments.get("content")
+        file_path = arguments.get("file_path")
+        summary = envelope.get("summary") if isinstance(envelope, Mapping) else None
+        tool_name = "write_file_and_record_worker_result"
+        if (
+            value.get("status") != "RESULT"
+            or value.get("effect_id") != path.stem
+            or value.get("operation_id") != operation_id
+            or value.get("turn_id") != turn_id
+            or value.get("tool_name") != tool_name
+            or value.get("tool_call_id") != recovered_call_id
+            or not isinstance(file_path, str)
+            or not isinstance(content, str)
+            or not isinstance(summary, str)
+            or arguments != recovered_arguments
+            or file_path != allowed_path
+            or value.get("path") != str(expected_path)
+            or value.get("postimage") != content
+            or value.get("postimage_sha256") != _sha256(content)
+            or value.get("preimage_sha256") == ""
+            or not isinstance(value.get("tool_call_id"), str)
+            or not value.get("tool_call_id")
+        ):
+            continue
+        expected_effect_id = "effect_" + _sha256(
+            _canonical_json({
+                "operation_id": operation_id,
+                "turn_id": turn_id,
+                "tool_call_id": recovered_call_id,
+                "tool_name": tool_name,
+                "arguments": recovered_arguments,
+            })
+        )
+        if value.get("effect_id") != expected_effect_id:
+            continue
+        if (
+            receipt.get("schema") != "nexus.open_swe_runtime.worker_result.v1"
+            or receipt.get("status") != "IMPLEMENTATION_EFFECT_COMPLETE"
+            or receipt.get("operation_id") != operation_id
+            or receipt.get("turn_id") != turn_id
+            or receipt.get("tool_call_id") != value.get("tool_call_id")
+            or receipt.get("effect_id") != expected_effect_id
+            or receipt.get("tool_name") != tool_name
+            or receipt.get("path") != str(expected_path)
+            or receipt.get("postimage_sha256") != _sha256(content)
+            or receipt.get("content_sha256") != _sha256(content)
+            or receipt.get("summary") != summary
+            or receipt.get("summary_sha256") != _sha256(summary)
+            or value.get("worker_result_sha256") != _sha256(_canonical_json(receipt))
+        ):
+            continue
+        receipt_material = dict(receipt)
+        receipt_hash = receipt_material.pop("receipt_sha256", None)
+        if receipt_hash != _sha256(_canonical_json(receipt_material)):
+            continue
+        records.append(dict(receipt))
+    if len(records) != 1:
+        return None
+    return records[0]
 
 
 def _prompt_field(prompt: str, name: str) -> str:
@@ -644,7 +1078,9 @@ def _contained_regular_card(workspace: Path, card_ref: str) -> tuple[Path, bytes
     return card, raw, content
 
 
-def _task_card_allows_exact_paths(content: str, task_id: str, allowed_paths: tuple[str, ...]) -> bool:
+def _task_card_allows_exact_paths(
+    content: str, task_id: str, allowed_paths: tuple[str, ...]
+) -> bool:
     def value_without_backticks(value: str) -> str | None:
         value = value.strip()
         if value.startswith("`") or value.endswith("`"):
@@ -713,23 +1149,52 @@ def _source_ref_for_path(refs: list[Any], path: str) -> str | None:
 
 
 _V2_KEYS = {
-    "binding", "definition_of_done", "diagnosis", "evidence_refs", "failure_guards",
-    "implementation_direction", "inspect_first", "objective", "required_semantics",
-    "schema", "scope_signal", "selected_worker", "stop_and_escalate", "verification_focus",
+    "binding",
+    "definition_of_done",
+    "diagnosis",
+    "evidence_refs",
+    "failure_guards",
+    "implementation_direction",
+    "inspect_first",
+    "objective",
+    "required_semantics",
+    "schema",
+    "scope_signal",
+    "selected_worker",
+    "stop_and_escalate",
+    "verification_focus",
 }
 _V2_BINDING_KEYS = {
-    "context_pack_sha256", "item_id", "item_type", "main_sha", "repository", "revision",
-    "task_card_hash", "task_card_ref",
+    "context_pack_sha256",
+    "item_id",
+    "item_type",
+    "main_sha",
+    "repository",
+    "revision",
+    "task_card_hash",
+    "task_card_ref",
 }
 _V2_DIAGNOSIS_KEYS = {"hypothesis", "next_probe", "status"}
 _V2_SCOPE_KEYS = {
-    "conditional_migration_paths", "forbidden_paths", "max_files", "production_edit_paths",
-    "read_only_authorities", "required_test_edit_paths", "scope_block_conditions",
-    "scope_confidence", "verification_only_paths",
+    "conditional_migration_paths",
+    "forbidden_paths",
+    "max_files",
+    "production_edit_paths",
+    "read_only_authorities",
+    "required_test_edit_paths",
+    "scope_block_conditions",
+    "scope_confidence",
+    "verification_only_paths",
 }
 _V2_WORKER_KEYS = {
-    "admission_evidence_hash", "admission_evidence_ref", "model", "provider",
-    "role_ceiling", "selection_evidence_hash", "selection_evidence_ref", "worker_id",
+    "admission_evidence_hash",
+    "admission_evidence_ref",
+    "model",
+    "provider",
+    "role_ceiling",
+    "selection_evidence_hash",
+    "selection_evidence_ref",
+    "worker_id",
 }
 
 
@@ -814,8 +1279,12 @@ def _semantic_v2_admission(
         if not all(isinstance(value, str) for value in diagnosis.values()):
             return SemanticAdmission(REJECT)
         for key in (
-            "conditional_migration_paths", "forbidden_paths", "production_edit_paths",
-            "read_only_authorities", "required_test_edit_paths", "scope_block_conditions",
+            "conditional_migration_paths",
+            "forbidden_paths",
+            "production_edit_paths",
+            "read_only_authorities",
+            "required_test_edit_paths",
+            "scope_block_conditions",
             "verification_only_paths",
         ):
             if not _string_list(scope[key]):
@@ -832,8 +1301,12 @@ def _semantic_v2_admission(
         if not _string_list(refs) or not _string_list(inspect_first):
             return SemanticAdmission(REJECT)
         for key in (
-            "definition_of_done", "failure_guards", "implementation_direction",
-            "required_semantics", "stop_and_escalate", "verification_focus",
+            "definition_of_done",
+            "failure_guards",
+            "implementation_direction",
+            "required_semantics",
+            "stop_and_escalate",
+            "verification_focus",
         ):
             if not _string_list(envelope[key]):
                 return SemanticAdmission(REJECT)
@@ -857,7 +1330,9 @@ def _semantic_v2_admission(
         if _git_output(workspace, "status", "--porcelain"):
             return SemanticAdmission(REJECT)
         origin = _git_output(workspace, "remote", "get-url", "origin")
-        if not _canonical_origin_repository(origin) or _canonical_origin_repository(origin) != _canonical_binding_repository(str(binding["repository"])):
+        if not _canonical_origin_repository(origin) or _canonical_origin_repository(
+            origin
+        ) != _canonical_binding_repository(str(binding["repository"])):
             return SemanticAdmission(REJECT)
         if _workspace_path_has_symlink(workspace, task_card_ref):
             return SemanticAdmission(REJECT)
@@ -874,10 +1349,20 @@ def _semantic_v2_admission(
             return SemanticAdmission(REJECT)
         if tuple(scope["read_only_authorities"]) != (task_card_ref,):
             return SemanticAdmission(REJECT)
-        required = tuple(_safe_relative_path(str(path)) for path in scope["required_test_edit_paths"])
-        if required != allowed_paths or not isinstance(scope["max_files"], int) or isinstance(scope["max_files"], bool) or scope["max_files"] != len(allowed_paths):
+        required = tuple(
+            _safe_relative_path(str(path)) for path in scope["required_test_edit_paths"]
+        )
+        if (
+            required != allowed_paths
+            or not isinstance(scope["max_files"], int)
+            or isinstance(scope["max_files"], bool)
+            or scope["max_files"] != len(allowed_paths)
+        ):
             return SemanticAdmission(REJECT)
-        if not all(isinstance(diagnosis[key], str) and diagnosis[key].strip() for key in ("hypothesis", "next_probe")):
+        if not all(
+            isinstance(diagnosis[key], str) and diagnosis[key].strip()
+            for key in ("hypothesis", "next_probe")
+        ):
             return SemanticAdmission(REJECT)
         task_ref = f"task_card:{task_card_ref}@"
         task_card_evidence = next(
@@ -914,17 +1399,25 @@ def _semantic_v2_admission(
             parent = target.parent
             while parent != workspace and not parent.exists():
                 parent = parent.parent
-            if parent.is_symlink() or not parent.resolve().is_relative_to(workspace) or not target.resolve().parent.is_relative_to(workspace):
+            if (
+                parent.is_symlink()
+                or not parent.resolve().is_relative_to(workspace)
+                or not target.resolve().parent.is_relative_to(workspace)
+            ):
                 return SemanticAdmission(REJECT)
         identity = request.get("worker_identity")
         if not isinstance(identity, Mapping) or dict(selected) != dict(identity):
             return SemanticAdmission(REJECT)
         expected_identity_hash = request.get("worker_identity_sha256")
-        if not isinstance(expected_identity_hash, str) or _sha256(_canonical_json(selected)) != expected_identity_hash:
+        if (
+            not isinstance(expected_identity_hash, str)
+            or _sha256(_canonical_json(selected)) != expected_identity_hash
+        ):
             return SemanticAdmission(REJECT)
     except (KeyError, TypeError, ValueError, RuntimeErrorBounded):
         return SemanticAdmission(REJECT)
     return SemanticAdmission(ADMIT, raw, envelope, diagnosis)
+
 
 def _worker_result(task_id: str, unit_id: str, status: str, summary: str) -> str:
     return _canonical_json({
@@ -999,12 +1492,8 @@ def _read_operation_state(path: Path) -> dict[str, Any] | None | object:
     return value if isinstance(value, dict) else _CORRUPT_OPERATION_STATE
 
 
-def _corrupt_operation_result(
-    request: Mapping[str, Any], *, kind: str
-) -> dict[str, Any]:
-    result = _base_result(
-        request, kind=kind, status="OPEN_SWE_OPERATION_STATE_CORRUPT"
-    )
+def _corrupt_operation_result(request: Mapping[str, Any], *, kind: str) -> dict[str, Any]:
+    result = _base_result(request, kind=kind, status="OPEN_SWE_OPERATION_STATE_CORRUPT")
     result.update(error="OPEN_SWE_OPERATION_STATE_CORRUPT")
     return result
 
@@ -1040,23 +1529,17 @@ def _worker_material_fingerprint(
             artifact_bytes = None
     artifact_sha256 = _sha256(artifact_bytes) if artifact_bytes is not None else "unavailable"
     return _sha256(
-        _canonical_json(
-            {
-                "operation": request.get("operation"),
-                "session_id": request.get("session_id"),
-                "workspace": str(
-                    Path(str(request.get("workspace_path") or ""))
-                    .expanduser()
-                    .resolve()
-                ),
-                "provider_id": request.get("provider_id"),
-                "model_id": request.get("model_id"),
-                "worker_identity_sha256": request.get("worker_identity_sha256"),
-                "prompt": prompt,
-                "artifact_path": str(artifact),
-                "artifact_sha256": artifact_sha256,
-            }
-        )
+        _canonical_json({
+            "operation": request.get("operation"),
+            "session_id": request.get("session_id"),
+            "workspace": str(Path(str(request.get("workspace_path") or "")).expanduser().resolve()),
+            "provider_id": request.get("provider_id"),
+            "model_id": request.get("model_id"),
+            "worker_identity_sha256": request.get("worker_identity_sha256"),
+            "prompt": prompt,
+            "artifact_path": str(artifact),
+            "artifact_sha256": artifact_sha256,
+        })
     )
 
 
@@ -1065,9 +1548,7 @@ def _write_started(
 ) -> dict[str, Any]:
     state = _base_result(request, kind=kind, status="STARTED")
     if kind == "worker" and request.get("workspace_path"):
-        state["directory"] = str(
-            Path(str(request["workspace_path"])).expanduser().resolve()
-        )
+        state["directory"] = str(Path(str(request["workspace_path"])).expanduser().resolve())
         material_fingerprint = _worker_material_fingerprint(request, artifact_bytes)
         if material_fingerprint is not None:
             state["execution_material_sha256"] = material_fingerprint
@@ -1101,9 +1582,7 @@ def _reconcile_operation(request: Mapping[str, Any], *, kind: str) -> dict[str, 
             if not isinstance(expected_workspace, str) or not expected_workspace.strip():
                 state = None
             else:
-                expected_workspace = str(
-                    Path(str(expected_workspace)).expanduser().resolve()
-                )
+                expected_workspace = str(Path(str(expected_workspace)).expanduser().resolve())
                 if (
                     not isinstance(persisted_workspace, str)
                     or not persisted_workspace
@@ -1352,18 +1831,35 @@ def _worker_run(
         semantic_admission_decision = semantic_admission.decision
         if semantic_admission_decision == REJECT:
             raise RuntimeErrorBounded("OPEN_SWE_SEMANTIC_V2_REJECTED")
+        packet = semantic_admission.envelope
+        scope = packet.get("scope_signal") if isinstance(packet, Mapping) else None
+        composite_admitted = bool(
+            semantic_admission_decision == ADMIT
+            and len(allowed_paths) == 1
+            and isinstance(scope, Mapping)
+            and scope.get("max_files") == 1
+            and scope.get("required_test_edit_paths", list(allowed_paths)) == list(allowed_paths)
+        )
         recovery_identity = RecoveryIdentity(
             operation_id=str(request.get("operation_id") or ""),
             execution_material_sha256=str(started.get("execution_material_sha256") or ""),
-            workspace=str(workspace), task_id=task_id, unit_id=unit_id, session_id=session_id,
-            allowed_paths=allowed_paths, provider_id=provider, model_id=model_id,
+            workspace=str(workspace),
+            task_id=task_id,
+            unit_id=unit_id,
+            session_id=session_id,
+            allowed_paths=allowed_paths,
+            provider_id=provider,
+            model_id=model_id,
             worker_identity_sha256=str(request.get("worker_identity_sha256") or ""),
             transport_config_sha256=_sha256(_canonical_json(request.get("transport_config") or {})),
-            runtime_identity_sha256=_sha256(_canonical_json({
-                "module_sha256": _sha256(Path(__file__).read_bytes()),
-                "deepagents": _deepagents_version(),
-                "checkpoint_namespace": "open-swe-repair-v1",
-            })),
+            runtime_identity_sha256=_sha256(
+                _canonical_json({
+                    "module_sha256": _sha256(Path(__file__).read_bytes()),
+                    "deepagents": _deepagents_version(),
+                    "checkpoint_namespace": "open-swe-repair-v1",
+                })
+            ),
+            composite_admitted=composite_admitted,
         )
         recovery_journal = DurableOperationJournal(
             request.get("runtime_state_root") or "", recovery_identity
@@ -1374,11 +1870,16 @@ def _worker_run(
         )
         recovery_journal.effect_journal = effect_journal
         checkpoint_saver, _checkpoint_namespace = create_checkpoint(
-            request.get("runtime_state_root") or "", str(request.get("operation_id") or ""),
+            request.get("runtime_state_root") or "",
+            str(request.get("operation_id") or ""),
             recovery_identity.checkpoint_namespace,
         )
         recovery_journal.checkpoint_bound(
-            str(checkpoint_path(request.get("runtime_state_root") or "", recovery_identity.operation_id))
+            str(
+                checkpoint_path(
+                    request.get("runtime_state_root") or "", recovery_identity.operation_id
+                )
+            )
         )
         try:
             evidence = semantic_admission.raw_bytes.decode("utf-8")
@@ -1386,7 +1887,9 @@ def _worker_run(
             raise RuntimeErrorBounded("OPEN_SWE_EVIDENCE_INVALID") from exc
         if semantic_admission_decision == ADMIT:
             packet = semantic_admission.envelope
-            if not isinstance(packet, Mapping) or not isinstance(semantic_admission.diagnosis, Mapping):
+            if not isinstance(packet, Mapping) or not isinstance(
+                semantic_admission.diagnosis, Mapping
+            ):
                 raise RuntimeErrorBounded("OPEN_SWE_SEMANTIC_V2_REJECTED")
             diagnosis = {
                 "status": "ROOT_CAUSE_SUPPORTED",
@@ -1467,8 +1970,18 @@ def _worker_run(
                 profile_key,
                 checkpoint_saver,
                 effect_journal,
+                composite=composite_admitted,
             )
-            if set(executable_tool_surface(repair_graph)) != REPAIR_TOOLS:
+            repair_tools = set(executable_tool_surface(repair_graph))
+            composite_runtime = (
+                composite_admitted and "write_file_and_record_worker_result" in repair_tools
+            )
+            expected_tools = (
+                REPAIR_TOOLS | {"write_file_and_record_worker_result"}
+                if composite_runtime
+                else REPAIR_TOOLS
+            )
+            if repair_tools != expected_tools:
                 raise RuntimeErrorBounded("OPEN_SWE_TOOL_SURFACE_INVALID")
             repair_config = {
                 "configurable": {
@@ -1489,7 +2002,11 @@ def _worker_run(
                 },
                 config=repair_config,
             )
-            repair = _recorded_payload(repair_output, "record_worker_result")
+            repair = (
+                _composite_worker_result(repair_output, effect_journal)
+                if composite_runtime
+                else _recorded_payload(repair_output, "record_worker_result")
+            )
             repair_summary = repair.get("summary") if isinstance(repair, Mapping) else None
             if not isinstance(repair_summary, str) or not repair_summary.strip():
                 raise RuntimeErrorBounded("OPEN_SWE_REPAIR_RESULT_INVALID")
@@ -1541,7 +2058,9 @@ def _worker_run(
     return _write_terminal(request, result)
 
 
-def _fenced_worker_reconcile(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, Any]]:
+def _fenced_worker_reconcile(
+    function: Callable[..., dict[str, Any]],
+) -> Callable[..., dict[str, Any]]:
     def wrapped(request: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
         operation_id = str(request.get("operation_id") or "")
         if not operation_id:
@@ -1575,24 +2094,35 @@ def _worker_reconcile(
         identity = RecoveryIdentity(
             operation_id=str(identity_data["operation_id"]),
             execution_material_sha256=str(identity_data["execution_material_sha256"]),
-            workspace=str(identity_data["workspace"]), task_id=str(identity_data["task_id"]),
-            unit_id=str(identity_data["unit_id"]), session_id=str(identity_data["session_id"]),
+            workspace=str(identity_data["workspace"]),
+            task_id=str(identity_data["task_id"]),
+            unit_id=str(identity_data["unit_id"]),
+            session_id=str(identity_data["session_id"]),
             allowed_paths=tuple(str(value) for value in identity_data["allowed_paths"]),
-            provider_id=str(identity_data["provider_id"]), model_id=str(identity_data["model_id"]),
+            provider_id=str(identity_data["provider_id"]),
+            model_id=str(identity_data["model_id"]),
             worker_identity_sha256=str(identity_data["worker_identity_sha256"]),
             transport_config_sha256=str(identity_data["transport_config_sha256"]),
             runtime_identity_sha256=str(identity_data["runtime_identity_sha256"]),
-            checkpoint_namespace=str(identity_data.get("checkpoint_namespace", "open-swe-repair-v1")),
+            checkpoint_namespace=str(
+                identity_data.get("checkpoint_namespace", "open-swe-repair-v1")
+            ),
+            composite_admitted=bool(identity_data.get("composite_admitted", False)),
         )
         if identity.operation_id != operation_id:
             return cached
         expected_transport = _sha256(_canonical_json(request.get("transport_config") or {}))
-        expected_runtime = _sha256(_canonical_json({
-            "module_sha256": _sha256(Path(__file__).read_bytes()),
-            "deepagents": _deepagents_version(),
-            "checkpoint_namespace": identity.checkpoint_namespace,
-        }))
-        if identity.transport_config_sha256 != expected_transport or identity.runtime_identity_sha256 != expected_runtime:
+        expected_runtime = _sha256(
+            _canonical_json({
+                "module_sha256": _sha256(Path(__file__).read_bytes()),
+                "deepagents": _deepagents_version(),
+                "checkpoint_namespace": identity.checkpoint_namespace,
+            })
+        )
+        if (
+            identity.transport_config_sha256 != expected_transport
+            or identity.runtime_identity_sha256 != expected_runtime
+        ):
             return cached
         for key, expected in (
             ("workspace_path", identity.workspace),
@@ -1603,7 +2133,11 @@ def _worker_reconcile(
             supplied = request.get(key)
             if key not in request:
                 continue
-            actual = str(Path(str(supplied)).expanduser().resolve()) if key == "workspace_path" else str(supplied)
+            actual = (
+                str(Path(str(supplied)).expanduser().resolve())
+                if key == "workspace_path"
+                else str(supplied)
+            )
             if actual != expected:
                 return cached
         journal = DurableOperationJournal.open(state_root, identity)
@@ -1613,10 +2147,30 @@ def _worker_reconcile(
                 return _write_terminal(request, terminal)
             return cached
         recovery_state = journal.read()
-        protocol_repair_pending = (
-            recovery_state.get("protocol_repair_status") == "DISPATCHING"
-            and isinstance(recovery_state.get("protocol_repair_turn_id"), str)
-        )
+        effect_journal = DurableEffectJournal(state_root, identity)
+        journal.effect_journal = effect_journal
+        if identity.composite_admitted:
+            persisted_composite = _persisted_composite_worker_result(journal, effect_journal)
+            if persisted_composite is not None:
+                result = {
+                    **cached,
+                    "status": "COMPLETED",
+                    "outcome_unknown": False,
+                    "response_text": _worker_result(
+                        identity.task_id,
+                        identity.unit_id,
+                        "IMPLEMENTATION_COMPLETED",
+                        persisted_composite["summary"],
+                    ),
+                    "process_started": True,
+                    "directory": identity.workspace,
+                    "finished_at": _now(),
+                }
+                journal.terminal(result)
+                return _write_terminal(request, result)
+        protocol_repair_pending = recovery_state.get(
+            "protocol_repair_status"
+        ) == "DISPATCHING" and isinstance(recovery_state.get("protocol_repair_turn_id"), str)
         if (
             not raw.get("conversation_id")
             and not recovery_state.get("conversation_id")
@@ -1641,18 +2195,36 @@ def _worker_reconcile(
         ):
             return cached
         runtime = runtime_loader()
-        model = model_builder(runtime, identity.provider_id, identity.model_id,
-                              request.get("transport_config"), request.get("runtime_state_root"))
+        model = model_builder(
+            runtime,
+            identity.provider_id,
+            identity.model_id,
+            request.get("transport_config"),
+            request.get("runtime_state_root"),
+        )
         if not hasattr(model, "_detail_response"):
             return cached
-        checkpoint_saver, _ = create_checkpoint(state_root, operation_id, identity.checkpoint_namespace)
-        effect_journal = DurableEffectJournal(state_root, identity)
-        journal.effect_journal = effect_journal
+        checkpoint_saver, _ = create_checkpoint(
+            state_root, operation_id, identity.checkpoint_namespace
+        )
         if hasattr(model, "configure_recovery_journal"):
             model.configure_recovery_journal(journal)
-        graph = graph_builder(model, Path(identity.workspace), runtime, identity.allowed_paths,
-                              f"{identity.provider_id}:{identity.model_id}", checkpoint_saver,
-                              effect_journal)
+        graph_args = [
+            model,
+            Path(identity.workspace),
+            runtime,
+            identity.allowed_paths,
+            f"{identity.provider_id}:{identity.model_id}",
+            checkpoint_saver,
+            effect_journal,
+        ]
+        graph_kwargs: dict[str, Any] = {}
+        try:
+            if "composite" in inspect.signature(graph_builder).parameters:
+                graph_kwargs["composite"] = identity.composite_admitted
+        except (TypeError, ValueError):
+            pass
+        graph = graph_builder(*graph_args, **graph_kwargs)
         repair_conversation_unbound = protocol_repair_pending and (
             recovery_state.get("conversation_id", "")
             == recovery_state.get("protocol_repair_original_conversation_id", "")
@@ -1669,6 +2241,7 @@ def _worker_reconcile(
             recovered = reconcile_bound_turn(journal, model)
         try:
             from langchain_core.utils.function_calling import convert_to_openai_tool
+
             tool_nodes = graph.get_graph().nodes["tools"].data.tools_by_name
             tool_schemas = [convert_to_openai_tool(tool) for tool in tool_nodes.values()]
             turn_id = str(journal.read().get("turn_id") or "")
@@ -1706,14 +2279,22 @@ def _worker_reconcile(
         }
         graph.update_state(config, {"messages": [recovered_message]}, as_node="model")
         output = graph.invoke(None, config=config)
-        envelope = _recorded_payload(output, "record_worker_result")
+        envelope = (
+            _composite_worker_result(output, effect_journal)
+            if identity.composite_admitted
+            else _recorded_payload(output, "record_worker_result")
+        )
         if envelope is None or not isinstance(envelope.get("summary"), str):
             return cached
         result = {
-            **cached, "status": "COMPLETED", "outcome_unknown": False,
-            "response_text": _worker_result(identity.task_id, identity.unit_id,
-                                              "IMPLEMENTATION_COMPLETED", envelope["summary"]),
-            "process_started": True, "directory": identity.workspace,
+            **cached,
+            "status": "COMPLETED",
+            "outcome_unknown": False,
+            "response_text": _worker_result(
+                identity.task_id, identity.unit_id, "IMPLEMENTATION_COMPLETED", envelope["summary"]
+            ),
+            "process_started": True,
+            "directory": identity.workspace,
             "finished_at": _now(),
         }
         journal.terminal(result)
@@ -1807,7 +2388,6 @@ def main() -> int:
         }
     print(_canonical_json(result))
     return 0
-
 
 
 if __name__ == "__main__":

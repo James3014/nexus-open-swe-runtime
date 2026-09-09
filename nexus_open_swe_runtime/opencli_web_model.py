@@ -14,6 +14,7 @@ import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from langchain_core.language_models.base import LangSmithParams, LanguageModelInput
@@ -49,6 +50,15 @@ _MAX_LATE_READBACK_POLLS = 5
 _MAX_WEB_TURNS_PER_OPERATION = 12
 _MAX_HISTORY_CANDIDATES = 12
 _TERMINAL_RECORDER_TOOLS = frozenset({"record_finding", "record_diagnosis", "record_worker_result"})
+
+
+class _CompositeProjection(str):
+    """A projected response carrying the exact malformed source it repaired."""
+
+    def __new__(cls, value: str, *, origin: str) -> "_CompositeProjection":
+        projected = str.__new__(cls, value)
+        projected.origin = origin
+        return projected
 
 
 def _direct_terminal_recorder(envelope: Mapping[str, Any]) -> tuple[str, dict[str, Any]] | None:
@@ -532,6 +542,167 @@ def _terminal_recorder_completed(
     return name in _TERMINAL_RECORDER_TOOLS and name in declared
 
 
+def _composite_terminal_completed(
+    messages: Sequence[BaseMessage], tools: Sequence[Mapping[str, Any]], journal: Any = None
+) -> bool:
+    if len(messages) < 2 or not isinstance(messages[-1], ToolMessage):
+        return False
+    result = messages[-1]
+    if getattr(result, "status", None) != "success":
+        return False
+    if not isinstance(result.content, str):
+        return False
+    try:
+        receipt = json.loads(result.content, object_pairs_hook=_reject_duplicate_json_keys)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    required = {
+        "schema",
+        "status",
+        "operation_id",
+        "turn_id",
+        "tool_call_id",
+        "effect_id",
+        "tool_name",
+        "path",
+        "postimage_sha256",
+        "summary",
+        "content_sha256",
+        "summary_sha256",
+        "receipt_sha256",
+    }
+    if (
+        not isinstance(receipt, Mapping)
+        or set(receipt) != required
+        or receipt.get("schema") != "nexus.open_swe_runtime.worker_result.v1"
+        or receipt.get("status") != "IMPLEMENTATION_EFFECT_COMPLETE"
+    ):
+        return False
+    request = messages[-2]
+    if not isinstance(request, AIMessage) or len(request.tool_calls) != 1:
+        return False
+    call = request.tool_calls[0]
+    if call.get("name") != "write_file_and_record_worker_result" or str(
+        call.get("id") or ""
+    ) != str(result.tool_call_id or ""):
+        return False
+    declared = {_tool_name(tool) for tool in tools}
+    if call.get("name") not in declared:
+        return False
+    args = call.get("args")
+    if not isinstance(args, Mapping):
+        return False
+    envelope = args.get("envelope")
+    file_path = args.get("file_path")
+    content = args.get("content")
+    summary = envelope.get("summary") if isinstance(envelope, Mapping) else None
+    if (
+        not isinstance(file_path, str)
+        or not isinstance(content, str)
+        or not isinstance(summary, str)
+        or receipt.get("tool_name") != call.get("name")
+        or receipt.get("summary") != summary
+        or receipt.get("content_sha256") != hashlib.sha256(content.encode()).hexdigest()
+        or receipt.get("postimage_sha256") != hashlib.sha256(content.encode()).hexdigest()
+        or receipt.get("summary_sha256") != hashlib.sha256(summary.encode()).hexdigest()
+        or not re.fullmatch(r"effect_[0-9a-f]{64}", str(receipt.get("effect_id") or ""))
+    ):
+        return False
+    if journal is None:
+        return False
+    effect_journal = getattr(journal, "effect_journal", None)
+    if effect_journal is None:
+        return False
+    identity = getattr(effect_journal, "identity", None)
+    operation_id = str(getattr(identity, "operation_id", "") or "")
+    turn_id = str(getattr(effect_journal, "_current_turn_id", "") or "")
+    allowed = tuple(getattr(identity, "allowed_paths", ()) or ())
+    workspace = str(getattr(identity, "workspace", "") or "")
+    if not operation_id or not turn_id or len(allowed) != 1:
+        return False
+    try:
+        normalized_path = (
+            Path(file_path).relative_to(Path(workspace)).as_posix()
+            if Path(file_path).is_absolute()
+            else file_path.lstrip("/")
+        )
+    except ValueError:
+        return False
+    if (
+        normalized_path != allowed[0]
+        or receipt.get("operation_id") != operation_id
+        or receipt.get("turn_id") != turn_id
+    ):
+        return False
+    try:
+        expected_physical = str((Path(workspace) / allowed[0]).resolve())
+        if str(Path(str(receipt.get("path") or "")).resolve()) != expected_physical:
+            return False
+    except (OSError, ValueError):
+        return False
+    if (
+        receipt.get("tool_call_id") != call.get("id")
+        or receipt.get("tool_call_id") != result.tool_call_id
+    ):
+        return False
+    effect_material = {
+        "operation_id": operation_id,
+        "turn_id": turn_id,
+        "tool_call_id": call.get("id"),
+        "tool_name": call.get("name"),
+        "arguments": {
+            "file_path": normalized_path,
+            "content": content,
+            "envelope": {"summary": summary},
+        },
+    }
+    expected_effect = (
+        "effect_"
+        + hashlib.sha256(
+            json.dumps(
+                effect_material, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode()
+        ).hexdigest()
+    )
+    if receipt.get("effect_id") != expected_effect:
+        return False
+    try:
+        persisted = effect_journal.read(expected_effect)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if (
+        persisted.get("status") != "RESULT"
+        or persisted.get("operation_id") != operation_id
+        or persisted.get("turn_id") != turn_id
+        or persisted.get("tool_call_id") != call.get("id")
+        or persisted.get("tool_name") != call.get("name")
+        or persisted.get("arguments")
+        != {
+            "file_path": normalized_path,
+            "content": content,
+            "envelope": {"summary": summary},
+        }
+        or persisted.get("postimage") != content
+        or persisted.get("postimage_sha256") != hashlib.sha256(content.encode()).hexdigest()
+        or persisted.get("worker_result") != dict(receipt)
+        or persisted.get("worker_result_sha256")
+        != hashlib.sha256(
+            json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+    ):
+        return False
+    receipt_hash = receipt.get("receipt_sha256")
+    material = dict(receipt)
+    material.pop("receipt_sha256", None)
+    return (
+        isinstance(receipt_hash, str)
+        and receipt_hash
+        == hashlib.sha256(
+            json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+    )
+
+
 def _tool_call_id(name: str, arguments: Mapping[str, Any], raw: str) -> str:
     canonical = json.dumps(
         {"name": name, "arguments": dict(arguments), "raw": raw},
@@ -643,9 +814,7 @@ class OpenCLIWebChatModel(BaseChatModel):
             if turn_id.startswith("turn_repair_"):
                 self._recovery_journal.protocol_repair_recovered(response)
 
-    def _journal_protocol_repair(
-        self, *, origin: str, origin_sha256: str, turn_id: str
-    ) -> None:
+    def _journal_protocol_repair(self, *, origin: str, origin_sha256: str, turn_id: str) -> None:
         if self._recovery_journal is not None:
             method = getattr(self._recovery_journal, "protocol_repair_started", None)
             if method is not None:
@@ -690,7 +859,13 @@ class OpenCLIWebChatModel(BaseChatModel):
         env = {
             k: v
             for k, v in os.environ.items()
-            if not (k.startswith("GITHUB_") or k.startswith("GH_") or "TOKEN" in k and "PROVIDER" not in k and "OPENCLI" not in k)
+            if not (
+                k.startswith("GITHUB_")
+                or k.startswith("GH_")
+                or "TOKEN" in k
+                and "PROVIDER" not in k
+                and "OPENCLI" not in k
+            )
         }
         if self.opencli_profile:
             env["OPENCLI_PROFILE"] = self.opencli_profile
@@ -704,9 +879,7 @@ class OpenCLIWebChatModel(BaseChatModel):
                 capture_output=True,
                 text=True,
                 timeout=(
-                    timeout_seconds
-                    if timeout_seconds is not None
-                    else self.timeout_seconds + 60
+                    timeout_seconds if timeout_seconds is not None else self.timeout_seconds + 60
                 ),
                 shell=False,
                 env=self._environment(),
@@ -942,9 +1115,9 @@ class OpenCLIWebChatModel(BaseChatModel):
         resume = {
             "protocol": envelope.get("protocol", OPENCLI_WEB_PROTOCOL),
             "turn_id": "turn_resume_"
-            + hashlib.sha256(
-                f"{conversation_id}\0{expected_turn_id}".encode("utf-8")
-            ).hexdigest()[:20],
+            + hashlib.sha256(f"{conversation_id}\0{expected_turn_id}".encode("utf-8")).hexdigest()[
+                :20
+            ],
             "rules": envelope.get("rules", []),
             "tools": envelope.get("tools", []),
             "tool_choice": envelope.get("tool_choice", "none"),
@@ -959,11 +1132,7 @@ class OpenCLIWebChatModel(BaseChatModel):
         try:
             return self._detail_response_once(conversation_id, wait=wait, turn_id=turn_id)
         except OpenCLIWebModelError as exc:
-            if (
-                not wait
-                or str(exc) != "OPENCLI_WEB_TIMEOUT"
-                or self._late_readback_used
-            ):
+            if not wait or str(exc) != "OPENCLI_WEB_TIMEOUT" or self._late_readback_used:
                 raise
             self._late_readback_used = True
             deadline = self._late_clock() + _LATE_READBACK_WINDOW_SECONDS
@@ -1007,27 +1176,28 @@ class OpenCLIWebChatModel(BaseChatModel):
             max(self.timeout_seconds, 30)
             if wait
             else (
-                math.ceil(timeout_seconds)
-                if timeout_seconds is not None
-                else self.timeout_seconds
+                math.ceil(timeout_seconds) if timeout_seconds is not None else self.timeout_seconds
             )
         )
-        detail = self._run([
-            self.executable,
-            "chatgpt",
-            "detail",
-            conversation_id,
-            "--wait",
-            "true" if wait else "false",
-            "--timeout",
-            str(readback_timeout),
-            "--stable",
-            str(int(_POST_RESPONSE_SETTLE_SECONDS)),
-            "--site-session",
-            self.site_session,
-            "-f",
-            "json",
-        ], timeout_seconds=timeout_seconds)
+        detail = self._run(
+            [
+                self.executable,
+                "chatgpt",
+                "detail",
+                conversation_id,
+                "--wait",
+                "true" if wait else "false",
+                "--timeout",
+                str(readback_timeout),
+                "--stable",
+                str(int(_POST_RESPONSE_SETTLE_SECONDS)),
+                "--site-session",
+                self.site_session,
+                "-f",
+                "json",
+            ],
+            timeout_seconds=timeout_seconds,
+        )
         try:
             return self._extract_detail_response(detail, turn_id)
         except OpenCLIWebModelError as exc:
@@ -1449,7 +1619,9 @@ class OpenCLIWebChatModel(BaseChatModel):
         if match is None:
             return None
         try:
-            file_path = json.loads(match.group("path"), object_pairs_hook=_reject_duplicate_json_keys)
+            file_path = json.loads(
+                match.group("path"), object_pairs_hook=_reject_duplicate_json_keys
+            )
             raw_content = match.group("content")
             escaped_content: list[str] = []
             index = 0
@@ -1481,6 +1653,134 @@ class OpenCLIWebChatModel(BaseChatModel):
             separators=(",", ":"),
             ensure_ascii=False,
         )
+
+    @staticmethod
+    def _project_unescaped_composite_response(response: str) -> str | None:
+        """Project one exact composite response with only quote repair allowed.
+
+        The two free-text fields are parsed against a unique structural boundary;
+        this prevents a quote inside content or summary from being mistaken for
+        the end of a field.  A projected value retains its source so the local
+        repair path can prove a literal inverse without guessing from JSON alone.
+        """
+        prefix = (
+            '{"type":"tool_call","name":"write_file_and_record_worker_result",'
+            '"arguments":{"file_path":'
+        )
+        boundary = ',"content":"'
+        summary_boundary = '","envelope":{"summary":"'
+        suffix = '"}}}'
+        if not response.startswith(prefix) or not response.endswith(suffix):
+            return None
+
+        # A strict, already-valid canonical response is accepted unchanged.  It
+        # still receives provenance so inverse validation remains fail-closed.
+        try:
+            canonical_value = json.loads(response, object_pairs_hook=_reject_duplicate_json_keys)
+            canonical_arguments = (
+                canonical_value.get("arguments") if isinstance(canonical_value, Mapping) else None
+            )
+            canonical_envelope = (
+                canonical_arguments.get("envelope")
+                if isinstance(canonical_arguments, Mapping)
+                else None
+            )
+            if not (
+                isinstance(canonical_value, Mapping)
+                and list(canonical_value) == ["type", "name", "arguments"]
+                and canonical_value.get("type") == "tool_call"
+                and canonical_value.get("name") == "write_file_and_record_worker_result"
+                and isinstance(canonical_arguments, Mapping)
+                and list(canonical_arguments) == ["file_path", "content", "envelope"]
+                and isinstance(canonical_arguments.get("file_path"), str)
+                and isinstance(canonical_arguments.get("content"), str)
+                and isinstance(canonical_envelope, Mapping)
+                and list(canonical_envelope) == ["summary"]
+                and isinstance(canonical_envelope.get("summary"), str)
+            ):
+                return None
+            canonical_response = json.dumps(
+                canonical_value,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            if canonical_response == response:
+                return _CompositeProjection(response, origin=response)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+        decoder = json.JSONDecoder(object_pairs_hook=_reject_duplicate_json_keys)
+        try:
+            path, path_end = decoder.raw_decode(response[len(prefix) :])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if not isinstance(path, str):
+            return None
+        rest = response[len(prefix) + path_end :]
+        if not rest.startswith(boundary):
+            return None
+        raw_fields = rest[len(boundary) :]
+        if raw_fields.count(summary_boundary) != 1:
+            return None
+        raw_content, raw_summary = raw_fields.split(summary_boundary, 1)
+        if raw_summary.count(suffix) != 1 or not raw_summary.endswith(suffix):
+            return None
+        raw_summary = raw_summary[: -len(suffix)]
+
+        def decode_unescaped_field(raw: str) -> str | None:
+            escaped: list[str] = []
+            index = 0
+            while index < len(raw):
+                character = raw[index]
+                if character == "\\":
+                    if index + 1 >= len(raw):
+                        return None
+                    escaped.append(raw[index : index + 2])
+                    index += 2
+                    continue
+                if character == '"':
+                    # A colon after an unescaped quote indicates a structural
+                    # key boundary, rather than literal field text.
+                    if re.match(r"\s*:", raw[index + 1 :]):
+                        return None
+                    escaped.append('\\"')
+                else:
+                    escaped.append(character)
+                index += 1
+            try:
+                value = json.loads('"' + "".join(escaped) + '"')
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return None
+            return value if isinstance(value, str) else None
+
+        content = decode_unescaped_field(raw_content)
+        summary = decode_unescaped_field(raw_summary)
+        if content is None or summary is None:
+            return None
+        projected = json.dumps(
+            {
+                "type": "tool_call",
+                "name": "write_file_and_record_worker_result",
+                "arguments": {
+                    "file_path": path,
+                    "content": content,
+                    "envelope": {"summary": summary},
+                },
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        return _CompositeProjection(projected, origin=response)
+
+    @staticmethod
+    def _inverse_repaired_composite_response(response: str) -> str | None:
+        if not isinstance(response, _CompositeProjection):
+            return None
+        origin = getattr(response, "origin", None)
+        if not isinstance(origin, str):
+            return None
+        projected = OpenCLIWebChatModel._project_unescaped_composite_response(origin)
+        return origin if projected == response else None
 
     @staticmethod
     def _is_complete_protocol_response(response: str) -> bool:
@@ -1562,6 +1862,11 @@ class OpenCLIWebChatModel(BaseChatModel):
             )
         except (json.JSONDecodeError, ValueError):
             return False
+        projected_composite = OpenCLIWebChatModel._project_unescaped_composite_response(
+            invalid_response
+        )
+        if projected_composite is not None and projected_composite != invalid_response:
+            return repaired_response == projected_composite
         projected_invalid = OpenCLIWebChatModel._project_unescaped_write_response(invalid_response)
         try:
             invalid_envelope, prefix_end = json.JSONDecoder(
@@ -1571,7 +1876,9 @@ class OpenCLIWebChatModel(BaseChatModel):
         except (json.JSONDecodeError, ValueError):
             if projected_invalid is None:
                 return False
-            invalid_envelope = json.loads(projected_invalid, object_pairs_hook=_reject_duplicate_json_keys)
+            invalid_envelope = json.loads(
+                projected_invalid, object_pairs_hook=_reject_duplicate_json_keys
+            )
             invalid_tail = "malformed-write-projection"
         if not isinstance(invalid_envelope, Mapping):
             return False
@@ -1588,9 +1895,24 @@ class OpenCLIWebChatModel(BaseChatModel):
                 separators=(",", ":"),
                 ensure_ascii=False,
             )
+
         return canonical(repaired_envelope) == canonical(invalid_envelope)
 
     def _refresh_protocol_response(self, response: str, *, turn_id: str) -> str:
+        projected_composite = self._project_unescaped_composite_response(response)
+        if (
+            projected_composite is not None
+            and self._inverse_repaired_composite_response(projected_composite) == response
+        ):
+            if self._recovery_journal is not None:
+                self._recovery_journal.protocol_repair_started(
+                    origin=response,
+                    origin_sha256=hashlib.sha256(response.encode("utf-8")).hexdigest(),
+                    turn_id=turn_id,
+                )
+                self._recovery_journal.protocol_repair_recovered(projected_composite)
+                self._recovery_journal.response_recovered(turn_id, projected_composite)
+            return projected_composite
         if self._is_complete_protocol_response(response) or not self._conversation_id:
             return response
         latest = response
@@ -1613,7 +1935,9 @@ class OpenCLIWebChatModel(BaseChatModel):
             ).raw_decode(invalid_response)
             malformed = bool(invalid_response[prefix_end:].strip())
         except (json.JSONDecodeError, ValueError):
-            projected = self._project_unescaped_write_response(invalid_response)
+            projected = self._project_unescaped_composite_response(invalid_response)
+            if projected is None:
+                projected = self._project_unescaped_write_response(invalid_response)
             if projected is None:
                 raise OpenCLIWebModelError("OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID")
             invalid_envelope = json.loads(projected, object_pairs_hook=_reject_duplicate_json_keys)
@@ -1652,10 +1976,9 @@ class OpenCLIWebChatModel(BaseChatModel):
             repair_prompt,
             new_conversation=True,
         )
-        if (
-            not self._is_complete_protocol_response(response)
-            or not self._repair_matches_invalid_response(invalid_response, response)
-        ):
+        if not self._is_complete_protocol_response(
+            response
+        ) or not self._repair_matches_invalid_response(invalid_response, response):
             raise OpenCLIWebModelError("OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID")
         return response
 
@@ -1722,12 +2045,19 @@ class OpenCLIWebChatModel(BaseChatModel):
         if tool_choice is not None and not isinstance(tool_choice, str):
             raise OpenCLIWebModelError("OPENCLI_WEB_TOOL_CHOICE_INVALID")
 
-        if _terminal_recorder_completed(messages, normalized_tools):
+        if _terminal_recorder_completed(
+            messages, normalized_tools
+        ) or _composite_terminal_completed(messages, normalized_tools, self._recovery_journal):
             message = AIMessage(content="Terminal recorder completed.")
             return ChatResult(generations=[ChatGeneration(message=message)])
 
         self._reserve_web_turn()
-        self._select_intelligence_level()
+        # A caller that supplies its own transport implementation owns model
+        # selection as well.  This keeps injected/replayed transports fully
+        # local and avoids probing the external CLI before their send hook.
+        send_impl = getattr(self._send_and_reconcile, "__func__", None)
+        if send_impl is OpenCLIWebChatModel._send_and_reconcile:
+            self._select_intelligence_level()
         prompt = self._render_prompt(messages, normalized_tools, tool_choice)
         turn_id = str(json.loads(prompt)["turn_id"])
         response = self._send_and_reconcile(prompt, budget_reserved=True)

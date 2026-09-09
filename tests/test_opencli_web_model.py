@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import signal
@@ -30,6 +31,11 @@ from nexus_open_swe_runtime.opencli_web_model import (
     _read_durable_state,
     _validate_state_file,
     _write_durable_state,
+)
+from nexus_open_swe_runtime.recovery import (
+    DurableEffectJournal,
+    DurableOperationJournal,
+    RecoveryIdentity,
 )
 
 
@@ -275,16 +281,14 @@ def test_opencli_repair_phase_starts_new_conversation_with_shared_pacing_binding
         if args[1:3] == ["chatgpt", "detail"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps(
-                    [
-                            {"Role": "User", "Text": latest_prompt, "Generating": False},
-                        {
-                            "Role": "Assistant",
-                            "Text": '{"type":"final","content":"repair ok"}',
-                            "Generating": False,
-                        },
-                    ]
-                ),
+                stdout=json.dumps([
+                    {"Role": "User", "Text": latest_prompt, "Generating": False},
+                    {
+                        "Role": "Assistant",
+                        "Text": '{"type":"final","content":"repair ok"}',
+                        "Generating": False,
+                    },
+                ]),
                 stderr="",
             )
         raise AssertionError(args)
@@ -305,8 +309,14 @@ def test_opencli_repair_phase_starts_new_conversation_with_shared_pacing_binding
     assert diagnosis_model._pacing_key() == repair_model._pacing_key()
     assert diagnosis_model._durable_pacing_backend is not None
     assert repair_model._durable_pacing_backend is not None
-    assert diagnosis_model._durable_pacing_backend.state_path() == repair_model._durable_pacing_backend.state_path()
-    assert diagnosis_model._durable_pacing_backend.lock_path() == repair_model._durable_pacing_backend.lock_path()
+    assert (
+        diagnosis_model._durable_pacing_backend.state_path()
+        == repair_model._durable_pacing_backend.state_path()
+    )
+    assert (
+        diagnosis_model._durable_pacing_backend.lock_path()
+        == repair_model._durable_pacing_backend.lock_path()
+    )
 
     result = repair_model.invoke([HumanMessage(content="repair the supported root cause")])
 
@@ -556,13 +566,11 @@ def test_opencli_web_model_translates_declared_terminal_record_direct_form(tool_
     assert result.tool_calls[0]["name"] == tool_name
     assert result.tool_calls[0]["args"] == {"envelope": {"status": "recorded"}}
     legacy = OpenCLIWebChatModel._response_message(
-        json.dumps(
-            {
-                "type": "tool_call",
-                "name": tool_name,
-                "arguments": {"envelope": {"status": "recorded"}},
-            }
-        ),
+        json.dumps({
+            "type": "tool_call",
+            "name": tool_name,
+            "arguments": {"envelope": {"status": "recorded"}},
+        }),
         declared,
     )
     assert legacy.tool_calls[0]["args"] == result.tool_calls[0]["args"]
@@ -570,7 +578,10 @@ def test_opencli_web_model_translates_declared_terminal_record_direct_form(tool_
 
 def test_opencli_web_model_direct_terminal_form_preserves_recorded_payload():
     declared = [
-        {"type": "function", "function": {"name": "record_finding", "parameters": {"type": "object"}}}
+        {
+            "type": "function",
+            "function": {"name": "record_finding", "parameters": {"type": "object"}},
+        }
     ]
     message = OpenCLIWebChatModel._response_message(
         '{"type":"record_finding","envelope":{"status":"recorded"}}', declared
@@ -617,7 +628,10 @@ def test_opencli_web_model_prompt_prefers_direct_terminal_recorders():
 )
 def test_opencli_web_model_rejects_invalid_direct_terminal_record_form(response):
     declared = [
-        {"type": "function", "function": {"name": "record_finding", "parameters": {"type": "object"}}}
+        {
+            "type": "function",
+            "function": {"name": "record_finding", "parameters": {"type": "object"}},
+        }
     ]
 
     with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TOOL_CALL_INVALID"):
@@ -1133,7 +1147,9 @@ def test_opencli_web_model_repairs_protocol_response_with_trailing_junk(
             ask_starts.append(clock())
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([{"conversationId": f"web-conversation-{ask_count}", "response": ""}]),
+                stdout=json.dumps([
+                    {"conversationId": f"web-conversation-{ask_count}", "response": ""}
+                ]),
                 stderr="",
             )
         if args[1:3] == ["chatgpt", "detail"]:
@@ -1177,7 +1193,8 @@ def test_opencli_web_model_repairs_protocol_response_with_trailing_junk(
     initial_ask = next(
         args
         for args in calls
-        if args[1:3] == ["chatgpt", "ask"] and json.loads(args[3])["turn_id"].startswith("turn_")
+        if args[1:3] == ["chatgpt", "ask"]
+        and json.loads(args[3])["turn_id"].startswith("turn_")
         and not json.loads(args[3])["turn_id"].startswith("turn_repair_")
     )
     repair_prompt = json.loads(ask_prompts[1])
@@ -1222,7 +1239,9 @@ def test_opencli_web_model_fails_closed_when_protocol_repair_is_still_invalid(
             latest_prompt = args[3]
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([{"conversationId": f"web-conversation-{ask_count}", "response": ""}]),
+                stdout=json.dumps([
+                    {"conversationId": f"web-conversation-{ask_count}", "response": ""}
+                ]),
                 stderr="",
             )
         if args[1:3] == ["chatgpt", "detail"]:
@@ -1238,6 +1257,7 @@ def test_opencli_web_model_fails_closed_when_protocol_repair_is_still_invalid(
 
     monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
     model = OpenCLIWebChatModel(executable="/opt/opencli")
+    monkeypatch.setattr(model, "_select_intelligence_level", lambda: None)
     model._clock = clock
     model._sleep = clock.sleep
 
@@ -1276,7 +1296,9 @@ def test_opencli_web_model_repair_preserves_protocol_object(
             latest_prompt = args[3]
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([{"conversationId": f"conversation-{ask_count}", "response": ""}]),
+                stdout=json.dumps([
+                    {"conversationId": f"conversation-{ask_count}", "response": ""}
+                ]),
                 stderr="",
             )
         if args[1:3] == ["chatgpt", "detail"]:
@@ -1324,7 +1346,9 @@ def test_opencli_web_model_rejects_repair_argument_drift_for_allowed_tool(
             latest_prompt = args[3]
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([{"conversationId": f"conversation-{ask_count}", "response": ""}]),
+                stdout=json.dumps([
+                    {"conversationId": f"conversation-{ask_count}", "response": ""}
+                ]),
                 stderr="",
             )
         if args[1:3] == ["chatgpt", "detail"]:
@@ -1392,7 +1416,7 @@ def test_unescaped_write_response_projects_exact_content_for_repair():
 
     assert projected == (
         '{"type":"tool_call","name":"write_file","arguments":{"file_path":"'
-        'src/example.py","content":"return \\\"quoted\\\" + value\\n"}}'
+        'src/example.py","content":"return \\"quoted\\" + value\\n"}}'
     )
     assert OpenCLIWebChatModel._repair_matches_invalid_response(invalid, projected)
 
@@ -1401,7 +1425,7 @@ def test_r21_malformed_write_fixture_preserves_every_content_byte():
     invalid = (
         '{"type":"tool_call","name":"write_file","arguments":{"file_path":"'
         '/tests/ops/test_open_swe_resident_five_repo_canary_20260908.py","content":"'
-        'def test_open_swe_resident_five_repo_canary_20260908():\\n mounted_repository_ids = (\\n '
+        "def test_open_swe_resident_five_repo_canary_20260908():\\n mounted_repository_ids = (\\n "
         '"James3014/Nexus-new",\\n "James3014/devspace",\\n "James3014/nexus-core",\\n '
         '"James3014/nexus-learning",\\n "James3014/nexus-open-swe-runtime",\\n )\\n\\n '
         'assert mounted_repository_ids == (\\n "James3014/Nexus-new",\\n '
@@ -1460,7 +1484,7 @@ def test_unescaped_write_repair_rejects_outer_whitespace_and_extra_escape_change
     )
     extra_escape = (
         '{"type":"tool_call","name":"write_file","arguments":'
-        '{"file_path":"x","content":"safe \\\"quoted\\"}}'
+        '{"file_path":"x","content":"safe \\"quoted\\"}}'
     )
 
     assert not OpenCLIWebChatModel._repair_matches_invalid_response(invalid, whitespace)
@@ -1766,7 +1790,9 @@ def test_opencli_web_model_reconciles_timed_out_fresh_repair_by_unique_turn(
     model._sleep = clock.sleep
 
     if expected_error:
-        with pytest.raises(OpenCLIWebModelError, match=f"OPENCLI_WEB_TIMEOUT_RECONCILE_{expected_error}"):
+        with pytest.raises(
+            OpenCLIWebModelError, match=f"OPENCLI_WEB_TIMEOUT_RECONCILE_{expected_error}"
+        ):
             model.bind_tools([]).invoke("inspect README")
     else:
         result = model.bind_tools([]).invoke("inspect README")
@@ -1801,7 +1827,11 @@ def test_opencli_web_model_fresh_repair_identity_requires_exact_unique_json_turn
             json.dumps([
                 {"Role": "User", "Text": json.dumps({"turn_id": turn_id})},
                 {"Role": "User", "Text": json.dumps({"turn_id": "later"})},
-                {"Role": "Assistant", "Text": '{"type":"final","content":"wrong"}', "Generating": False},
+                {
+                    "Role": "Assistant",
+                    "Text": '{"type":"final","content":"wrong"}',
+                    "Generating": False,
+                },
             ]),
             turn_id,
         )
@@ -1812,7 +1842,11 @@ def test_opencli_web_model_fresh_repair_identity_requires_exact_unique_json_turn
                     "Role": "User",
                     "Text": json.dumps({"turn_id": turn_id + "-suffix", "note": turn_id}),
                 },
-                {"Role": "Assistant", "Text": '{"type":"final","content":"wrong"}', "Generating": False},
+                {
+                    "Role": "Assistant",
+                    "Text": '{"type":"final","content":"wrong"}',
+                    "Generating": False,
+                },
             ]),
             turn_id,
         )
@@ -1964,9 +1998,7 @@ def test_opencli_web_model_fails_closed_after_bound_repair_late_readback(
             conversation_id = "original-conversation" if ask_count == 1 else "resume-conversation"
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps(
-                    [{"conversationId": conversation_id, "response": ""}]
-                ),
+                stdout=json.dumps([{"conversationId": conversation_id, "response": ""}]),
                 stderr="",
             )
         if args[1:3] == ["chatgpt", "history"]:
@@ -1991,9 +2023,7 @@ def test_opencli_web_model_fails_closed_after_bound_repair_late_readback(
                     stderr="Browser exec command timed out; it may still complete in the browser.",
                 )
             elif ask_count == 2:
-                rows = [
-                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False}
-                ]
+                rows = [{"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False}]
             else:
                 rows = [
                     {"Index": 1, "Role": "User", "Text": resume_prompt, "Generating": False},
@@ -2064,15 +2094,13 @@ def test_opencli_web_model_repair_resume_uses_final_late_readback(
     monkeypatch: pytest.MonkeyPatch,
 ):
     model = OpenCLIWebChatModel(executable="/opt/opencli")
-    valid_detail = json.dumps(
-        [{"Role": "User", "Text": '{"turn_id":"expected"}', "Generating": False}]
-    )
-    stale_detail = json.dumps(
-        [
-            {"Role": "User", "Text": '{"turn_id":"expected"}', "Generating": False},
-            {"Role": "User", "Text": '{"turn_id":"later"}', "Generating": False},
-        ]
-    )
+    valid_detail = json.dumps([
+        {"Role": "User", "Text": '{"turn_id":"expected"}', "Generating": False}
+    ])
+    stale_detail = json.dumps([
+        {"Role": "User", "Text": '{"turn_id":"expected"}', "Generating": False},
+        {"Role": "User", "Text": '{"turn_id":"later"}', "Generating": False},
+    ])
 
     def fake_run(argv):
         assert argv[2] == "history" or argv[2] == "detail"
@@ -2105,9 +2133,7 @@ def test_opencli_web_model_repair_resume_has_one_attempt_and_budget(
     model = OpenCLIWebChatModel(executable="/opt/opencli")
     model._repair_resume_used = resume_used
     model._web_turn_count = turn_count
-    detail = json.dumps(
-        [{"Role": "User", "Text": '{"turn_id":"expected"}', "Generating": False}]
-    )
+    detail = json.dumps([{"Role": "User", "Text": '{"turn_id":"expected"}', "Generating": False}])
 
     def fake_run(argv):
         if argv[2] == "history":
@@ -2348,8 +2374,12 @@ def test_opencli_web_model_r18_late_readback_returns_write_file_without_redispat
             prior_rows = [
                 {"Index": index, "Role": role, "Text": text, "Generating": False}
                 for index, (role, text) in enumerate(
-                    [("User", '{"turn_id":"prior-1"}'), ("Assistant", "prior-1"),
-                     ("User", '{"turn_id":"prior-2"}'), ("Assistant", "prior-2")],
+                    [
+                        ("User", '{"turn_id":"prior-1"}'),
+                        ("Assistant", "prior-1"),
+                        ("User", '{"turn_id":"prior-2"}'),
+                        ("Assistant", "prior-2"),
+                    ],
                     start=1,
                 )
             ]
@@ -2482,9 +2512,7 @@ def test_opencli_web_model_r18_poll_timeout_caps_remaining_deadline(
             late_now += 4.25
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([
-                    {"Role": "User", "Text": latest_prompt, "Generating": False}
-                ]),
+                stdout=json.dumps([{"Role": "User", "Text": latest_prompt, "Generating": False}]),
                 stderr="",
             )
         raise AssertionError(args)
@@ -2501,7 +2529,10 @@ def test_opencli_web_model_r18_poll_timeout_caps_remaining_deadline(
     assert detail_waits == ["true", "false", "false", "false", "false"]
     assert subprocess_timeouts == [15.0, 10.75, 6.5, 2.25]
     assert cli_timeouts == ["120", "15", "11", "7", "3"]
-    assert all(timeout <= remaining for timeout, remaining in zip(subprocess_timeouts, (15.0, 10.75, 6.5, 2.25)))
+    assert all(
+        timeout <= remaining
+        for timeout, remaining in zip(subprocess_timeouts, (15.0, 10.75, 6.5, 2.25))
+    )
     assert late_now == 17.0
 
 
@@ -2552,7 +2583,11 @@ def test_opencli_web_model_r18_durable_lock_covers_late_polling(
                     returncode=0,
                     stdout=json.dumps([
                         {"Role": "User", "Text": latest_prompts[0], "Generating": False},
-                        {"Role": "Assistant", "Text": '{"type":"final","content":"first"}', "Generating": False},
+                        {
+                            "Role": "Assistant",
+                            "Text": '{"type":"final","content":"first"}',
+                            "Generating": False,
+                        },
                     ]),
                     stderr="",
                 )
@@ -2560,7 +2595,11 @@ def test_opencli_web_model_r18_durable_lock_covers_late_polling(
                 returncode=0,
                 stdout=json.dumps([
                     {"Role": "User", "Text": latest_prompts[1], "Generating": False},
-                    {"Role": "Assistant", "Text": '{"type":"final","content":"second"}', "Generating": False},
+                    {
+                        "Role": "Assistant",
+                        "Text": '{"type":"final","content":"second"}',
+                        "Generating": False,
+                    },
                 ]),
                 stderr="",
             )
@@ -2738,7 +2777,11 @@ def test_opencli_web_model_r18_polling_holds_inprocess_pacing_gate(
                 returncode=0,
                 stdout=json.dumps([
                     {"Role": "User", "Text": latest_prompts[1], "Generating": False},
-                    {"Role": "Assistant", "Text": '{"type":"final","content":"ok"}', "Generating": False},
+                    {
+                        "Role": "Assistant",
+                        "Text": '{"type":"final","content":"ok"}',
+                        "Generating": False,
+                    },
                 ]),
                 stderr="",
             )
@@ -2817,9 +2860,7 @@ def test_opencli_web_model_exhausts_bound_timeout_after_empty_late_readback(
                     stderr="Browser exec command timed out; it may still complete in the browser.",
                 )
             if len(ask_prompts) == 1:
-                rows = [
-                    {"Index": 1, "Role": "User", "Text": ask_prompts[0], "Generating": False}
-                ]
+                rows = [{"Index": 1, "Role": "User", "Text": ask_prompts[0], "Generating": False}]
             else:
                 rows = [
                     {"Index": 1, "Role": "User", "Text": ask_prompts[1], "Generating": False},
@@ -2877,9 +2918,7 @@ def test_opencli_web_model_bound_resume_respects_remaining_turn_budget(
                 )
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps(
-                    [{"Role": "User", "Text": latest_prompt, "Generating": False}]
-                ),
+                stdout=json.dumps([{"Role": "User", "Text": latest_prompt, "Generating": False}]),
                 stderr="",
             )
         if args[1:3] == ["chatgpt", "history"]:
@@ -2931,9 +2970,7 @@ def test_opencli_web_model_bound_resume_timeout_cannot_resume_twice(
                 )
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps(
-                    [{"Role": "User", "Text": latest_prompt, "Generating": False}]
-                ),
+                stdout=json.dumps([{"Role": "User", "Text": latest_prompt, "Generating": False}]),
                 stderr="",
             )
         if args[1:3] == ["chatgpt", "history"]:
@@ -3150,7 +3187,9 @@ def test_opencli_web_model_gives_default_subprocess_sixty_seconds_headroom(
     model = OpenCLIWebChatModel(timeout_seconds=180)
 
     assert model._run(["opencli", "chatgpt", "status"]) == "ok"
-    assert model._run(["opencli", "chatgpt", "detail", "conversation"], timeout_seconds=7.25) == "ok"
+    assert (
+        model._run(["opencli", "chatgpt", "detail", "conversation"], timeout_seconds=7.25) == "ok"
+    )
 
     assert observed_timeouts == [240, 7.25]
 
@@ -4095,3 +4134,287 @@ def test_durable_pacing_no_duplicate_ask(monkeypatch):
 
     with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TURN_BUDGET_EXHAUSTED"):
         model._reserve_web_turn()
+
+
+def _composite_terminal_fixture(tmp_path):
+    identity = RecoveryIdentity(
+        operation_id="a" * 64,
+        execution_material_sha256="b" * 64,
+        workspace=str(tmp_path.resolve()),
+        task_id="task-1",
+        unit_id="unit-1",
+        session_id="session-1",
+        allowed_paths=("a.py",),
+        provider_id="opencli_chatgpt",
+        model_id="advanced",
+        worker_identity_sha256="c" * 64,
+        transport_config_sha256="d" * 64,
+        runtime_identity_sha256="e" * 64,
+        composite_admitted=True,
+    )
+    operation_journal = DurableOperationJournal(tmp_path, identity)
+    operation_journal.prepare()
+    effect_journal = DurableEffectJournal(tmp_path, identity)
+    operation_journal.effect_journal = effect_journal
+    args = {
+        "file_path": "a.py",
+        "content": "done\n",
+        "envelope": {"summary": "fixed"},
+    }
+    raw = json.dumps(
+        {
+            "type": "tool_call",
+            "name": "write_file_and_record_worker_result",
+            "arguments": args,
+        },
+        separators=(",", ":"),
+    )
+    call_id = web_model._tool_call_id("write_file_and_record_worker_result", args, raw)
+    operation_journal.ask_dispatching(turn_id="turn_1", prompt=raw, ordinal=0)
+    effect_journal.bind_turn("turn_1", call_id)
+    effect = effect_journal.intent(
+        turn_id="turn_1",
+        tool_call_id=call_id,
+        tool_name="write_file_and_record_worker_result",
+        arguments=args,
+        path=tmp_path / "a.py",
+        preimage=None,
+        postimage=args["content"],
+    )
+    effect_journal.recover_write(effect)
+    receipt = effect_journal.record_worker_result(effect, args["envelope"])
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "write_file_and_record_worker_result",
+                    "args": args,
+                    "id": call_id,
+                }
+            ],
+        ),
+        ToolMessage(content=json.dumps(receipt), tool_call_id=call_id),
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "write_file_and_record_worker_result"},
+        }
+    ]
+    return args, receipt, messages, tools, operation_journal
+
+
+def test_composite_terminal_receipt_binds_exact_call_and_effect(tmp_path, monkeypatch):
+    args, _receipt, messages, tools, journal = _composite_terminal_fixture(tmp_path)
+    assert web_model._composite_terminal_completed(messages, tools, journal)
+
+    mutations = {
+        "file_path": lambda call: call["args"].__setitem__("file_path", "b.py"),
+        "content": lambda call: call["args"].__setitem__("content", "other\n"),
+        "summary": lambda call: call["args"]["envelope"].__setitem__("summary", "other"),
+        "operation_id": lambda receipt: receipt.__setitem__("operation_id", "c" * 64),
+        "turn_id": lambda receipt: receipt.__setitem__("turn_id", "turn_2"),
+        "tool_call_id": lambda receipt: receipt.__setitem__("tool_call_id", "other"),
+        "effect_id": lambda receipt: receipt.__setitem__("effect_id", "effect_c" + "c" * 63),
+        "path": lambda receipt: receipt.__setitem__("path", "/tmp/b.py"),
+        "postimage_sha256": lambda receipt: receipt.__setitem__("postimage_sha256", "c" * 64),
+        "content_sha256": lambda receipt: receipt.__setitem__("content_sha256", "c" * 64),
+        "summary_sha256": lambda receipt: receipt.__setitem__("summary_sha256", "c" * 64),
+    }
+    accepted_mutations = []
+    for name, mutate in mutations.items():
+        candidate = copy.deepcopy(messages)
+        if name in {"file_path", "content", "summary"}:
+            mutate(candidate[-2].tool_calls[0])
+        else:
+            payload = json.loads(candidate[-1].content)
+            mutate(payload)
+            material = dict(payload)
+            material.pop("receipt_sha256", None)
+            payload["receipt_sha256"] = web_model.hashlib.sha256(
+                json.dumps(
+                    material,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode()
+            ).hexdigest()
+            candidate[-1] = ToolMessage(
+                content=json.dumps(payload), tool_call_id=candidate[-1].tool_call_id
+            )
+        if web_model._composite_terminal_completed(candidate, tools, journal):
+            accepted_mutations.append(name)
+
+    for name, value in {
+        "receipt_sha256": "0" * 64,
+        "schema": "nexus.open_swe_runtime.worker_result.unknown",
+        "status": "IMPLEMENTATION_EFFECT_PENDING",
+    }.items():
+        candidate = copy.deepcopy(messages)
+        payload = json.loads(candidate[-1].content)
+        payload[name] = value
+        if name != "receipt_sha256":
+            material = dict(payload)
+            material.pop("receipt_sha256", None)
+            payload["receipt_sha256"] = web_model.hashlib.sha256(
+                json.dumps(
+                    material, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+                ).encode()
+            ).hexdigest()
+        candidate[-1] = ToolMessage(
+            content=json.dumps(payload), tool_call_id=candidate[-1].tool_call_id
+        )
+        if web_model._composite_terminal_completed(candidate, tools, journal):
+            accepted_mutations.append(name)
+
+    assert accepted_mutations == []
+
+    # The valid exact receipt is consumed locally and must never redispatch.
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model.configure_recovery_journal(journal)
+    sends = 0
+
+    def fail_send(*_args, **_kwargs):
+        nonlocal sends
+        sends += 1
+        raise AssertionError("composite terminal must not send")
+
+    monkeypatch.setattr(model, "_send_and_reconcile", fail_send)
+    result = model._generate(messages, tools=tools)
+    assert sends == 0
+    assert result.generations[0].message.content == "Terminal recorder completed."
+
+
+def test_invalid_composite_receipt_does_not_short_circuit(monkeypatch):
+    args = {"file_path": "a.py", "content": "done\n", "envelope": {"summary": "fixed"}}
+    call_id = "opencli_" + "a" * 24
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    monkeypatch.setattr(model, "_select_intelligence_level", lambda: None)
+    monkeypatch.setattr(
+        model,
+        "_send_and_reconcile",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("sentinel")),
+    )
+    with pytest.raises(AssertionError, match="sentinel"):
+        model._generate(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {"name": "write_file_and_record_worker_result", "args": args, "id": call_id}
+                    ],
+                ),
+                ToolMessage(
+                    content=json.dumps({"status": "IMPLEMENTATION_EFFECT_COMPLETE"}),
+                    tool_call_id=call_id,
+                ),
+            ],
+            tools=[
+                {"type": "function", "function": {"name": "write_file_and_record_worker_result"}}
+            ],
+        )
+
+
+def _r23_malformed_composite_response() -> tuple[str, str]:
+    origin = (
+        '{"type":"tool_call","name":"write_file_and_record_worker_result",'
+        '"arguments":{"file_path":"tests/r23.py","content":"def run():\\n'
+        '    return "quoted"\\n","envelope":{"summary":"writes "quoted""}}}'
+    )
+    expected = json.dumps(
+        {
+            "type": "tool_call",
+            "name": "write_file_and_record_worker_result",
+            "arguments": {
+                "file_path": "tests/r23.py",
+                "content": 'def run():\n    return "quoted"\n',
+                "envelope": {"summary": 'writes "quoted"'},
+            },
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return origin, expected
+
+
+def test_r23_malformed_composite_projection_preserves_path_content_and_summary():
+    origin, expected = _r23_malformed_composite_response()
+
+    projected = OpenCLIWebChatModel._project_unescaped_composite_response(origin)
+
+    assert projected == expected
+    assert json.loads(projected)["arguments"] == {
+        "file_path": "tests/r23.py",
+        "content": 'def run():\n    return "quoted"\n',
+        "envelope": {"summary": 'writes "quoted"'},
+    }
+    assert OpenCLIWebChatModel._inverse_repaired_composite_response(projected) == origin
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda value: value.replace(
+            '"name":"write_file_and_record_worker_result"', '"name":"write_file"'
+        ),
+        lambda value: value.replace(
+            '"type":"tool_call","name"', '"name":"write_file_and_record_worker_result","type"'
+        ),
+        lambda value: value.replace(
+            '"file_path":"tests/r23.py","content"', '"content":"x","file_path":"tests/r23.py"'
+        ),
+        lambda value: " " + value,
+        lambda value: value.replace(
+            '"envelope":{"summary":"writes "quoted""}',
+            '"envelope":{"summary":"writes "quoted"","summary":"duplicate"}',
+        ),
+        lambda value: value.replace(
+            '"envelope":{"summary":"writes "quoted""}',
+            '"envelope":{"summary":"writes "quoted"","extra":true}',
+        ),
+        lambda value: value + value,
+        lambda value: value.replace(
+            'return "quoted"\\n', 'return ","envelope":{"summary":"fake"}}\\n'
+        ),
+    ],
+)
+def test_r23_malformed_composite_projection_rejects_shape_or_boundary_drift(mutation):
+    origin, _expected = _r23_malformed_composite_response()
+
+    assert OpenCLIWebChatModel._project_unescaped_composite_response(mutation(origin)) is None
+
+
+def test_r23_projection_accepts_structural_path_summary_changes_but_rejects_provenance():
+    origin, _expected = _r23_malformed_composite_response()
+    changed = origin.replace('"file_path":"tests/r23.py"', '"file_path":"other.py"')
+    changed = changed.replace('"summary":"writes "quoted""', '"summary":"other"')
+
+    projected = OpenCLIWebChatModel._project_unescaped_composite_response(changed)
+
+    assert projected is not None
+    assert json.loads(projected)["arguments"]["file_path"] == "other.py"
+    assert json.loads(projected)["arguments"]["envelope"]["summary"] == "other"
+    assert not OpenCLIWebChatModel._repair_matches_invalid_response(origin, projected)
+    assert OpenCLIWebChatModel._inverse_repaired_composite_response(projected) != origin
+
+
+def test_r23_composite_repair_equivalence_and_refresh_use_local_projection(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    origin, projected = _r23_malformed_composite_response()
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model._conversation_id = "r23-conversation"
+    monkeypatch.setattr(
+        model,
+        "_detail_response",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("same-family malformed response must project locally")
+        ),
+    )
+
+    assert OpenCLIWebChatModel._repair_matches_invalid_response(origin, projected)
+    assert model._refresh_protocol_response(origin, turn_id="turn_r23") == projected
+
+    mismatch = projected.replace('writes \\"quoted\\"', 'writes \\"changed\\"')
+    assert OpenCLIWebChatModel._inverse_repaired_composite_response(mismatch) is None

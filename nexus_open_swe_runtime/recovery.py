@@ -107,6 +107,7 @@ class RecoveryIdentity:
     transport_config_sha256: str
     runtime_identity_sha256: str
     checkpoint_namespace: str = "open-swe-repair-v1"
+    composite_admitted: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -186,7 +187,9 @@ class DurableOperationJournal:
             return dict(state)
 
     def prepare(self) -> dict[str, Any]:
-        return self._transition(status="PREPARED", checkpoint_namespace=self.identity.checkpoint_namespace)
+        return self._transition(
+            status="PREPARED", checkpoint_namespace=self.identity.checkpoint_namespace
+        )
 
     def ask_dispatching(self, *, turn_id: str, prompt: str, ordinal: int) -> dict[str, Any]:
         if not turn_id or ordinal < 0:
@@ -281,16 +284,27 @@ class DurableEffectJournal:
         return self.root / f"{effect_id}.json"
 
     def intent(
-        self, *, turn_id: str, tool_call_id: str, tool_name: str, arguments: Mapping[str, Any],
-        path: Path, preimage: str | None, postimage: str,
+        self,
+        *,
+        turn_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        path: Path,
+        preimage: str | None,
+        postimage: str,
     ) -> Effect:
-        if tool_name not in {"write_file", "edit_file"}:
+        if tool_name not in {"write_file", "edit_file", "write_file_and_record_worker_result"}:
             raise RuntimeError("RECOVERY_TOOL_FORBIDDEN")
-        effect_id = "effect_" + _sha(_canonical({
-            "operation_id": self.identity.operation_id, "turn_id": turn_id,
-            "tool_call_id": tool_call_id, "tool_name": tool_name,
-            "arguments": dict(arguments),
-        }))
+        effect_id = "effect_" + _sha(
+            _canonical({
+                "operation_id": self.identity.operation_id,
+                "turn_id": turn_id,
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "arguments": dict(arguments),
+            })
+        )
         existing_path = self._path(effect_id)
         if existing_path.is_file() and not existing_path.is_symlink():
             existing = self.read(effect_id)
@@ -305,14 +319,27 @@ class DurableEffectJournal:
                 ):
                     raise RuntimeError("RECOVERY_EFFECT_IDENTITY_MISMATCH")
                 return Effect(
-                    effect_id, self.identity.operation_id, turn_id, tool_call_id, tool_name,
-                    str(path), str(existing["preimage_sha256"]), str(existing["postimage_sha256"]),
-                    str(existing["postimage"]), dict(existing["arguments"]),
+                    effect_id,
+                    self.identity.operation_id,
+                    turn_id,
+                    tool_call_id,
+                    tool_name,
+                    str(path),
+                    str(existing["preimage_sha256"]),
+                    str(existing["postimage_sha256"]),
+                    str(existing["postimage"]),
+                    dict(existing["arguments"]),
                 )
         effect = Effect(
-            effect_id, self.identity.operation_id, turn_id, tool_call_id, tool_name,
-            str(path), _sha(preimage) if preimage is not None else "absent",
-            _sha(postimage), postimage,
+            effect_id,
+            self.identity.operation_id,
+            turn_id,
+            tool_call_id,
+            tool_name,
+            str(path),
+            _sha(preimage) if preimage is not None else "absent",
+            _sha(postimage),
+            postimage,
             dict(arguments),
         )
         _fsync_replace(self._path(effect_id), {"status": "INTENT", **asdict(effect)})
@@ -359,6 +386,70 @@ class DurableEffectJournal:
         _fsync_replace(self._path(effect.effect_id), {"status": "RESULT", **asdict(effect)})
         return "RESULT"
 
+    def record_worker_result(self, effect: Effect, envelope: Mapping[str, Any]) -> dict[str, Any]:
+        state = self.read(effect.effect_id)
+        if state.get("status") != "RESULT":
+            raise RuntimeError("RECOVERY_EFFECT_NOT_RESULT")
+        expected_effect = asdict(effect)
+        persisted_effect = {key: state.get(key) for key in expected_effect}
+        if persisted_effect != expected_effect:
+            raise RuntimeError("RECOVERY_EFFECT_IDENTITY_MISMATCH")
+        if _sha(effect.postimage) != effect.postimage_sha256:
+            raise RuntimeError("RECOVERY_EFFECT_POSTIMAGE_MISMATCH")
+        if not isinstance(envelope, Mapping):
+            raise RuntimeError("RECOVERY_WORKER_RESULT_INVALID")
+        summary = envelope.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise RuntimeError("RECOVERY_WORKER_RESULT_INVALID")
+        if effect.tool_name == "write_file_and_record_worker_result":
+            effect_envelope = effect.arguments.get("envelope")
+            if (
+                not isinstance(effect_envelope, Mapping)
+                or effect_envelope.get("summary") != summary
+            ):
+                raise RuntimeError("RECOVERY_WORKER_RESULT_SUMMARY_MISMATCH")
+        receipt = {
+            "schema": "nexus.open_swe_runtime.worker_result.v1",
+            "status": "IMPLEMENTATION_EFFECT_COMPLETE",
+            "operation_id": self.identity.operation_id,
+            "turn_id": effect.turn_id,
+            "tool_call_id": effect.tool_call_id,
+            "effect_id": effect.effect_id,
+            "tool_name": effect.tool_name,
+            "path": effect.path,
+            "postimage_sha256": effect.postimage_sha256,
+            "summary": summary,
+        }
+        receipt["content_sha256"] = _sha(effect.postimage)
+        receipt["summary_sha256"] = _sha(summary)
+        receipt["receipt_sha256"] = _sha(_canonical(receipt))
+        existing_receipt = state.get("worker_result")
+        existing_hash = state.get("worker_result_sha256")
+        if existing_receipt is not None or existing_hash is not None:
+            if (
+                not isinstance(existing_receipt, Mapping)
+                or not isinstance(existing_hash, str)
+                or existing_receipt != receipt
+                or existing_hash != _sha(_canonical(existing_receipt))
+                or existing_receipt.get("receipt_sha256")
+                != _sha(
+                    _canonical({
+                        key: value
+                        for key, value in existing_receipt.items()
+                        if key != "receipt_sha256"
+                    })
+                )
+            ):
+                raise RuntimeError("RECOVERY_WORKER_RESULT_MISMATCH")
+            return dict(existing_receipt)
+        updated = {
+            **state,
+            "worker_result": receipt,
+            "worker_result_sha256": _sha(_canonical(receipt)),
+        }
+        _fsync_replace(self._path(effect.effect_id), updated)
+        return receipt
+
 
 def checkpoint_path(state_root: str | Path, operation_id: str) -> Path:
     root = Path(state_root).expanduser().resolve() / "recovery" / "checkpoints"
@@ -392,9 +483,7 @@ def validate_checkpoint(path: str | Path) -> bool:
         return False
     try:
         connection = sqlite3.connect(f"file:{candidate}?mode=ro", uri=True)
-        rows = connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()
+        rows = connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         connection.close()
     except sqlite3.Error:
         return False
