@@ -571,6 +571,7 @@ class OpenCLIWebChatModel(BaseChatModel):
     _web_turn_count: int = PrivateAttr(default=0)
     _budget_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
     _durable_pacing_backend: DurablePacingBackend | None = PrivateAttr(default=None)
+    _recovery_journal: Any = PrivateAttr(default=None)
 
     def __init__(self, **data: Any) -> None:
         if "profile" in data:
@@ -605,6 +606,39 @@ class OpenCLIWebChatModel(BaseChatModel):
                 site_session=self.site_session,
                 clock=self._clock,
             )
+
+    def configure_recovery_journal(self, journal: Any) -> None:
+        """Bind one operation journal before the first external model call."""
+        self._recovery_journal = journal
+        try:
+            conversation_id = journal.read().get("conversation_id")
+        except (AttributeError, OSError, TypeError, ValueError):
+            conversation_id = None
+        if isinstance(conversation_id, str) and conversation_id:
+            self._conversation_id = conversation_id
+
+    def _journal_ask(self, turn_id: str, prompt: str) -> None:
+        if self._recovery_journal is not None:
+            self._recovery_journal.ask_dispatching(
+                turn_id=turn_id, prompt=prompt, ordinal=self._web_turn_count
+            )
+
+    def _journal_bound(self, conversation_id: str) -> None:
+        if self._recovery_journal is not None:
+            self._recovery_journal.conversation_bound(conversation_id)
+
+    def _journal_response(self, turn_id: str, response: str) -> None:
+        if self._recovery_journal is not None:
+            if getattr(self._recovery_journal, "effect_journal", None) is not None:
+                try:
+                    envelope = json.loads(response)
+                    if envelope.get("type") == "tool_call":
+                        args = envelope.get("arguments") or {}
+                        call_id = _tool_call_id(str(envelope.get("name") or ""), args, response)
+                        self._recovery_journal.effect_journal.bind_turn(turn_id, call_id)
+                except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                    pass
+            self._recovery_journal.response_recovered(turn_id, response)
 
     @property
     def model_name(self) -> str:
@@ -1080,7 +1114,9 @@ class OpenCLIWebChatModel(BaseChatModel):
     def _reconcile_timeout(self, turn_id: str, resume_prompt: str | None = None) -> str:
         if self._conversation_id:
             try:
-                return self._detail_response(self._conversation_id, wait=True, turn_id=turn_id)
+                response = self._detail_response(self._conversation_id, wait=True, turn_id=turn_id)
+                self._journal_response(turn_id, response)
+                return response
             except _IncompleteDetailError as exc:
                 return self._resume_bound_turn_once(
                     turn_id,
@@ -1117,7 +1153,10 @@ class OpenCLIWebChatModel(BaseChatModel):
         if len(matches) != 1:
             raise OpenCLIWebModelError("OPENCLI_WEB_TIMEOUT_RECONCILE_UNKNOWN")
         self._conversation_id = matches[0]
-        return self._detail_response(matches[0], wait=True, turn_id=turn_id)
+        self._journal_bound(matches[0])
+        response = self._detail_response(matches[0], wait=True, turn_id=turn_id)
+        self._journal_response(turn_id, response)
+        return response
 
     def _reconcile_fresh_repair_timeout(
         self,
@@ -1160,8 +1199,11 @@ class OpenCLIWebChatModel(BaseChatModel):
             raise OpenCLIWebModelError("OPENCLI_WEB_TIMEOUT_RECONCILE_UNKNOWN")
         conversation_id = matches[0]
         self._conversation_id = conversation_id
+        self._journal_bound(conversation_id)
         try:
-            return self._detail_response(conversation_id, wait=True, turn_id=turn_id)
+            response = self._detail_response(conversation_id, wait=True, turn_id=turn_id)
+            self._journal_response(turn_id, response)
+            return response
         except _IncompleteDetailError as exc:
             return self._resume_bound_turn_once(
                 turn_id,
@@ -1245,6 +1287,7 @@ class OpenCLIWebChatModel(BaseChatModel):
             if isinstance(prompt_envelope, Mapping)
             else ""
         )
+        self._journal_ask(turn_id, prompt)
         prior_conversation_id = self._conversation_id
         argv = [self.executable, "chatgpt", "ask", prompt]
         if self._conversation_id and not new_conversation:
@@ -1289,7 +1332,9 @@ class OpenCLIWebChatModel(BaseChatModel):
         ):
             raise OpenCLIWebModelError("OPENCLI_WEB_CONVERSATION_ID_MISMATCH")
         self._conversation_id = conversation_id
+        self._journal_bound(conversation_id)
         response = self._detail_response(conversation_id, wait=True, turn_id=turn_id)
+        self._journal_response(turn_id, response)
         if response_finished_ref is not None:
             response_finished_ref[0] = True
         return response

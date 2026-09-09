@@ -73,6 +73,26 @@ execution replay request) match; missing or mismatched material, including a
 legacy record without the required workspace binding, yields
 `OPEN_SWE_OUTCOME_UNKNOWN` and never re-dispatches execution.
 
+### Restart-safe worker recovery
+
+Worker operations additionally keep an owner-only journal under
+`<runtime_state_root>/recovery/`. Each journal is atomically replaced and
+fsynced, and its operation fence carries a monotonic lease epoch. The record
+binds the operation/material/workspace/session/provider/model/worker identity,
+the transport hash, and the fixed repair checkpoint namespace. Before an
+OpenCLI request the exact turn ID and prompt hash are recorded; the
+conversation ID is recorded before detail readback is trusted.
+
+After a process restart, reconciliation may read only the recorded
+conversation and exact turn with `detail --wait false`. It must not resend the
+initial ask or scan history. Repair graphs use the persistent SQLite
+checkpoint backend (`langgraph-checkpoint-sqlite`) so a recovered assistant
+message can be injected at the saved model node and the existing scoped tools
+can continue. File mutations use INTENT/RESULT effect records. A write is
+recovered only when its exact expected postimage is present or its exact
+preimage still permits one execution; an unresolved `edit_file` intent remains
+unknown.
+
 ## 5. Security & Authority Boundaries
 
 - **Execution Runtime Only**: The runtime possesses zero Workforce admission, Capability routing, Candidate acceptance, or Git commit/push authority.

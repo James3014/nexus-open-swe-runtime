@@ -1,0 +1,251 @@
+from __future__ import annotations
+
+import json
+import multiprocessing
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import pytest
+
+from nexus_open_swe_runtime import cli
+from nexus_open_swe_runtime.recovery import (
+    DurableEffectJournal,
+    DurableOperationJournal,
+    RecoveryIdentity,
+    reconcile_bound_turn,
+)
+
+
+def _identity(tmp_path: Path) -> RecoveryIdentity:
+    return RecoveryIdentity(
+        operation_id="a" * 64,
+        execution_material_sha256="b" * 64,
+        workspace=str(tmp_path / "workspace"),
+        task_id="task-1",
+        unit_id="unit-1",
+        session_id="session-1",
+        allowed_paths=("a.py",),
+        provider_id="opencli_chatgpt",
+        model_id="balanced",
+        worker_identity_sha256="c" * 64,
+        transport_config_sha256="d" * 64,
+        runtime_identity_sha256="e" * 64,
+        checkpoint_namespace="open-swe-repair-v1",
+    )
+
+
+def _contending_fence(state_root: str, workspace: str, marker: str) -> None:
+    identity = RecoveryIdentity(
+        operation_id="a" * 64,
+        execution_material_sha256="b" * 64,
+        workspace=workspace,
+        task_id="task-1", unit_id="unit-1", session_id="session-1",
+        allowed_paths=("a.py",), provider_id="opencli_chatgpt", model_id="balanced",
+        worker_identity_sha256="c" * 64, transport_config_sha256="d" * 64,
+        runtime_identity_sha256="e" * 64,
+    )
+    journal = DurableOperationJournal(state_root, identity)
+    with journal.fence():
+        with Path(marker).open("a", encoding="utf-8") as stream:
+            stream.write("entered\n")
+            stream.flush()
+        time.sleep(0.15)
+        with Path(marker).open("a", encoding="utf-8") as stream:
+            stream.write("leaving\n")
+            stream.flush()
+
+
+def test_operation_journal_is_atomic_owner_only_and_round_trips(tmp_path: Path):
+    journal = DurableOperationJournal(tmp_path / "state", _identity(tmp_path))
+    journal.prepare()
+    journal.ask_dispatching(turn_id="turn_1", prompt="payload", ordinal=0)
+    journal.conversation_bound("conversation-1")
+    journal.response_recovered("turn_1", '{"type":"tool_call"}')
+
+    restored = DurableOperationJournal.open(tmp_path / "state", _identity(tmp_path))
+    state = restored.read()
+    assert state["status"] == "RESPONSE_RECOVERED"
+    assert state["conversation_id"] == "conversation-1"
+    assert state["turn_id"] == "turn_1"
+    assert state["prompt_sha256"]
+    assert state["lease_epoch"] >= 1
+    assert journal.path.stat().st_mode & 0o077 == 0
+
+
+def test_effect_journal_accepts_exact_already_applied_write(tmp_path: Path):
+    target = tmp_path / "a.py"
+    journal = DurableEffectJournal(tmp_path / "state", _identity(tmp_path))
+    effect = journal.intent(
+        turn_id="turn_1",
+        tool_call_id="call_1",
+        tool_name="write_file",
+        arguments={"file_path": "a.py", "content": "VALUE = 2\n"},
+        path=target,
+        preimage=None,
+        postimage="VALUE = 2\n",
+    )
+    target.write_text("VALUE = 2\n", encoding="utf-8")
+    assert journal.recover_write(effect) == "RESULT"
+    assert journal.read(effect.effect_id)["status"] == "RESULT"
+
+
+def test_effect_journal_fails_closed_on_unresolved_edit_intent(tmp_path: Path):
+    target = tmp_path / "a.py"
+    target.write_text("old\n", encoding="utf-8")
+    journal = DurableEffectJournal(tmp_path / "state", _identity(tmp_path))
+    effect = journal.intent(
+        turn_id="turn_1",
+        tool_call_id="call_1",
+        tool_name="edit_file",
+        arguments={"file_path": "a.py"},
+        path=target,
+        preimage="old\n",
+        postimage="new\n",
+    )
+    with pytest.raises(RuntimeError, match="UNRESOLVED"):
+        journal.recover_write(effect)
+
+
+def test_scoped_backend_records_write_effect_and_reads_operation_turn(tmp_path: Path):
+    target = tmp_path / "a.py"
+    journal = DurableEffectJournal(tmp_path / "state", _identity(tmp_path))
+    journal.bind_turn("turn_9", "call_9")
+
+    class Delegate:
+        def write(self, file_path, content):
+            target.write_text(content, encoding="utf-8")
+
+    backend = cli.ScopedRepairBackend(Delegate(), tmp_path, ("a.py",), journal)
+    backend.write("a.py", "done\n")
+    records = list((tmp_path / "state" / "recovery" / "effects").glob("*.json"))
+    assert len(records) == 1
+    assert json.loads(records[0].read_text(encoding="utf-8"))["status"] == "RESULT"
+
+
+def test_scoped_backend_replays_result_without_second_delegate(tmp_path: Path):
+    target = tmp_path / "a.py"
+    journal = DurableEffectJournal(tmp_path / "state", _identity(tmp_path))
+    journal.bind_turn("turn_9", "call_9")
+    calls = 0
+
+    class Delegate:
+        def write(self, file_path, content):
+            nonlocal calls
+            calls += 1
+            target.write_text(content, encoding="utf-8")
+
+    backend = cli.ScopedRepairBackend(Delegate(), tmp_path, ("a.py",), journal)
+    backend.write("a.py", "done\n")
+    backend.write("a.py", "done\n")
+    assert calls == 0
+
+
+def test_operation_journal_lease_serializes_processes(tmp_path: Path):
+    journal = DurableOperationJournal(tmp_path / "state", _identity(tmp_path))
+    with journal.fence():
+        assert journal.read()["lease_epoch"] == 1
+
+
+def test_operation_fence_serializes_real_processes(tmp_path: Path):
+    identity = _identity(tmp_path)
+    journal = DurableOperationJournal(tmp_path / "state", identity)
+    journal.prepare()
+    marker = tmp_path / "fence-events.log"
+    processes = [
+        multiprocessing.get_context("fork").Process(
+            target=_contending_fence,
+            args=(str(tmp_path / "state"), identity.workspace, str(marker)),
+        )
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=3)
+    assert marker.read_text(encoding="utf-8").splitlines() in (
+        ["entered", "leaving", "entered", "leaving"],
+    )
+    assert all(process.exitcode == 0 for process in processes)
+    assert journal.read()["lease_epoch"] == 3
+
+
+def test_reconcile_process_fence_gives_one_winner_and_zero_call_loser(tmp_path: Path):
+    state_root = tmp_path / "state"
+    request = {"runtime_state_root": str(state_root), "operation_id": "a" * 64}
+    marker = tmp_path / "winner.marker"
+    counts = tmp_path / "counts.log"
+
+    def callback(req, **_kwargs):
+        with marker.open("a+", encoding="utf-8") as stream:
+            stream.seek(0)
+            winner = bool(stream.read())
+            if winner:
+                return {"status": "COMPLETED", "calls": 0}
+            stream.write("winner")
+            stream.flush()
+        with counts.open("a", encoding="utf-8") as stream:
+            stream.write("detail update invoke effect\n")
+        return {"status": "COMPLETED", "calls": 1}
+
+    wrapped = cli._fenced_worker_reconcile(callback)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = pool.map(lambda _: wrapped(request), range(2))
+    assert first["status"] == second["status"] == "COMPLETED"
+    assert first["calls"] + second["calls"] == 1
+    assert counts.read_text(encoding="utf-8").splitlines() == ["detail update invoke effect"]
+
+
+def test_reconcile_bound_turn_reads_exact_detail_without_ask_or_history(tmp_path: Path):
+    journal = DurableOperationJournal(tmp_path / "state", _identity(tmp_path))
+    journal.prepare()
+    journal.ask_dispatching(turn_id="turn_1", prompt="payload", ordinal=0)
+    journal.conversation_bound("conversation-1")
+
+    class Model:
+        _conversation_id = None
+
+        def _detail_response(self, conversation_id, *, wait, turn_id):
+            assert conversation_id == "conversation-1"
+            assert wait is False
+            assert turn_id == "turn_1"
+            return '{"type":"tool_call"}'
+
+    assert reconcile_bound_turn(journal, Model()) == '{"type":"tool_call"}'
+
+
+def test_reconcile_bound_turn_reuses_persisted_response_without_detail(tmp_path: Path):
+    journal = DurableOperationJournal(tmp_path / "state", _identity(tmp_path))
+    journal.prepare()
+    journal.ask_dispatching(turn_id="turn_1", prompt="payload", ordinal=0)
+    journal.conversation_bound("conversation-1")
+    response = '{"type":"tool_call"}'
+    journal.response_recovered("turn_1", response)
+
+    class Model:
+        def _detail_response(self, *args, **kwargs):
+            raise AssertionError("reconcile must not detail a recovered response")
+
+    assert reconcile_bound_turn(journal, Model()) == response
+
+
+def test_restart_trace_recovered_response_updates_graph_once_and_terminal_reconcile_is_idempotent(tmp_path: Path):
+    journal = DurableOperationJournal(tmp_path / "state", _identity(tmp_path))
+    journal.prepare()
+    journal.ask_dispatching(turn_id="turn_1", prompt="payload", ordinal=0)
+    journal.conversation_bound("conversation-1")
+    calls: list[str] = []
+
+    class Model:
+        _conversation_id = None
+
+        def _detail_response(self, conversation_id, *, wait, turn_id):
+            calls.append(f"detail:{conversation_id}:{wait}:{turn_id}")
+            return '{"type":"tool_call","name":"write_file","arguments":{"file_path":"a.py","content":"done"}}'
+
+    recovered = reconcile_bound_turn(journal, Model())
+    assert '"write_file"' in recovered
+    assert calls == ["detail:conversation-1:False:turn_1"]
+    journal.terminal({"status": "COMPLETED"})
+    assert journal.read()["status"] == "COMPLETED"
+    assert calls == ["detail:conversation-1:False:turn_1"]
