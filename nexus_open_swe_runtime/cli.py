@@ -1439,7 +1439,6 @@ def _worker_run(
             repair_config = {
                 "configurable": {
                     "thread_id": str(request.get("operation_id") or ""),
-                    "checkpoint_ns": recovery_identity.checkpoint_namespace,
                 },
                 "recursion_limit": 60,
             }
@@ -1668,7 +1667,7 @@ def _worker_reconcile(
                 return cached
             effect_journal.bind_turn(turn_id, recovered_call_id)
         config = {
-            "configurable": {"thread_id": operation_id, "checkpoint_ns": identity.checkpoint_namespace},
+            "configurable": {"thread_id": operation_id},
             "recursion_limit": 60,
         }
         graph.update_state(config, {"messages": [recovered_message]}, as_node="model")

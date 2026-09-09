@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TypedDict
 
 import pytest
 from langchain_core.messages import HumanMessage, ToolMessage
@@ -18,6 +20,39 @@ from nexus_open_swe_runtime.recovery import (
     RecoveryIdentity,
     create_checkpoint,
 )
+
+
+def test_root_checkpoint_config_reads_sqlite_checkpoint_without_subgraph_namespace(tmp_path):
+    from langgraph.checkpoint.sqlite import SqliteSaver
+    from langgraph.graph import END, START, StateGraph
+
+    class State(TypedDict):
+        value: str
+
+    connection = sqlite3.connect(str(tmp_path / "checkpoint.sqlite"), check_same_thread=False)
+    saver = SqliteSaver(connection)
+    saver.setup()
+    builder = StateGraph(State)
+    builder.add_node("step", lambda _state: {"value": "recovered"})
+    builder.add_edge(START, "step")
+    builder.add_edge("step", END)
+    graph = builder.compile(checkpointer=saver)
+    config = {"configurable": {"thread_id": "operation-1"}}
+
+    assert graph.invoke({"value": "pending"}, config=config) == {"value": "recovered"}
+    assert graph.get_state(config).values == {"value": "recovered"}
+    assert connection.execute("SELECT DISTINCT checkpoint_ns FROM checkpoints").fetchall() == [
+        ("",)
+    ]
+    with pytest.raises(ValueError, match="Subgraph open-swe-repair-v1 not found"):
+        graph.get_state(
+            {
+                "configurable": {
+                    "thread_id": "operation-1",
+                    "checkpoint_ns": "open-swe-repair-v1",
+                }
+            }
+        )
 
 
 class FakeGraph:
@@ -772,7 +807,7 @@ def test_worker_reconcile_direct_restart_trace_has_one_winner_and_zero_call_lose
         def update_state(self, config, values, *, as_node):
             counters["update"] += 1
             assert as_node == "model"
-            assert config["configurable"] == {"thread_id": operation_id, "checkpoint_ns": "open-swe-repair-v1"}
+            assert config["configurable"] == {"thread_id": operation_id}
             assert values["messages"][0].tool_calls[0]["id"] == "call-1"
 
         def invoke(self, payload, *, config):
