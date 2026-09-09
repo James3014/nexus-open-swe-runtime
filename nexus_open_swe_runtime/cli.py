@@ -634,11 +634,13 @@ def _semantic_v2_admission(
     artifact: Path,
     prompt: str,
     allowed_paths: tuple[str, ...],
+    artifact_bytes: bytes | None = None,
 ) -> SemanticAdmission:
     """Classify a v2 packet without invoking a model or graph."""
-    raw = b""
+    raw = artifact_bytes or b""
     try:
-        raw = _read_regular_artifact(artifact)
+        if artifact_bytes is None:
+            raw = _read_regular_artifact(artifact)
         envelope = _parse_unique_json(raw)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, RuntimeErrorBounded):
         return SemanticAdmission(REJECT)
@@ -738,12 +740,28 @@ def _semantic_v2_admission(
             return SemanticAdmission(REJECT)
         if scope["production_edit_paths"] or scope["conditional_migration_paths"]:
             return SemanticAdmission(REJECT)
+        if tuple(scope["read_only_authorities"]) != (task_card_ref,):
+            return SemanticAdmission(REJECT)
         required = tuple(_safe_relative_path(str(path)) for path in scope["required_test_edit_paths"])
         if required != allowed_paths or not isinstance(scope["max_files"], int) or isinstance(scope["max_files"], bool) or scope["max_files"] != len(allowed_paths):
             return SemanticAdmission(REJECT)
         if not all(isinstance(diagnosis[key], str) and diagnosis[key].strip() for key in ("hypothesis", "next_probe")):
             return SemanticAdmission(REJECT)
         task_ref = f"task_card:{task_card_ref}@"
+        task_card_evidence = next(
+            (
+                ref
+                for ref in refs
+                if isinstance(ref, str)
+                and ref.startswith(task_ref)
+                and _evidence_anchor(ref[len(task_ref) :])
+            ),
+            None,
+        )
+        if task_card_evidence is None:
+            return SemanticAdmission(REJECT)
+        if task_card_evidence not in inspect_first:
+            return SemanticAdmission(REJECT)
         if not any(
             isinstance(ref, str)
             and ref.startswith(task_ref)
@@ -755,7 +773,7 @@ def _semantic_v2_admission(
             if _workspace_path_has_symlink(workspace, path):
                 return SemanticAdmission(REJECT)
             source_ref = _source_ref_for_path(refs, path)
-            if source_ref is None or not any(isinstance(entry, str) and source_ref in entry for entry in inspect_first):
+            if source_ref is None or source_ref not in inspect_first:
                 return SemanticAdmission(REJECT)
             target = workspace / path
             try:
@@ -877,16 +895,20 @@ def _base_result(request: Mapping[str, Any], *, kind: str, status: str) -> dict[
     }
 
 
-def _worker_material_fingerprint(request: Mapping[str, Any]) -> str | None:
+def _worker_material_fingerprint(
+    request: Mapping[str, Any], artifact_bytes: bytes | None = None
+) -> str | None:
     prompt = request.get("prompt")
     artifact_path = request.get("artifact_path")
     if not isinstance(prompt, str) or not isinstance(artifact_path, str):
         return None
-    artifact = Path(artifact_path).expanduser().resolve()
-    try:
-        artifact_sha256 = _sha256(artifact.read_bytes())
-    except OSError:
-        artifact_sha256 = "unavailable"
+    artifact = Path(artifact_path).expanduser()
+    if artifact_bytes is None:
+        try:
+            artifact_bytes = _read_regular_artifact(artifact)
+        except RuntimeErrorBounded:
+            artifact_bytes = None
+    artifact_sha256 = _sha256(artifact_bytes) if artifact_bytes is not None else "unavailable"
     return _sha256(
         _canonical_json(
             {
@@ -908,13 +930,15 @@ def _worker_material_fingerprint(request: Mapping[str, Any]) -> str | None:
     )
 
 
-def _write_started(request: Mapping[str, Any], kind: str) -> dict[str, Any]:
+def _write_started(
+    request: Mapping[str, Any], kind: str, artifact_bytes: bytes | None = None
+) -> dict[str, Any]:
     state = _base_result(request, kind=kind, status="STARTED")
     if kind == "worker" and request.get("workspace_path"):
         state["directory"] = str(
             Path(str(request["workspace_path"])).expanduser().resolve()
         )
-        material_fingerprint = _worker_material_fingerprint(request)
+        material_fingerprint = _worker_material_fingerprint(request, artifact_bytes)
         if material_fingerprint is not None:
             state["execution_material_sha256"] = material_fingerprint
     state["process_started"] = True
@@ -1147,7 +1171,7 @@ def _worker_run(
     if existing is not None:
         return _reconcile_operation(request, kind="worker")
     workspace = Path(str(request.get("workspace_path") or "")).expanduser().resolve()
-    artifact = Path(str(request.get("artifact_path") or "")).expanduser().resolve()
+    artifact = Path(str(request.get("artifact_path") or "")).expanduser()
     prompt = str(request.get("prompt") or "")
     provider = str(request.get("provider_id") or "")
     model_id = str(request.get("model_id") or "")
@@ -1159,7 +1183,11 @@ def _worker_run(
         or not model_id
     ):
         return _base_result(request, kind="worker", status="OPEN_SWE_EXECUTION_INPUT_INVALID")
-    started = _write_started(request, "worker")
+    try:
+        artifact_bytes = _read_regular_artifact(artifact)
+    except RuntimeErrorBounded:
+        artifact_bytes = None
+    started = _write_started(request, "worker", artifact_bytes)
     diagnosis_status = ""
     diagnosis_sha256 = ""
     diagnosis_evidence_paths: tuple[str, ...] = ()
@@ -1173,7 +1201,7 @@ def _worker_run(
         runtime = runtime_loader()
         profile_key = f"{provider}:{model_id}"
         semantic_admission = _semantic_v2_admission(
-            request, workspace, artifact, prompt, allowed_paths
+            request, workspace, artifact, prompt, allowed_paths, artifact_bytes
         )
         semantic_admission_decision = semantic_admission.decision
         if semantic_admission_decision == REJECT:

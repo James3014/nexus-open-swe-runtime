@@ -7,8 +7,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from langchain_core.messages import HumanMessage
 
 from nexus_open_swe_runtime import cli
+from nexus_open_swe_runtime.opencli_web_model import OpenCLIWebChatModel
 
 
 class FakeGraph:
@@ -1366,6 +1368,93 @@ def test_worker_admits_strict_v2_without_diagnosis_model_or_graph(tmp_path, monk
     assert repair.calls == 1
 
 
+def test_worker_admit_r16_opencli_repair_uses_new_without_conversation(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "_git_output",
+        lambda _workspace, *args: {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
+        }[args],
+    )
+    ask_commands: list[list[str]] = []
+    latest_prompt = ""
+
+    def fake_run(argv, **_kwargs):
+        nonlocal latest_prompt
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_commands.append(args)
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": "r16-repair", "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    [
+                        {"Role": "User", "Text": latest_prompt, "Generating": False},
+                        {
+                            "Role": "Assistant",
+                            "Text": '{"type":"final","content":"repair ok"}',
+                            "Generating": False,
+                        },
+                    ]
+                ),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    repair_model_calls = 0
+
+    def model_factory(_runtime, provider, model_id, transport_config, state_root):
+        nonlocal repair_model_calls
+        repair_model_calls += 1
+        return OpenCLIWebChatModel(
+            executable=transport_config["executable"],
+            intelligence_level=model_id,
+            opencli_profile=transport_config["profile"],
+            timeout_seconds=transport_config["timeout_seconds"],
+            site_session=transport_config["site_session"],
+            runtime_state_root=state_root,
+        )
+
+    class RepairGraph(FakeGraph):
+        def __init__(self, model):
+            super().__init__(cli.REPAIR_TOOLS)
+            self.model = model
+
+        def invoke(self, _payload, config=None):
+            self.calls += 1
+            self.model.invoke([HumanMessage(content="repair")])
+            return _record("record_worker_result", {"summary": "repair ok"})
+
+    def repair_factory(model, *_args):
+        assert model._conversation_id is None
+        return RepairGraph(model)
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=model_factory,
+        diagnosis_factory=lambda *_args: pytest.fail("admitted v2 must skip diagnosis"),
+        repair_factory=repair_factory,
+    )
+    assert result["status"] == "COMPLETED"
+    assert repair_model_calls == 1
+    assert len(ask_commands) == 1
+    assert "--new" in ask_commands[0]
+    assert "--conversation" not in ask_commands[0]
+
+
 def test_worker_invalid_v2_hash_rejects_before_any_model_or_graph(tmp_path):
     request = _v2_request(tmp_path)
     request["prompt"] = request["prompt"].replace("envelope_sha256=", "envelope_sha256=" + "0" * 64 + "\n#")
@@ -1417,17 +1506,57 @@ def test_malformed_v2_rejects_without_fallback_model(tmp_path):
     assert model_calls == 0
 
 
-def test_v2_artifact_symlink_and_missing_full_worker_identity_reject(tmp_path):
+def test_v2_artifact_symlink_rejects(tmp_path):
     request = _v2_request(tmp_path)
     artifact = Path(request["artifact_path"])
     target = artifact.with_name("artifact-target.json")
     artifact.replace(target)
     artifact.symlink_to(target.name)
-    request.pop("worker_identity")
     assert cli._semantic_v2_admission(
         request,
         Path(request["workspace_path"]),
         artifact,
+        request["prompt"],
+        ("a.py",),
+    ).decision == cli.REJECT
+
+
+def test_v2_missing_full_worker_identity_rejects(tmp_path):
+    request = _v2_request(tmp_path)
+    request.pop("worker_identity")
+    assert cli._semantic_v2_admission(
+        request,
+        Path(request["workspace_path"]),
+        Path(request["artifact_path"]),
+        request["prompt"],
+        ("a.py",),
+    ).decision == cli.REJECT
+
+
+def test_v2_card_symlink_rejects(tmp_path):
+    request = _v2_request(tmp_path)
+    workspace = Path(request["workspace_path"])
+    card = workspace / "tasks/task-card.md"
+    target = workspace / "tasks/card-target.md"
+    card.replace(target)
+    card.symlink_to(target.name)
+    assert cli._semantic_v2_admission(
+        request,
+        workspace,
+        Path(request["artifact_path"]),
+        request["prompt"],
+        ("a.py",),
+    ).decision == cli.REJECT
+
+
+def test_v2_target_symlink_rejects(tmp_path):
+    request = _v2_request(tmp_path)
+    workspace = Path(request["workspace_path"])
+    (workspace / "a.py").symlink_to("tasks/task-card.md")
+    assert cli._semantic_v2_admission(
+        request,
+        workspace,
+        Path(request["artifact_path"]),
         request["prompt"],
         ("a.py",),
     ).decision == cli.REJECT
