@@ -16,6 +16,7 @@ from langchain_core.messages import HumanMessage, ToolMessage
 from nexus_open_swe_runtime import cli
 from nexus_open_swe_runtime.opencli_web_model import OpenCLIWebChatModel
 from nexus_open_swe_runtime.recovery import (
+    DurableEffectJournal,
     DurableOperationJournal,
     RecoveryIdentity,
     create_checkpoint,
@@ -2707,3 +2708,302 @@ def test_composite_projector_has_strict_literal_inverse():
     assert projected == raw
     assert OpenCLIWebChatModel._inverse_repaired_composite_response(projected) == raw
     assert OpenCLIWebChatModel._project_unescaped_composite_response(raw.replace('"name":"write_file_and_record_worker_result"', '"name":"write_file"')) is None
+
+
+def _composite_worker_model(model: OpenCLIWebChatModel, sends: list[str]) -> None:
+    """Make the real web model return one valid composite tool call."""
+    def one_model_send(prompt, **_kwargs):
+        sends.append(prompt)
+        turn_id = json.loads(prompt)["turn_id"]
+        model._journal_ask(turn_id, prompt)
+        model._journal_bound("conversation-1")
+        response = json.dumps(
+            {
+                "type": "tool_call",
+                "name": "write_file_and_record_worker_result",
+                "arguments": {
+                    "file_path": "a.py",
+                    "content": "VALUE = 2\n",
+                    "envelope": {"summary": "repaired a.py"},
+                },
+            },
+            separators=(",", ":"),
+        )
+        model._journal_response(turn_id, response)
+        return response
+
+    model._send_and_reconcile = one_model_send
+
+
+def _composite_recovery_fixture(tmp_path: Path) -> tuple[dict, DurableOperationJournal, DurableEffectJournal]:
+    request = _worker_request(tmp_path)
+    request.update(
+        operation="worker_reconcile",
+        provider_id="opencli_chatgpt",
+        model_id="advanced",
+        transport_config={
+            "executable": "/usr/bin/opencli",
+            "profile": "r16",
+            "site_session": "ephemeral",
+            "timeout_seconds": 30,
+        },
+    )
+    workspace = Path(request["workspace_path"])
+    target = workspace / "a.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    runtime_identity = cli._sha256(cli._canonical_json({
+        "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
+        "deepagents": cli._deepagents_version(),
+        "checkpoint_namespace": "open-swe-repair-v1",
+    }))
+    identity = RecoveryIdentity(
+        operation_id=request["operation_id"], execution_material_sha256="b" * 64,
+        workspace=str(workspace.resolve()), task_id="task-1", unit_id="u1",
+        session_id="session-1", allowed_paths=("a.py",),
+        provider_id=request["provider_id"], model_id=request["model_id"],
+        worker_identity_sha256=request["worker_identity_sha256"],
+        transport_config_sha256=cli._sha256(cli._canonical_json(request["transport_config"])),
+        runtime_identity_sha256=runtime_identity, composite_admitted=True,
+    )
+    journal = DurableOperationJournal(request["runtime_state_root"], identity)
+    journal.prepare()
+    journal.ask_dispatching(turn_id="turn-1", prompt="repair", ordinal=0)
+    journal.conversation_bound("conversation-1")
+    effects = DurableEffectJournal(request["runtime_state_root"], identity)
+    journal.effect_journal = effects
+    effects.bind_turn("turn-1", "call-1")
+    effect = effects.intent(
+        turn_id="turn-1", tool_call_id="call-1",
+        tool_name="write_file_and_record_worker_result",
+        arguments={
+            "file_path": "a.py", "content": "VALUE = 2\n",
+            "envelope": {"summary": "repaired a.py"},
+        },
+        path=target, preimage="VALUE = 1\n", postimage="VALUE = 2\n",
+    )
+    effects.recover_write(effect)
+    effects.record_worker_result(effect, {"summary": "repaired a.py"})
+    cli._atomic_json(cli._operation_path(request), {
+        **cli._write_started(request, "worker"),
+        "status": "OPEN_SWE_OUTCOME_UNKNOWN", "outcome_unknown": True,
+        "retry_safe": False, "execution_material_sha256": identity.execution_material_sha256,
+        "session_id": identity.session_id,
+    })
+    return request, journal, effects
+
+
+def test_worker_run_admitted_v2_executes_real_composite_graph_once(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path)
+    monkeypatch.setattr(
+        cli, "_git_output", lambda _workspace, *args: {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
+        }[args],
+    )
+    monkeypatch.setattr(
+        cli, "create_checkpoint", lambda _state_root, _operation_id, namespace: (None, namespace)
+    )
+    sends: list[str] = []
+
+    def model_factory(_runtime, provider, model_id, transport_config, state_root):
+        model = OpenCLIWebChatModel(
+            executable=transport_config["executable"],
+            intelligence_level=model_id,
+            opencli_profile=transport_config["profile"],
+            site_session=transport_config["site_session"],
+            timeout_seconds=transport_config["timeout_seconds"],
+            runtime_state_root=state_root,
+        )
+        assert (provider, model_id) == ("opencli_chatgpt", "advanced")
+        _composite_worker_model(model, sends)
+        return model
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=cli._load_runtime,
+        model_factory=model_factory,
+        repair_factory=cli.build_repair_graph,
+    )
+
+    assert result["status"] == "COMPLETED"
+    assert result["diagnosis_status"] == "ROOT_CAUSE_SUPPORTED"
+    assert len(sends) == 1
+    assert (Path(request["workspace_path"]) / "a.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    effects = list((Path(request["runtime_state_root"]) / "recovery" / "effects").glob("effect_*.json"))
+    assert len(effects) == 1
+    assert json.loads(effects[0].read_text(encoding="utf-8"))["worker_result"]["summary"] == "repaired a.py"
+
+
+def test_worker_run_fallback_and_multipath_do_not_admit_composite(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        cli, "_git_output", lambda _workspace, *args: {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
+        }[args],
+    )
+    monkeypatch.setattr(
+        cli, "create_checkpoint", lambda _state_root, _operation_id, namespace: (None, namespace)
+    )
+    fallback_root = tmp_path / "fallback"
+    fallback_root.mkdir()
+    cases: list[dict] = [{"request": _worker_request(fallback_root)}]
+    multipath_root = tmp_path / "multipath"
+    multipath_root.mkdir()
+    request = _v2_request(multipath_root)
+    workspace = Path(request["workspace_path"])
+    card = workspace / "tasks/task-card.md"
+    card.write_text(card.read_text(encoding="utf-8").replace("- `a.py`", "- `a.py`\n- `b.py`"), encoding="utf-8")
+    envelope = json.loads(Path(request["artifact_path"]).read_text(encoding="utf-8"))
+    envelope["binding"]["task_card_hash"] = cli._sha256(card.read_bytes())
+    envelope["scope_signal"].update(
+        required_test_edit_paths=["a.py", "b.py"], verification_only_paths=["a.py", "b.py"], max_files=2
+    )
+    envelope["evidence_refs"].append("source_absence:b.py@" + "b" * 16)
+    envelope["inspect_first"].append(envelope["evidence_refs"][-1])
+    Path(request["artifact_path"]).write_text(cli._canonical_json(envelope), encoding="utf-8")
+    request["prompt"] = request["prompt"].replace(
+        'authorized_mutation_paths=["a.py"]', 'authorized_mutation_paths=["a.py","b.py"]'
+    )
+    request["prompt"] = "\n".join(
+        f"envelope_sha256={cli._sha256(Path(request['artifact_path']).read_bytes())}"
+        if line.startswith("envelope_sha256=") else line
+        for line in request["prompt"].splitlines()
+    )
+    assert cli._semantic_v2_admission(
+        request, workspace.resolve(), Path(request["artifact_path"]), request["prompt"], ("a.py", "b.py")
+    ).decision == cli.ADMIT
+    cases.append({"request": request})
+    admitted_flags: list[bool] = []
+
+    for case in cases:
+        current = case["request"]
+        diagnosis = FakeGraph(
+            cli.DIAGNOSIS_TOOLS,
+            _record("record_diagnosis", {
+                "status": "ROOT_CAUSE_SUPPORTED", "summary": "supported", "evidence_paths": ["a.py"],
+            }),
+        )
+        repair = FakeGraph(cli.REPAIR_TOOLS, _record("record_worker_result", {"summary": "done"}))
+
+        def repair_factory(_model, *_args, composite=False, **_kwargs):
+            admitted_flags.append(composite)
+            assert composite is False
+            return repair
+
+        result = cli._worker_run(
+            current,
+            runtime_loader=_runtime,
+            model_factory=lambda *_args: SimpleNamespace(_conversation_id=None),
+            diagnosis_factory=lambda *_args: diagnosis,
+            repair_factory=repair_factory,
+        )
+        assert result["status"] == "COMPLETED"
+
+    assert admitted_flags == [False, False]
+
+
+def test_worker_reconcile_terminalizes_valid_durable_composite_without_model_or_write(tmp_path):
+    request, _journal, effects = _composite_recovery_fixture(tmp_path)
+    other_workspace = tmp_path / "other-workspace"
+    other_workspace.mkdir()
+    other_target = other_workspace / "a.py"
+    other_target.write_text("VALUE = 1\n", encoding="utf-8")
+    other_identity = RecoveryIdentity(
+        operation_id="c" * 64, execution_material_sha256="d" * 64,
+        workspace=str(other_workspace.resolve()), task_id="task-2", unit_id="u2",
+        session_id="session-2", allowed_paths=("a.py",),
+        provider_id="opencli_chatgpt", model_id="advanced", worker_identity_sha256="e" * 64,
+        transport_config_sha256=effects.identity.transport_config_sha256,
+        runtime_identity_sha256=effects.identity.runtime_identity_sha256,
+        composite_admitted=True,
+    )
+    other_effects = DurableEffectJournal(request["runtime_state_root"], other_identity)
+    other_effects.bind_turn("turn-2", "call-2")
+    other_effect = other_effects.intent(
+        turn_id="turn-2", tool_call_id="call-2",
+        tool_name="write_file_and_record_worker_result",
+        arguments={
+            "file_path": "a.py", "content": "VALUE = other\n",
+            "envelope": {"summary": "other operation"},
+        },
+        path=other_target, preimage="VALUE = 1\n", postimage="VALUE = other\n",
+    )
+    other_effects.recover_write(other_effect)
+    other_effects.record_worker_result(other_effect, {"summary": "other operation"})
+    calls = {"model": 0, "graph": 0}
+
+    def forbidden_model(*_args):
+        calls["model"] += 1
+        raise AssertionError("durable composite receipt must not redispatch or extract model args")
+
+    def forbidden_graph(*_args, **_kwargs):
+        calls["graph"] += 1
+        raise AssertionError("durable composite receipt must terminalize locally")
+
+    result = cli._worker_reconcile(
+        request, runtime_loader=_runtime, model_builder=forbidden_model, graph_builder=forbidden_graph
+    )
+
+    assert result["status"] == "COMPLETED"
+    assert result["outcome_unknown"] is False
+    assert json.loads(result["response_text"])["summary"] == "repaired a.py"
+    assert (Path(request["workspace_path"]) / "a.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert calls == {"model": 0, "graph": 0}
+    assert len(list(effects.root.glob("effect_*.json"))) == 2
+
+
+def test_composite_terminal_predicate_rejects_error_tool_message_without_effect_file(
+    tmp_path,
+):
+    from langchain_core.messages import AIMessage
+
+    from nexus_open_swe_runtime.opencli_web_model import _composite_terminal_completed
+
+    _request, journal, effects = _composite_recovery_fixture(tmp_path)
+    effect_path = next(effects.root.glob("effect_*.json"))
+    receipt = json.loads(effect_path.read_text(encoding="utf-8"))["worker_result"]
+    effect_path.unlink()
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "write_file_and_record_worker_result",
+                "args": {
+                    "file_path": "a.py", "content": "VALUE = 2\n",
+                    "envelope": {"summary": "repaired a.py"},
+                },
+                "id": "call-1", "type": "tool_call",
+            }],
+        ),
+        ToolMessage(
+            content=json.dumps(receipt), tool_call_id="call-1",
+            name="write_file_and_record_worker_result", status="error",
+        ),
+    ]
+    tools = [{"type": "function", "function": {"name": "write_file_and_record_worker_result"}}]
+
+    assert not _composite_terminal_completed(messages, tools, journal)
+
+
+@pytest.mark.parametrize("tamper", ["receipt", "hash"])
+def test_worker_reconcile_tampered_durable_composite_receipt_fails_closed(tmp_path, tamper):
+    request, _journal, effects = _composite_recovery_fixture(tmp_path)
+    effect_path = next(effects.root.glob("effect_*.json"))
+    record = json.loads(effect_path.read_text(encoding="utf-8"))
+    if tamper == "receipt":
+        record["worker_result"]["summary"] = "tampered"
+    else:
+        record["worker_result_sha256"] = "0" * 64
+    effect_path.write_text(json.dumps(record), encoding="utf-8")
+
+    result = cli._worker_reconcile(
+        request,
+        runtime_loader=_runtime,
+        model_builder=lambda *_args: pytest.fail("tampered receipt must not build model"),
+        graph_builder=lambda *_args: pytest.fail("tampered receipt must not build graph"),
+    )
+
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["outcome_unknown"] is True
