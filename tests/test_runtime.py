@@ -77,7 +77,10 @@ def _worker_request(tmp_path: Path) -> dict:
     workspace.mkdir()
     (workspace / "a.py").write_text("VALUE = 1\n", encoding="utf-8")
     artifact = tmp_path / "evidence.json"
-    artifact.write_text('{"failure":"VALUE must be 2"}\n', encoding="utf-8")
+    artifact.write_text(
+        '{"schema":"external_execution_envelope.v1","failure":"VALUE must be 2"}\n',
+        encoding="utf-8",
+    )
     return {
         "schema": cli.REQUEST_SCHEMA,
         "operation": "worker_run",
@@ -1254,7 +1257,7 @@ def _v2_request(tmp_path: Path, *, status: str = "PROVEN") -> dict:
             "item_id": "task-1",
             "item_type": "issue",
             "main_sha": "b" * 40,
-            "repository": "James3014/Nexus-new",
+            "repository": "https://github.com/James3014/Nexus-new.git",
             "revision": "r16",
             "task_card_ref": card_ref,
             "task_card_hash": card_hash,
@@ -1266,12 +1269,12 @@ def _v2_request(tmp_path: Path, *, status: str = "PROVEN") -> dict:
         },
         "definition_of_done": ["one bounded test"],
         "evidence_refs": [
-            f"task_card:{card_ref}@" + "a" * 64,
-            "source_absence:a.py@" + "b" * 64,
+            f"task_card:{card_ref}@" + "a" * 16,
+            "source_absence:a.py@" + "b" * 16,
         ],
         "inspect_first": [
-            f"task_card:{card_ref}@" + "a" * 64,
-            "source_absence:a.py@" + "b" * 64,
+            f"task_card:{card_ref}@" + "a" * 16,
+            "source_absence:a.py@" + "b" * 16,
         ],
         "failure_guards": ["no other paths"],
         "implementation_direction": ["create one test"],

@@ -410,7 +410,6 @@ def _canonical_repository(value: str) -> str:
         r"^https://github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$",
         r"^git@github\.com:([^/\s]+)/([^/\s]+?)(?:\.git)?/?$",
         r"^ssh://git@github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$",
-        r"^([^/\s]+)/([^/\s]+)$",
     )
     for pattern in patterns:
         match = re.match(pattern, text, re.IGNORECASE)
@@ -552,7 +551,7 @@ def _source_ref_for_path(refs: list[Any], path: str) -> str | None:
     prefix = f"source_absence:{path}@"
     for ref in refs:
         suffix = ref[len(prefix) :] if isinstance(ref, str) and ref.startswith(prefix) else ""
-        if re.fullmatch(r"[0-9a-f]{64}", suffix):
+        if re.fullmatch(r"(?:[0-9a-f]{16}|[0-9a-f]{64})", suffix):
             return ref
     return None
 
@@ -597,8 +596,10 @@ def _string_list(value: Any) -> bool:
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
 
 
-def _hex_digest(value: Any, length: int = 64) -> bool:
-    return isinstance(value, str) and re.fullmatch(rf"[0-9a-f]{{{length}}}", value) is not None
+def _hex_digest(value: Any, lengths: tuple[int, ...] = (16, 64)) -> bool:
+    return isinstance(value, str) and any(
+        re.fullmatch(rf"[0-9a-f]{{{length}}}", value) is not None for length in lengths
+    )
 
 
 def _semantic_v2_admission(
@@ -614,12 +615,15 @@ def _semantic_v2_admission(
         raw = artifact.read_bytes()
         envelope = _parse_unique_json(raw)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        if b'"schema"' in raw and b"external_execution_envelope.v2" in raw:
-            return SemanticAdmission(REJECT)
-        return SemanticAdmission(FALLBACK)
-    if envelope.get("schema") != "external_execution_envelope.v2":
-        return SemanticAdmission(FALLBACK)
+        return SemanticAdmission(REJECT)
+    schema = envelope.get("schema")
+    if schema == "external_execution_envelope.v1":
+        return SemanticAdmission(FALLBACK, raw, envelope)
+    if schema != "external_execution_envelope.v2":
+        return SemanticAdmission(REJECT)
     try:
+        if _workspace_path_has_symlink(workspace, "") or workspace.is_symlink():
+            return SemanticAdmission(REJECT)
         if set(envelope) != _V2_KEYS:
             return SemanticAdmission(REJECT)
         supplied_hash = _prompt_field(prompt, "envelope_sha256")
@@ -695,7 +699,9 @@ def _semantic_v2_admission(
         origin = _git_output(workspace, "remote", "get-url", "origin")
         if not _canonical_repository(origin) or _canonical_repository(origin) != _canonical_repository(str(binding["repository"])):
             return SemanticAdmission(REJECT)
-        card, card_raw, card_content = _contained_regular_card(workspace, task_card_ref)
+        if _workspace_path_has_symlink(workspace, task_card_ref):
+            return SemanticAdmission(REJECT)
+        _card_path, card_raw, card_content = _contained_regular_card(workspace, task_card_ref)
         if _sha256(card_raw) != task_card_hash:
             return SemanticAdmission(REJECT)
         if not _task_card_allows_exact_paths(card_content, task_id, allowed_paths):
@@ -712,9 +718,17 @@ def _semantic_v2_admission(
         if not all(isinstance(diagnosis[key], str) and diagnosis[key].strip() for key in ("hypothesis", "next_probe")):
             return SemanticAdmission(REJECT)
         task_ref = f"task_card:{task_card_ref}@"
-        if not any(isinstance(ref, str) and re.fullmatch(re.escape(task_ref) + r"[0-9a-f]{64}", ref) for ref in refs):
+        if not any(
+            isinstance(ref, str)
+            and re.fullmatch(
+                re.escape(task_ref) + r"(?:[0-9a-f]{16}|[0-9a-f]{64})", ref
+            )
+            for ref in refs
+        ):
             return SemanticAdmission(REJECT)
         for path in allowed_paths:
+            if _workspace_path_has_symlink(workspace, path):
+                return SemanticAdmission(REJECT)
             source_ref = _source_ref_for_path(refs, path)
             if source_ref is None or not any(isinstance(entry, str) and source_ref in entry for entry in inspect_first):
                 return SemanticAdmission(REJECT)
@@ -1144,22 +1158,25 @@ def _worker_run(
         task_id, unit_id, allowed_paths, session_id = _worker_context(request, prompt)
         runtime = runtime_loader()
         profile_key = f"{provider}:{model_id}"
-        evidence = artifact.read_text(encoding="utf-8")
         semantic_admission = _semantic_v2_admission(
             request, workspace, artifact, prompt, allowed_paths
         )
         semantic_admission_decision = semantic_admission.decision
         if semantic_admission_decision == REJECT:
             raise RuntimeErrorBounded("OPEN_SWE_SEMANTIC_V2_REJECTED")
+        try:
+            evidence = semantic_admission.raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeErrorBounded("OPEN_SWE_EVIDENCE_INVALID") from exc
         if semantic_admission_decision == ADMIT:
             packet = semantic_admission.envelope
             if not isinstance(packet, Mapping) or not isinstance(semantic_admission.diagnosis, Mapping):
                 raise RuntimeErrorBounded("OPEN_SWE_SEMANTIC_V2_REJECTED")
-            evidence = semantic_admission.raw_bytes.decode("utf-8")
-            diagnosis = dict(semantic_admission.diagnosis)
-            diagnosis["status"] = "ROOT_CAUSE_SUPPORTED"
-            diagnosis["summary"] = diagnosis.get("hypothesis", "supported semantic diagnosis")
-            diagnosis["evidence_paths"] = list(packet["scope_signal"]["required_test_edit_paths"])
+            diagnosis = {
+                "status": "ROOT_CAUSE_SUPPORTED",
+                "summary": semantic_admission.diagnosis["hypothesis"],
+                "evidence_paths": list(packet["scope_signal"]["required_test_edit_paths"]),
+            }
         else:
             diagnosis_model = model_factory(
                 runtime,
