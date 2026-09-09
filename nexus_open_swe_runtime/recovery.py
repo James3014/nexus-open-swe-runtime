@@ -332,11 +332,6 @@ class DurableEffectJournal:
         if state.get("status") == "RESULT":
             return "RESULT"
         actual = _sha(path.read_text(encoding="utf-8")) if path.exists() else "absent"
-        if effect.tool_name == "edit_file":
-            if actual == effect.postimage_sha256:
-                _fsync_replace(self._path(effect.effect_id), {"status": "RESULT", **asdict(effect)})
-                return "RESULT"
-            raise RuntimeError("RECOVERY_EDIT_UNRESOLVED_INTENT")
         if actual == effect.postimage_sha256:
             _fsync_replace(self._path(effect.effect_id), {"status": "RESULT", **asdict(effect)})
             return "RESULT"

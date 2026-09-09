@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TypedDict
 
 import pytest
 from langchain_core.messages import HumanMessage, ToolMessage
@@ -18,6 +20,116 @@ from nexus_open_swe_runtime.recovery import (
     RecoveryIdentity,
     create_checkpoint,
 )
+
+
+def test_root_checkpoint_config_reads_sqlite_checkpoint_without_subgraph_namespace(tmp_path):
+    from langgraph.checkpoint.sqlite import SqliteSaver
+    from langgraph.graph import END, START, StateGraph
+
+    class State(TypedDict):
+        value: str
+
+    connection = sqlite3.connect(str(tmp_path / "checkpoint.sqlite"), check_same_thread=False)
+    saver = SqliteSaver(connection)
+    saver.setup()
+    builder = StateGraph(State)
+    builder.add_node("step", lambda _state: {"value": "recovered"})
+    builder.add_edge(START, "step")
+    builder.add_edge("step", END)
+    graph = builder.compile(checkpointer=saver)
+    config = {"configurable": {"thread_id": "operation-1"}}
+
+    assert graph.invoke({"value": "pending"}, config=config) == {"value": "recovered"}
+    assert graph.get_state(config).values == {"value": "recovered"}
+    assert connection.execute("SELECT DISTINCT checkpoint_ns FROM checkpoints").fetchall() == [
+        ("",)
+    ]
+    with pytest.raises(ValueError, match="Subgraph open-swe-repair-v1 not found"):
+        graph.get_state(
+            {
+                "configurable": {
+                    "thread_id": "operation-1",
+                    "checkpoint_ns": "open-swe-repair-v1",
+                }
+            }
+        )
+
+
+def test_worker_reconcile_real_graph_replays_write_effect_once_after_restart(tmp_path):
+    from langchain_core.language_models.chat_models import BaseChatModel
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+
+    request = _worker_request(tmp_path)
+    request.update(operation="worker_reconcile", provider_id="google_genai", model_id="test-model")
+    workspace = Path(request["workspace_path"])
+    state_root = Path(request["runtime_state_root"])
+    identity = RecoveryIdentity(
+        operation_id=request["operation_id"], execution_material_sha256="b" * 64,
+        workspace=str(workspace.resolve()), task_id="task-1", unit_id="u1", session_id="session-1",
+        allowed_paths=("a.py",), provider_id="google_genai", model_id="test-model",
+        worker_identity_sha256=request["worker_identity_sha256"], transport_config_sha256=cli._sha256("{}"),
+        runtime_identity_sha256=cli._sha256(cli._canonical_json({
+            "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
+            "deepagents": cli._deepagents_version(), "checkpoint_namespace": "open-swe-repair-v1",
+        })),
+    )
+    journal = DurableOperationJournal(state_root, identity)
+    journal.prepare()
+    journal.ask_dispatching(turn_id="turn-1", prompt="repair", ordinal=0)
+    journal.conversation_bound("conversation-1")
+    cli._atomic_json(cli._operation_path(request), {
+        **cli._write_started(request, "worker"), "status": "OPEN_SWE_OUTCOME_UNKNOWN",
+        "outcome_unknown": True, "retry_safe": False,
+        "execution_material_sha256": identity.execution_material_sha256, "session_id": identity.session_id,
+    })
+    checkpoint, _ = cli.create_checkpoint(state_root, request["operation_id"], identity.checkpoint_namespace)
+    checkpoint.conn.close()
+
+    class RecoveryModel(BaseChatModel):
+        model_name: str = "test-model"
+        continuation_conversations: list[str] = []
+
+        @property
+        def _llm_type(self):
+            return "test-recovery-model"
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def configure_recovery_journal(self, value):
+            return None
+
+        def _detail_response(self, conversation_id, *, wait, turn_id):
+            assert (conversation_id, wait, turn_id) == ("conversation-1", False, "turn-1")
+            return '{"type":"tool_call","name":"write_file","arguments":{"file_path":"a.py","content":"done\\n"}}'
+
+        def _response_message(self, _response, _tools):
+            return AIMessage(content="", tool_calls=[{
+                "name": "write_file", "args": {"file_path": "a.py", "content": "done\n"},
+                "id": "call-1", "type": "tool_call",
+            }])
+
+        def _generate(self, messages, **kwargs):
+            if any(getattr(message, "name", None) == "record_worker_result" for message in messages):
+                return ChatResult(generations=[ChatGeneration(message=AIMessage(content="done"))])
+            self.continuation_conversations.append("conversation-1")
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="", tool_calls=[{
+                "name": "record_worker_result", "args": {"envelope": {"summary": "done"}},
+                "id": "record-1", "type": "tool_call",
+            }]))])
+
+    model = RecoveryModel()
+    result = cli._worker_reconcile(
+        request, runtime_loader=cli._load_runtime, model_builder=lambda *_args: model,
+        graph_builder=cli.build_repair_graph,
+    )
+    assert result["status"] == "COMPLETED"
+    assert (workspace / "a.py").read_text(encoding="utf-8") == "done\n"
+    effects = list((state_root / "recovery" / "effects").glob("*.json"))
+    assert len(effects) == 1
+    assert json.loads(effects[0].read_text(encoding="utf-8"))["status"] == "RESULT"
+    assert model.continuation_conversations == ["conversation-1"]
 
 
 class FakeGraph:
@@ -772,7 +884,7 @@ def test_worker_reconcile_direct_restart_trace_has_one_winner_and_zero_call_lose
         def update_state(self, config, values, *, as_node):
             counters["update"] += 1
             assert as_node == "model"
-            assert config["configurable"] == {"thread_id": operation_id, "checkpoint_ns": "open-swe-repair-v1"}
+            assert config["configurable"] == {"thread_id": operation_id}
             assert values["messages"][0].tool_calls[0]["id"] == "call-1"
 
         def invoke(self, payload, *, config):
@@ -1320,6 +1432,43 @@ def test_scoped_repair_backend_rejects_out_of_scope_write(tmp_path):
     assert not (tmp_path / "b.py").exists()
     scoped.write("a.py", "allowed\n")
     assert (tmp_path / "a.py").read_text(encoding="utf-8") == "allowed\n"
+
+
+@pytest.mark.parametrize(
+    ("content", "old_string", "replace_all", "error_fragment"),
+    [
+        ("alpha\n", "missing", False, "String not found"),
+        ("same\nsame\n", "same", False, "appears 2 times"),
+    ],
+)
+def test_scoped_repair_backend_edit_recovery_preserves_replace_contract(
+    tmp_path, content, old_string, replace_all, error_fragment
+):
+    target = tmp_path / "a.py"
+    target.write_text(content, encoding="utf-8")
+    identity = RecoveryIdentity(
+        operation_id="o" * 64,
+        execution_material_sha256="e" * 64,
+        workspace=str(tmp_path.resolve()),
+        task_id="task-1",
+        unit_id="unit-1",
+        session_id="session-1",
+        allowed_paths=("a.py",),
+        provider_id="test",
+        model_id="test",
+        worker_identity_sha256="w" * 64,
+        transport_config_sha256="t" * 64,
+        runtime_identity_sha256="r" * 64,
+    )
+    journal = cli.DurableEffectJournal(tmp_path, identity)
+    journal.bind_turn("turn-1", "call-1")
+    backend = cli.ScopedRepairBackend(object(), tmp_path, ("a.py",), journal)
+
+    result = backend.edit("a.py", old_string, "replacement", replace_all=replace_all)
+
+    assert result.error is not None and error_fragment in result.error
+    assert target.read_text(encoding="utf-8") == content
+    assert list(journal.root.glob("*.json")) == []
 
 
 def test_real_deepagents_graphs_expose_only_qualified_surfaces(tmp_path):

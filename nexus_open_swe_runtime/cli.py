@@ -179,7 +179,9 @@ class ScopedRepairBackend:
         effect = self._effect("write_file", _safe_relative_path(file_path), content, old)
         if effect is not None:
             self._effect_journal.recover_write(effect)
-            return None
+            from deepagents.backends.protocol import WriteResult
+
+            return WriteResult(path=file_path)
         return self._delegate.write(file_path, content)
 
     async def awrite(self, file_path: str, content: str) -> Any:
@@ -189,7 +191,9 @@ class ScopedRepairBackend:
         effect = self._effect("write_file", _safe_relative_path(file_path), content, old)
         if effect is not None:
             self._effect_journal.recover_write(effect)
-            return None
+            from deepagents.backends.protocol import WriteResult
+
+            return WriteResult(path=file_path)
         return await self._delegate.awrite(file_path, content)
 
     def edit(
@@ -201,12 +205,27 @@ class ScopedRepairBackend:
     ) -> Any:
         self._authorize(file_path)
         target = self._root / _safe_relative_path(file_path)
-        old = target.read_text(encoding="utf-8") if target.exists() else None
-        expected = old.replace(old_string, new_string, -1 if replace_all else 1) if old is not None else new_string
+        if not target.exists() or not target.is_file():
+            from deepagents.backends.protocol import EditResult
+
+            return EditResult(error=f"Error: File '{file_path}' not found")
+        old = target.read_text(encoding="utf-8")
+        old_string = old_string.replace("\r\n", "\n").replace("\r", "\n")
+        new_string = new_string.replace("\r\n", "\n").replace("\r", "\n")
+        from deepagents.backends.utils import perform_string_replacement
+
+        replacement = perform_string_replacement(old, old_string, new_string, replace_all)
+        if isinstance(replacement, str):
+            from deepagents.backends.protocol import EditResult
+
+            return EditResult(error=replacement)
+        expected, occurrences = replacement
         effect = self._effect("edit_file", _safe_relative_path(file_path), expected, old)
         if effect is not None:
             self._effect_journal.recover_write(effect)
-            return None
+            from deepagents.backends.protocol import EditResult
+
+            return EditResult(path=file_path, occurrences=occurrences)
         return self._delegate.edit(file_path, old_string, new_string, replace_all)
 
     async def aedit(
@@ -218,12 +237,27 @@ class ScopedRepairBackend:
     ) -> Any:
         self._authorize(file_path)
         target = self._root / _safe_relative_path(file_path)
-        old = target.read_text(encoding="utf-8") if target.exists() else None
-        expected = old.replace(old_string, new_string, -1 if replace_all else 1) if old is not None else new_string
+        if not target.exists() or not target.is_file():
+            from deepagents.backends.protocol import EditResult
+
+            return EditResult(error=f"Error: File '{file_path}' not found")
+        old = target.read_text(encoding="utf-8")
+        old_string = old_string.replace("\r\n", "\n").replace("\r", "\n")
+        new_string = new_string.replace("\r\n", "\n").replace("\r", "\n")
+        from deepagents.backends.utils import perform_string_replacement
+
+        replacement = perform_string_replacement(old, old_string, new_string, replace_all)
+        if isinstance(replacement, str):
+            from deepagents.backends.protocol import EditResult
+
+            return EditResult(error=replacement)
+        expected, occurrences = replacement
         effect = self._effect("edit_file", _safe_relative_path(file_path), expected, old)
         if effect is not None:
             self._effect_journal.recover_write(effect)
-            return None
+            from deepagents.backends.protocol import EditResult
+
+            return EditResult(path=file_path, occurrences=occurrences)
         return await self._delegate.aedit(file_path, old_string, new_string, replace_all)
 
 
@@ -1439,7 +1473,6 @@ def _worker_run(
             repair_config = {
                 "configurable": {
                     "thread_id": str(request.get("operation_id") or ""),
-                    "checkpoint_ns": recovery_identity.checkpoint_namespace,
                 },
                 "recursion_limit": 60,
             }
@@ -1668,7 +1701,7 @@ def _worker_reconcile(
                 return cached
             effect_journal.bind_turn(turn_id, recovered_call_id)
         config = {
-            "configurable": {"thread_id": operation_id, "checkpoint_ns": identity.checkpoint_namespace},
+            "configurable": {"thread_id": operation_id},
             "recursion_limit": 60,
         }
         graph.update_state(config, {"messages": [recovered_message]}, as_node="model")
