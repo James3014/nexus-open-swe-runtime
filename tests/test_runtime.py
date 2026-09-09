@@ -55,6 +55,83 @@ def test_root_checkpoint_config_reads_sqlite_checkpoint_without_subgraph_namespa
         )
 
 
+def test_worker_reconcile_real_graph_replays_write_effect_once_after_restart(tmp_path):
+    from langchain_core.language_models.chat_models import BaseChatModel
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+
+    request = _worker_request(tmp_path)
+    request.update(operation="worker_reconcile", provider_id="google_genai", model_id="test-model")
+    workspace = Path(request["workspace_path"])
+    state_root = Path(request["runtime_state_root"])
+    identity = RecoveryIdentity(
+        operation_id=request["operation_id"], execution_material_sha256="b" * 64,
+        workspace=str(workspace.resolve()), task_id="task-1", unit_id="u1", session_id="session-1",
+        allowed_paths=("a.py",), provider_id="google_genai", model_id="test-model",
+        worker_identity_sha256=request["worker_identity_sha256"], transport_config_sha256=cli._sha256("{}"),
+        runtime_identity_sha256=cli._sha256(cli._canonical_json({
+            "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
+            "deepagents": cli._deepagents_version(), "checkpoint_namespace": "open-swe-repair-v1",
+        })),
+    )
+    journal = DurableOperationJournal(state_root, identity)
+    journal.prepare()
+    journal.ask_dispatching(turn_id="turn-1", prompt="repair", ordinal=0)
+    journal.conversation_bound("conversation-1")
+    cli._atomic_json(cli._operation_path(request), {
+        **cli._write_started(request, "worker"), "status": "OPEN_SWE_OUTCOME_UNKNOWN",
+        "outcome_unknown": True, "retry_safe": False,
+        "execution_material_sha256": identity.execution_material_sha256, "session_id": identity.session_id,
+    })
+    checkpoint, _ = cli.create_checkpoint(state_root, request["operation_id"], identity.checkpoint_namespace)
+    checkpoint.conn.close()
+
+    class RecoveryModel(BaseChatModel):
+        model_name: str = "test-model"
+        continuation_conversations: list[str] = []
+
+        @property
+        def _llm_type(self):
+            return "test-recovery-model"
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def configure_recovery_journal(self, value):
+            return None
+
+        def _detail_response(self, conversation_id, *, wait, turn_id):
+            assert (conversation_id, wait, turn_id) == ("conversation-1", False, "turn-1")
+            return '{"type":"tool_call","name":"write_file","arguments":{"file_path":"a.py","content":"done\\n"}}'
+
+        def _response_message(self, _response, _tools):
+            return AIMessage(content="", tool_calls=[{
+                "name": "write_file", "args": {"file_path": "a.py", "content": "done\n"},
+                "id": "call-1", "type": "tool_call",
+            }])
+
+        def _generate(self, messages, **kwargs):
+            if any(getattr(message, "name", None) == "record_worker_result" for message in messages):
+                return ChatResult(generations=[ChatGeneration(message=AIMessage(content="done"))])
+            self.continuation_conversations.append("conversation-1")
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="", tool_calls=[{
+                "name": "record_worker_result", "args": {"envelope": {"summary": "done"}},
+                "id": "record-1", "type": "tool_call",
+            }]))])
+
+    model = RecoveryModel()
+    result = cli._worker_reconcile(
+        request, runtime_loader=cli._load_runtime, model_builder=lambda *_args: model,
+        graph_builder=cli.build_repair_graph,
+    )
+    assert result["status"] == "COMPLETED"
+    assert (workspace / "a.py").read_text(encoding="utf-8") == "done\n"
+    effects = list((state_root / "recovery" / "effects").glob("*.json"))
+    assert len(effects) == 1
+    assert json.loads(effects[0].read_text(encoding="utf-8"))["status"] == "RESULT"
+    assert model.continuation_conversations == ["conversation-1"]
+
+
 class FakeGraph:
     def __init__(self, surface, output=None, effect=None, error=None):
         self.surface = tuple(surface)

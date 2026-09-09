@@ -179,7 +179,9 @@ class ScopedRepairBackend:
         effect = self._effect("write_file", _safe_relative_path(file_path), content, old)
         if effect is not None:
             self._effect_journal.recover_write(effect)
-            return None
+            from deepagents.backends.protocol import WriteResult
+
+            return WriteResult(path=file_path)
         return self._delegate.write(file_path, content)
 
     async def awrite(self, file_path: str, content: str) -> Any:
@@ -189,7 +191,9 @@ class ScopedRepairBackend:
         effect = self._effect("write_file", _safe_relative_path(file_path), content, old)
         if effect is not None:
             self._effect_journal.recover_write(effect)
-            return None
+            from deepagents.backends.protocol import WriteResult
+
+            return WriteResult(path=file_path)
         return await self._delegate.awrite(file_path, content)
 
     def edit(
@@ -206,7 +210,10 @@ class ScopedRepairBackend:
         effect = self._effect("edit_file", _safe_relative_path(file_path), expected, old)
         if effect is not None:
             self._effect_journal.recover_write(effect)
-            return None
+            from deepagents.backends.protocol import EditResult
+
+            occurrences = old.count(old_string) if old is not None and replace_all else 1
+            return EditResult(path=file_path, occurrences=occurrences)
         return self._delegate.edit(file_path, old_string, new_string, replace_all)
 
     async def aedit(
@@ -223,7 +230,10 @@ class ScopedRepairBackend:
         effect = self._effect("edit_file", _safe_relative_path(file_path), expected, old)
         if effect is not None:
             self._effect_journal.recover_write(effect)
-            return None
+            from deepagents.backends.protocol import EditResult
+
+            occurrences = old.count(old_string) if old is not None and replace_all else 1
+            return EditResult(path=file_path, occurrences=occurrences)
         return await self._delegate.aedit(file_path, old_string, new_string, replace_all)
 
 
