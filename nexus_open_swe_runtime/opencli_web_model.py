@@ -42,6 +42,9 @@ _HARD_BLOCK_MARKERS = (
 _BUSY_MARKERS = ("busy", "rate control", "rate-control", "too many requests")
 _MIN_WEB_SEND_INTERVAL_SECONDS = 15.0
 _POST_RESPONSE_SETTLE_SECONDS = 3.0
+_LATE_READBACK_WINDOW_SECONDS = 15.0
+_LATE_READBACK_INTERVAL_SECONDS = 3.0
+_MAX_LATE_READBACK_POLLS = 5
 _MAX_WEB_TURNS_PER_OPERATION = 12
 _MAX_HISTORY_CANDIDATES = 12
 _TERMINAL_RECORDER_TOOLS = frozenset({"record_finding", "record_diagnosis", "record_worker_result"})
@@ -561,6 +564,7 @@ class OpenCLIWebChatModel(BaseChatModel):
     _late_readback_used: bool = PrivateAttr(default=False)
     _repair_resume_used: bool = PrivateAttr(default=False)
     _sleep: Callable[[float], None] = PrivateAttr(default=time.sleep)
+    _late_clock: Callable[[], float] = PrivateAttr(default=time.monotonic)
     # Durable pacing uses epoch wall-clock timestamps so state survives reboot.
     _clock: Callable[[], float] = PrivateAttr(default=time.time)
     _pacing_state: _PacingState = PrivateAttr(default_factory=_PacingState)
@@ -647,14 +651,18 @@ class OpenCLIWebChatModel(BaseChatModel):
             env["OPENCLI_PROFILE"] = self.opencli_profile
         return env
 
-    def _run(self, argv: Sequence[str]) -> str:
+    def _run(self, argv: Sequence[str], *, timeout_seconds: float | None = None) -> str:
         try:
             result = subprocess.run(
                 list(argv),
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=max(self.timeout_seconds + 5, 35),
+                timeout=(
+                    timeout_seconds
+                    if timeout_seconds is not None
+                    else max(self.timeout_seconds + 5, 35)
+                ),
                 shell=False,
                 env=self._environment(),
             )
@@ -913,10 +921,52 @@ class OpenCLIWebChatModel(BaseChatModel):
             ):
                 raise
             self._late_readback_used = True
-            return self._detail_response_once(conversation_id, wait=False, turn_id=turn_id)
+            deadline = self._late_clock() + _LATE_READBACK_WINDOW_SECONDS
+            last_error: Exception = exc
+            for poll in range(_MAX_LATE_READBACK_POLLS):
+                remaining = deadline - self._late_clock()
+                if remaining <= 0:
+                    break
+                if poll:
+                    self._sleep(min(_LATE_READBACK_INTERVAL_SECONDS, remaining))
+                    remaining = deadline - self._late_clock()
+                    if remaining <= 0:
+                        break
+                try:
+                    return self._detail_response_once(
+                        conversation_id,
+                        wait=False,
+                        turn_id=turn_id,
+                        timeout_seconds=remaining,
+                    )
+                except _IncompleteDetailError as poll_error:
+                    last_error = poll_error
+                except OpenCLIWebModelError as poll_error:
+                    if str(poll_error) != "OPENCLI_WEB_TIMEOUT":
+                        raise
+                    last_error = poll_error
+            remaining = deadline - self._late_clock()
+            if remaining > 0:
+                self._sleep(remaining)
+            raise OpenCLIWebModelError("OPENCLI_WEB_TIMEOUT") from last_error
 
-    def _detail_response_once(self, conversation_id: str, *, wait: bool, turn_id: str = "") -> str:
-        readback_timeout = max(self.timeout_seconds, 30) if wait else self.timeout_seconds
+    def _detail_response_once(
+        self,
+        conversation_id: str,
+        *,
+        wait: bool,
+        turn_id: str = "",
+        timeout_seconds: float | None = None,
+    ) -> str:
+        readback_timeout = (
+            max(self.timeout_seconds, 30)
+            if wait
+            else (
+                math.ceil(timeout_seconds)
+                if timeout_seconds is not None
+                else self.timeout_seconds
+            )
+        )
         detail = self._run([
             self.executable,
             "chatgpt",
@@ -932,7 +982,7 @@ class OpenCLIWebChatModel(BaseChatModel):
             self.site_session,
             "-f",
             "json",
-        ])
+        ], timeout_seconds=timeout_seconds)
         try:
             return self._extract_detail_response(detail, turn_id)
         except OpenCLIWebModelError as exc:

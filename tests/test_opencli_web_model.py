@@ -1765,7 +1765,7 @@ def test_opencli_web_model_rejects_undeclared_tool_call(monkeypatch: pytest.Monk
         model.bind_tools([read_file]).invoke("inspect README")
 
 
-def test_opencli_web_model_resumes_one_bound_repair_turn_without_assistant(
+def test_opencli_web_model_fails_closed_after_bound_repair_late_readback(
     monkeypatch: pytest.MonkeyPatch,
 ):
     ask_count = 0
@@ -1844,17 +1844,14 @@ def test_opencli_web_model_resumes_one_bound_repair_turn_without_assistant(
     model = OpenCLIWebChatModel(executable="/opt/opencli")
     model._clock = clock
     model._sleep = clock.sleep
+    model._late_clock = clock
 
-    result = model.invoke([HumanMessage(content="recover this response")])
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TIMEOUT"):
+        model.invoke([HumanMessage(content="recover this response")])
 
-    assert result.content == "bad"
-    assert ask_count == 3
-    assert detail_count == 7
-    assert model._web_turn_count == 3
-    resume_envelope = json.loads(resume_prompt)
-    repair_envelope = json.loads(repair_prompt)
-    assert resume_envelope["tools"] == repair_envelope["tools"] == []
-    assert resume_envelope["tool_choice"] == repair_envelope["tool_choice"] == "none"
+    assert ask_count == 2
+    assert detail_count >= 7
+    assert model._web_turn_count == 2
 
 
 @pytest.mark.parametrize(
@@ -2137,7 +2134,480 @@ def test_opencli_web_model_recovers_bound_timeout_with_one_late_readback(
     assert "history" not in commands
 
 
-def test_opencli_web_model_resumes_r14_bound_timeout_after_empty_late_readback(
+def test_opencli_web_model_r18_late_readback_returns_write_file_without_redispatch(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    @tool
+    def write_file(file_path: str, content: str) -> str:
+        """Write one repository file."""
+        return f"{file_path}:{content}"
+
+    ask_count = 0
+    detail_waits: list[str] = []
+    detail_timeouts: list[str] = []
+    latest_prompt = ""
+    late_now = 0.0
+
+    def late_clock() -> float:
+        return late_now
+
+    def late_sleep(delay: float) -> None:
+        nonlocal late_now
+        late_now += delay
+
+    def fake_run(argv, **_kwargs):
+        nonlocal ask_count, latest_prompt
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_count += 1
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="Browser exec command timed out; it may still complete in the browser.",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            wait = args[args.index("--wait") + 1]
+            detail_waits.append(wait)
+            detail_timeouts.append(args[args.index("--timeout") + 1])
+            if wait == "true":
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="Browser exec command timed out; it may still complete in the browser.",
+                )
+            prior_rows = [
+                {"Index": index, "Role": role, "Text": text, "Generating": False}
+                for index, (role, text) in enumerate(
+                    [("User", '{"turn_id":"prior-1"}'), ("Assistant", "prior-1"),
+                     ("User", '{"turn_id":"prior-2"}'), ("Assistant", "prior-2")],
+                    start=1,
+                )
+            ]
+            user_row = {"Index": 5, "Role": "User", "Text": latest_prompt, "Generating": False}
+            if detail_waits.count("false") == 1:
+                rows = [*prior_rows, user_row]
+            else:
+                rows = [
+                    *prior_rows,
+                    user_row,
+                    {
+                        "Index": 6,
+                        "Role": "Assistant",
+                        "Text": '{"type":"tool_call","name":"write_file","arguments":{"file_path":"README.md","content":"late"}}',
+                        "Generating": False,
+                    },
+                ]
+            return SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr="")
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model._conversation_id = "bound-conversation"
+    model._late_clock = late_clock
+    model._sleep = late_sleep
+
+    result = model.bind_tools([write_file]).invoke("write README")
+
+    assert result.tool_calls[0]["name"] == "write_file"
+    assert result.tool_calls[0]["args"] == {"file_path": "README.md", "content": "late"}
+    assert ask_count == 1
+    assert detail_waits == ["true", "false", "false"]
+    assert detail_timeouts[1:] == ["15", "12"]
+
+
+def test_opencli_web_model_r18_late_readback_exhaustion_does_not_resume(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    ask_count = 0
+    detail_waits: list[str] = []
+    latest_prompt = ""
+    late_now = 0.0
+    late_times: list[float] = []
+
+    def fake_run(argv, **_kwargs):
+        nonlocal ask_count, latest_prompt
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_count += 1
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="Browser exec command timed out; it may still complete in the browser.",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            wait = args[args.index("--wait") + 1]
+            detail_waits.append(wait)
+            if wait == "false":
+                late_times.append(late_now)
+            if wait == "true":
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="Browser exec command timed out; it may still complete in the browser.",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False}
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model._conversation_id = "bound-conversation"
+    model._late_clock = lambda: late_now
+
+    def advance(delay: float) -> None:
+        nonlocal late_now
+        late_now += delay
+
+    model._sleep = advance
+
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TIMEOUT"):
+        model.invoke("wait for completion")
+
+    assert ask_count == 1
+    assert detail_waits == ["true", "false", "false", "false", "false", "false"]
+    assert late_times == [0.0, 3.0, 6.0, 9.0, 12.0]
+    assert late_now == 15.0
+
+
+def test_opencli_web_model_r18_poll_timeout_caps_remaining_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    detail_waits: list[str] = []
+    subprocess_timeouts: list[float] = []
+    cli_timeouts: list[str] = []
+    latest_prompt = ""
+    late_now = 0.0
+
+    def fake_run(argv, **kwargs):
+        nonlocal latest_prompt, late_now
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="Browser exec command timed out; it may still complete in the browser.",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            wait = args[args.index("--wait") + 1]
+            detail_waits.append(wait)
+            cli_timeouts.append(args[args.index("--timeout") + 1])
+            if wait == "true":
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="Browser exec command timed out; it may still complete in the browser.",
+                )
+            subprocess_timeouts.append(kwargs["timeout"])
+            late_now += 4.25
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Role": "User", "Text": latest_prompt, "Generating": False}
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model._conversation_id = "bound-conversation"
+    model._late_clock = lambda: late_now
+    model._sleep = lambda delay: None
+
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TIMEOUT"):
+        model.invoke("deadline cap")
+
+    assert detail_waits == ["true", "false", "false", "false", "false"]
+    assert subprocess_timeouts == [15.0, 10.75, 6.5, 2.25]
+    assert cli_timeouts == ["120", "15", "11", "7", "3"]
+    assert all(timeout <= remaining for timeout, remaining in zip(subprocess_timeouts, (15.0, 10.75, 6.5, 2.25)))
+    assert late_now == 17.0
+
+
+def test_opencli_web_model_r18_durable_lock_covers_late_polling(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    first_poll_started = threading.Event()
+    release_first_poll = threading.Event()
+    second_ask_started = threading.Event()
+    ask_count = 0
+    latest_prompts: list[str] = []
+    errors: list[BaseException] = []
+    clock = _FakeClock()
+
+    def fake_run(argv, **_kwargs):
+        nonlocal ask_count
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_count += 1
+            latest_prompts.append(args[3])
+            if ask_count == 1:
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="Browser exec command timed out; it may still complete in the browser.",
+                )
+            second_ask_started.set()
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": "bound-conversation", "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            wait = args[args.index("--wait") + 1]
+            if wait == "true" and ask_count == 1:
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="Browser exec command timed out; it may still complete in the browser.",
+                )
+            if ask_count == 1:
+                first_poll_started.set()
+                assert release_first_poll.wait(timeout=2)
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps([
+                        {"Role": "User", "Text": latest_prompts[0], "Generating": False},
+                        {"Role": "Assistant", "Text": '{"type":"final","content":"first"}', "Generating": False},
+                    ]),
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Role": "User", "Text": latest_prompts[1], "Generating": False},
+                    {"Role": "Assistant", "Text": '{"type":"final","content":"second"}', "Generating": False},
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    kwargs = {
+        "executable": "/opt/opencli",
+        "opencli_profile": "r18-durable-lock",
+        "runtime_state_root": str(tmp_path),
+    }
+    first = OpenCLIWebChatModel(**kwargs)
+    second = OpenCLIWebChatModel(**kwargs)
+    for model in (first, second):
+        model._conversation_id = "bound-conversation"
+        model._clock = clock
+        model._late_clock = clock
+        model._sleep = clock.sleep
+        assert model._durable_pacing_backend is not None
+        model._durable_pacing_backend._clock = clock
+
+    def invoke(model: OpenCLIWebChatModel, prompt: str) -> None:
+        try:
+            model.invoke(prompt)
+        except BaseException as exc:
+            errors.append(exc)
+
+    first_thread = threading.Thread(target=invoke, args=(first, "first"))
+    second_thread = threading.Thread(target=invoke, args=(second, "second"))
+    first_thread.start()
+    assert first_poll_started.wait(timeout=1)
+    second_thread.start()
+    assert not second_ask_started.wait(timeout=0.1)
+    release_first_poll.set()
+    first_thread.join(timeout=2)
+    second_thread.join(timeout=2)
+
+    assert not errors
+    assert second_ask_started.is_set()
+    assert ask_count == 2
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_error"),
+    [
+        ("duplicate", "OPENCLI_WEB_TURN_IDENTITY_UNKNOWN"),
+        ("missing", "OPENCLI_WEB_TURN_IDENTITY_UNKNOWN"),
+        ("malformed", "OPENCLI_WEB_RECONCILE_INVALID"),
+        ("process", "OPENCLI_WEB_PROCESS_FAILURE"),
+        ("busy", "OPENCLI_WEB_BUSY"),
+        ("hard_block", "OPENCLI_WEB_HARD_BLOCK"),
+    ],
+)
+def test_opencli_web_model_r18_late_readback_fails_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+    expected_error: str,
+):
+    ask_count = 0
+    detail_waits: list[str] = []
+    latest_prompt = ""
+
+    def fake_run(argv, **_kwargs):
+        nonlocal ask_count, latest_prompt
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_count += 1
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="Browser exec command timed out; it may still complete in the browser.",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            wait = args[args.index("--wait") + 1]
+            detail_waits.append(wait)
+            if wait == "true":
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="Browser exec command timed out; it may still complete in the browser.",
+                )
+            if outcome == "malformed":
+                return SimpleNamespace(returncode=0, stdout="{", stderr="")
+            if outcome in {"process", "busy", "hard_block"}:
+                stderr = {
+                    "process": "browser unavailable",
+                    "busy": "busy",
+                    "hard_block": "login required",
+                }[outcome]
+                return SimpleNamespace(returncode=69, stdout="", stderr=stderr)
+            user = {"Index": 5, "Role": "User", "Text": latest_prompt, "Generating": False}
+            if outcome == "missing":
+                rows = [
+                    {
+                        "Index": 5,
+                        "Role": "User",
+                        "Text": '{"turn_id":"other-turn"}',
+                        "Generating": False,
+                    }
+                ]
+            elif outcome == "duplicate":
+                rows = [user, {**user, "Index": 6}]
+            else:
+                raise AssertionError(outcome)
+            return SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr="")
+        if args[1:3] == ["chatgpt", "history"]:
+            raise AssertionError("late readback must not scan history")
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model._conversation_id = "bound-conversation"
+    model._sleep = lambda _delay: None
+    initial_turn_count = model._web_turn_count
+
+    with pytest.raises(OpenCLIWebModelError, match=expected_error):
+        model.invoke("late readback negative")
+
+    assert ask_count == 1
+    assert detail_waits == ["true", "false"]
+    assert model._web_turn_count == initial_turn_count + 1
+
+
+def test_opencli_web_model_r18_polling_holds_inprocess_pacing_gate(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    poll_started = threading.Event()
+    release_poll = threading.Event()
+    second_done = threading.Event()
+    ask_count = 0
+    latest_prompts: list[str] = []
+    errors: list[BaseException] = []
+
+    def fake_run(argv, **_kwargs):
+        nonlocal ask_count
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_count += 1
+            latest_prompts.append(args[3])
+            if ask_count == 1:
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="Browser exec command timed out; it may still complete in the browser.",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": "bound-conversation", "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            wait = args[args.index("--wait") + 1]
+            if ask_count == 1 and wait == "true":
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="Browser exec command timed out; it may still complete in the browser.",
+                )
+            if ask_count == 1:
+                poll_started.set()
+                release_poll.wait(timeout=2)
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps([
+                        {"Role": "User", "Text": latest_prompts[0], "Generating": False}
+                    ]),
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Role": "User", "Text": latest_prompts[1], "Generating": False},
+                    {"Role": "Assistant", "Text": '{"type":"final","content":"ok"}', "Generating": False},
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    model = OpenCLIWebChatModel(executable="/opt/opencli", opencli_profile="r18-gate")
+    model._conversation_id = "bound-conversation"
+    model._late_clock = lambda: 0.0
+    model._sleep = lambda _delay: None
+
+    def invoke(prompt: str, *, mark_done: bool = False) -> None:
+        try:
+            model.invoke(prompt)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            if mark_done:
+                second_done.set()
+
+    first = threading.Thread(target=invoke, args=("first",))
+    second = threading.Thread(target=invoke, kwargs={"prompt": "second", "mark_done": True})
+    first.start()
+    assert poll_started.wait(timeout=1)
+    second.start()
+    assert not second_done.wait(timeout=0.1)
+    release_poll.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert second_done.is_set()
+    assert ask_count == 2
+    assert len(errors) == 1
+
+
+def test_opencli_web_model_exhausts_bound_timeout_after_empty_late_readback(
     monkeypatch: pytest.MonkeyPatch,
 ):
     @tool
@@ -2200,17 +2670,14 @@ def test_opencli_web_model_resumes_r14_bound_timeout_after_empty_late_readback(
     model = OpenCLIWebChatModel(executable="/opt/opencli")
     model._conversation_id = "bound-conversation"
 
-    result = model.bind_tools([read_file]).invoke("inspect README")
+    model._sleep = lambda _delay: None
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TIMEOUT"):
+        model.bind_tools([read_file]).invoke("inspect README")
 
-    assert result.tool_calls[0]["name"] == "read_file"
-    assert result.tool_calls[0]["args"] == {"file_path": "README.md"}
-    assert ask_prompts[0] != ask_prompts[1]
-    assert json.loads(ask_prompts[1])["rules"] == json.loads(ask_prompts[0])["rules"]
-    assert json.loads(ask_prompts[1])["tools"] == json.loads(ask_prompts[0])["tools"]
-    assert json.loads(ask_prompts[1])["tool_choice"] == json.loads(ask_prompts[0])["tool_choice"]
-    assert commands.count("ask") == 2
+    assert len(ask_prompts) == 1
+    assert commands.count("ask") == 1
     assert commands.count("history") == 0
-    assert detail_waits == ["true", "false", "true"]
+    assert detail_waits == ["true", "false", "false", "false", "false", "false"]
 
 
 def test_opencli_web_model_bound_resume_respects_remaining_turn_budget(
@@ -2257,12 +2724,15 @@ def test_opencli_web_model_bound_resume_respects_remaining_turn_budget(
     model = OpenCLIWebChatModel(executable="/opt/opencli")
     model._conversation_id = "bound-conversation"
     model._web_turn_count = 11
+    model._late_clock = lambda: 0.0
+    model._sleep = lambda _delay: None
 
-    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TURN_BUDGET_EXHAUSTED"):
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TIMEOUT"):
         model.invoke("budget-bound resume")
 
     assert ask_count == 1
     assert history_count == 0
+    assert model._web_turn_count == 12
 
 
 def test_opencli_web_model_bound_resume_timeout_cannot_resume_twice(
@@ -2306,11 +2776,13 @@ def test_opencli_web_model_bound_resume_timeout_cannot_resume_twice(
     monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
     model = OpenCLIWebChatModel(executable="/opt/opencli")
     model._conversation_id = "bound-conversation"
+    model._late_clock = lambda: 0.0
+    model._sleep = lambda _delay: None
 
-    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_REPAIR_RESUME_EXHAUSTED"):
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TIMEOUT"):
         model.invoke("resume timeout")
 
-    assert ask_count == 2
+    assert ask_count == 1
 
 
 def test_opencli_web_model_recovers_detail_timeout_after_successful_ask(
@@ -2380,7 +2852,7 @@ def test_opencli_web_model_recovers_detail_timeout_after_successful_ask(
                     "Generating": True,
                 },
             ],
-            "OPENCLI_WEB_RECONCILE_INCOMPLETE",
+            "OPENCLI_WEB_TIMEOUT",
         ),
         (
             [
@@ -2448,11 +2920,16 @@ def test_opencli_web_model_fails_closed_on_invalid_late_readback(
     monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
     model = OpenCLIWebChatModel(executable="/opt/opencli")
     model._conversation_id = "bound-conversation"
+    model._sleep = lambda _delay: None
 
     with pytest.raises(OpenCLIWebModelError, match=error):
         model.invoke([HumanMessage(content="bound timeout")])
     assert ask_count == 1
-    assert detail_waits == ["true", "false"]
+    assert detail_waits == (
+        ["true", "false", "false", "false", "false", "false"]
+        if error == "OPENCLI_WEB_TIMEOUT"
+        else ["true", "false"]
+    )
     assert "history" not in commands
 
 
