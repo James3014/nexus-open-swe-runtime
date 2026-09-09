@@ -203,9 +203,36 @@ class ScopedRepairBackend:
             raise RuntimeErrorBounded("OPEN_SWE_COMPOSITE_RESULT_INVALID")
         target = self._root / _safe_relative_path(file_path)
         old = target.read_text(encoding="utf-8") if target.exists() else None
+        turn_id = str(self._effect_journal._current_turn_id or "turn_unknown")
+        call_id = str(self._effect_journal._current_tool_call_id or "")
+        if not call_id:
+            # A malformed OpenCLI response is locally projected before the
+            # tool runs.  Its response cannot be parsed by the transport's
+            # journal hook, so reconstruct the exact canonical projected
+            # envelope used by OpenCLI's deterministic call-id function.
+            arguments = {
+                "file_path": _safe_relative_path(file_path),
+                "content": content,
+                "envelope": {"summary": envelope["summary"]},
+            }
+            projected = json.dumps(
+                {
+                    "type": "tool_call",
+                    "name": "write_file_and_record_worker_result",
+                    "arguments": arguments,
+                },
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            call_id = "opencli_" + _sha256(_canonical_json({
+                "name": "write_file_and_record_worker_result",
+                "arguments": arguments,
+                "raw": projected,
+            }))[:24]
+            self._effect_journal.bind_turn(turn_id, call_id)
         effect = self._effect_journal.intent(
-            turn_id=str(self._effect_journal._current_turn_id or "turn_unknown"),
-            tool_call_id=str(self._effect_journal._current_tool_call_id or ""),
+            turn_id=turn_id,
+            tool_call_id=call_id,
             tool_name="write_file_and_record_worker_result",
             arguments={"file_path": _safe_relative_path(file_path), "content": content, "envelope": {"summary": envelope["summary"]}},
             path=target, preimage=old, postimage=content,

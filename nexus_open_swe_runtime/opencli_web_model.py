@@ -1855,6 +1855,14 @@ class OpenCLIWebChatModel(BaseChatModel):
             projected_composite is not None
             and self._inverse_repaired_composite_response(projected_composite) == response
         ):
+            if self._recovery_journal is not None:
+                self._recovery_journal.protocol_repair_started(
+                    origin=response,
+                    origin_sha256=hashlib.sha256(response.encode("utf-8")).hexdigest(),
+                    turn_id=turn_id,
+                )
+                self._recovery_journal.protocol_repair_recovered(projected_composite)
+                self._recovery_journal.response_recovered(turn_id, projected_composite)
             return projected_composite
         if self._is_complete_protocol_response(response) or not self._conversation_id:
             return response
