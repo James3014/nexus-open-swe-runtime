@@ -3796,20 +3796,11 @@ def test_worker_reconcile_flat_direct_response_with_checkpoint_has_one_local_eff
     journal.prepare()
     journal.ask_dispatching(turn_id="turn-1", prompt="repair", ordinal=0)
     journal.conversation_bound("conversation-1")
-    raw_flat = json.dumps(
-        {
-            "type": "write_file_and_record_worker_result",
-            "file_path": "/a.py",
-            "content": "VALUE = 2\n",
-            "envelope": {
-                "schema": "external_intelligence_worker_result.v1",
-                "status": "IMPLEMENTATION_COMPLETED",
-                "task_id": "task-1",
-                "unit_id": "u1",
-                "summary": "repaired a.py",
-            },
-        },
-        separators=(",", ":"),
+    raw_flat = (
+        '{"type":"write_file_and_record_worker_result","file_path":"/a.py",'
+        '"content":"VALUE = 2\\n","envelope":{"schema":"external_intelligence_worker_result.v1",'
+        '"status":"IMPLEMENTATION_COMPLETED","summary":"repaired "a.py"",'
+        '"task_id":"task-1","unit_id":"u1"}}'
     )
     journal.response_recovered("turn-1", raw_flat)
     cli._atomic_json(
@@ -3963,7 +3954,7 @@ def test_worker_reconcile_flat_direct_response_with_checkpoint_has_one_local_eff
             "arguments": {
                 "file_path": "a.py",
                 "content": "VALUE = 2\n",
-                "envelope": {"summary": "repaired a.py"},
+                "envelope": {"summary": 'repaired "a.py"'},
             },
         },
         separators=(",", ":"),

@@ -2283,11 +2283,19 @@ def _worker_reconcile(
             recovered_response = recovered_state.get("recovered_response")
             recovered_turn_id = recovered_state.get("turn_id")
             if isinstance(recovered_response, str) and isinstance(recovered_turn_id, str):
-                from .opencli_web_model import _canonicalize_direct_composite_response
+                from .opencli_web_model import (
+                    OpenCLIWebChatModel,
+                    _canonicalize_direct_composite_response,
+                )
 
                 canonical_response = _canonicalize_direct_composite_response(
                     recovered_response, journal
                 )
+                projected_response = OpenCLIWebChatModel._project_unescaped_composite_response(
+                    recovered_response, journal
+                )
+                if projected_response is not None:
+                    canonical_response = projected_response
                 if canonical_response != recovered_response:
                     journal.protocol_repair_started(
                         origin=recovered_response,

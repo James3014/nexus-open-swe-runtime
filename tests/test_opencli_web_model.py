@@ -4394,6 +4394,95 @@ def _r23_malformed_composite_response() -> tuple[str, str]:
     return origin, expected
 
 
+def _r27_malformed_flat_composite_response() -> str:
+    return (
+        '{"type":"write_file_and_record_worker_result","file_path":"/tests/ops/'
+        'test_open_swe_resident_five_repo_canary_20260908.py","content":"def '
+        "test_resident_five_repository_mount_order() -> None:\\n mounted_repository_ids = (\\n "
+        '"James3014/Nexus-new",\\n "James3014/devspace",\\n "James3014/nexus-core",\\n '
+        '"James3014/nexus-learning",\\n "James3014/nexus-open-swe-runtime",\\n )\\n\\n '
+        'assert mounted_repository_ids == (\\n "James3014/Nexus-new",\\n '
+        '"James3014/devspace",\\n "James3014/nexus-core",\\n "James3014/nexus-learning",\\n '
+        '"James3014/nexus-open-swe-runtime",\\n )\\n","envelope":{"schema":"'
+        'external_intelligence_worker_result.v1","status":"IMPLEMENTATION_COMPLETED",'
+        '"summary":"Created the single authorized deterministic canary test with the exact '
+        'required ordered tuple; no other mutation is requested by this worker result.",'
+        '"task_id":"open-swe-resident-five-repo-canary-20260908","unit_id":"resident-canary-r27"}}'
+    )
+
+
+def _composite_identity(
+    *, path: str = "tests/ops/test_open_swe_resident_five_repo_canary_20260908.py"
+):
+    return SimpleNamespace(
+        composite_admitted=True,
+        allowed_paths=(path,),
+        task_id="open-swe-resident-five-repo-canary-20260908",
+        unit_id="resident-canary-r27",
+    )
+
+
+def test_r27_malformed_flat_composite_projects_exact_sha_and_inverse():
+    import hashlib
+
+    raw = _r27_malformed_flat_composite_response()
+    assert hashlib.sha256(raw.encode()).hexdigest() == (
+        "d21ec33736c1c803d7f7630152ff9a3ea00620317341331682efa83713d657ae"
+    )
+    journal = SimpleNamespace(effect_journal=SimpleNamespace(identity=_composite_identity()))
+    projected = OpenCLIWebChatModel._project_unescaped_composite_response(raw, journal)
+    assert projected is not None
+    assert json.loads(projected)["type"] == "tool_call"
+    assert json.loads(projected)["arguments"]["file_path"] == (
+        "tests/ops/test_open_swe_resident_five_repo_canary_20260908.py"
+    )
+    assert OpenCLIWebChatModel._inverse_repaired_composite_response(projected, journal) == raw
+    assert OpenCLIWebChatModel._repair_matches_invalid_response(raw, projected, journal)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda value: value + "tail",
+        lambda value: value.replace(',"content":"', ',"injected":1,"content":"', 1),
+        lambda value: value.replace('resident-canary-r27"}}', 'resident-canary-r27"}}\n{}'),
+        lambda value: value.replace(
+            "test_open_swe_resident_five_repo_canary_20260908.py",
+            "other.py",
+            1,
+        ),
+        lambda value: value.replace("resident-canary-r27", "other-unit", 1),
+        lambda value: value.replace(
+            "mounted_repository_ids = (\\n ", 'mounted_repository_ids = (\\n "x":1, ', 1
+        ),
+    ],
+)
+def test_r27_malformed_flat_composite_rejects_tamper_and_injection(mutation):
+    raw = mutation(_r27_malformed_flat_composite_response())
+    journal = SimpleNamespace(effect_journal=SimpleNamespace(identity=_composite_identity()))
+    assert OpenCLIWebChatModel._project_unescaped_composite_response(raw, journal) is None
+
+
+def test_r27_refresh_projects_locally_without_detail_or_protocol_repair(monkeypatch):
+    raw = _r27_malformed_flat_composite_response()
+    journal = SimpleNamespace(
+        effect_journal=SimpleNamespace(identity=_composite_identity()),
+        protocol_repair_started=lambda **_kwargs: None,
+        protocol_repair_recovered=lambda _response: None,
+        response_recovered=lambda _turn_id, _response: None,
+    )
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model.configure_recovery_journal(journal)
+    monkeypatch.setattr(
+        model,
+        "_detail_response",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("detail")),
+    )
+    assert model._refresh_protocol_response(raw, turn_id="turn-r27").startswith(
+        '{"type":"tool_call","name":"write_file_and_record_worker_result"'
+    )
+
+
 def test_r23_malformed_composite_projection_preserves_path_content_and_summary():
     origin, expected = _r23_malformed_composite_response()
 

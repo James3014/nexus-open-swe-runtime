@@ -873,6 +873,9 @@ class OpenCLIWebChatModel(BaseChatModel):
     def _journal_response(self, turn_id: str, response: str) -> None:
         origin = response
         response = _canonicalize_direct_composite_response(response, self._recovery_journal)
+        projected = self._project_unescaped_composite_response(origin, self._recovery_journal)
+        if projected is not None:
+            response = projected
         if self._recovery_journal is not None:
             if response != origin:
                 self._journal_protocol_repair(
@@ -1744,7 +1747,107 @@ class OpenCLIWebChatModel(BaseChatModel):
         )
 
     @staticmethod
-    def _project_unescaped_composite_response(response: str) -> str | None:
+    def _project_unescaped_flat_composite_response(
+        response: str, journal: Any = None
+    ) -> _CompositeProjection | None:
+        """Project the one malformed flat composite form into the wrapped form."""
+        prefix = '{"type":"write_file_and_record_worker_result","file_path":'
+        content_boundary = ',"content":"'
+        envelope_boundary = (
+            '","envelope":{"schema":"external_intelligence_worker_result.v1",'
+            '"status":"IMPLEMENTATION_COMPLETED","summary":"'
+        )
+        task_boundary = '","task_id":"'
+        unit_boundary = '","unit_id":"'
+        suffix = '"}}'
+        if not response.startswith(prefix) or not response.endswith(suffix):
+            return None
+        decoder = json.JSONDecoder(object_pairs_hook=_reject_duplicate_json_keys)
+        try:
+            path, path_end = decoder.raw_decode(response[len(prefix) :])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if not isinstance(path, str):
+            return None
+        rest = response[len(prefix) + path_end :]
+        if not rest.startswith(content_boundary) or rest.count(content_boundary) != 1:
+            return None
+        after_content = rest[len(content_boundary) :]
+        if after_content.count(envelope_boundary) != 1:
+            return None
+        raw_content, raw_summary = after_content.split(envelope_boundary, 1)
+        if raw_summary.count(task_boundary) != 1:
+            return None
+        raw_summary, raw_task = raw_summary.split(task_boundary, 1)
+        if raw_task.count(unit_boundary) != 1:
+            return None
+        raw_task, raw_unit = raw_task.split(unit_boundary, 1)
+        if not raw_unit.endswith(suffix):
+            return None
+        raw_unit = raw_unit[: -len(suffix)]
+
+        def decode_unescaped_field(raw: str) -> str | None:
+            escaped: list[str] = []
+            index = 0
+            while index < len(raw):
+                character = raw[index]
+                if character == "\\":
+                    if index + 1 >= len(raw):
+                        return None
+                    escaped.append(raw[index : index + 2])
+                    index += 2
+                    continue
+                if character == '"':
+                    if re.match(r"\s*:", raw[index + 1 :]):
+                        return None
+                    escaped.append('\\"')
+                else:
+                    escaped.append(character)
+                index += 1
+            try:
+                value = json.loads('"' + "".join(escaped) + '"')
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return None
+            return value if isinstance(value, str) else None
+
+        def decode_strict_string(raw: str) -> str | None:
+            try:
+                value, end = decoder.raw_decode('"' + raw + '"')
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return None
+            return value if end == len(raw) + 2 and isinstance(value, str) else None
+
+        content = decode_unescaped_field(raw_content)
+        summary = decode_unescaped_field(raw_summary)
+        task_id = decode_strict_string(raw_task)
+        unit_id = decode_strict_string(raw_unit)
+        if content is None or summary is None or task_id is None or unit_id is None:
+            return None
+        direct = json.dumps(
+            {
+                "type": "write_file_and_record_worker_result",
+                "file_path": path,
+                "content": content,
+                "envelope": {
+                    "schema": "external_intelligence_worker_result.v1",
+                    "status": "IMPLEMENTATION_COMPLETED",
+                    "summary": summary,
+                    "task_id": task_id,
+                    "unit_id": unit_id,
+                },
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        canonical = _canonicalize_direct_composite_response(direct, journal)
+        if canonical == direct:
+            return None
+        return _CompositeProjection(canonical, origin=response)
+
+    @staticmethod
+    def _project_unescaped_composite_response(
+        response: str, journal: Any = None
+    ) -> _CompositeProjection | None:
         """Project one exact composite response with only quote repair allowed.
 
         The two free-text fields are parsed against a unique structural boundary;
@@ -1752,6 +1855,9 @@ class OpenCLIWebChatModel(BaseChatModel):
         the end of a field.  A projected value retains its source so the local
         repair path can prove a literal inverse without guessing from JSON alone.
         """
+        flat = OpenCLIWebChatModel._project_unescaped_flat_composite_response(response, journal)
+        if flat is not None:
+            return flat
         prefix = (
             '{"type":"tool_call","name":"write_file_and_record_worker_result",'
             '"arguments":{"file_path":'
@@ -1862,13 +1968,13 @@ class OpenCLIWebChatModel(BaseChatModel):
         return _CompositeProjection(projected, origin=response)
 
     @staticmethod
-    def _inverse_repaired_composite_response(response: str) -> str | None:
+    def _inverse_repaired_composite_response(response: str, journal: Any = None) -> str | None:
         if not isinstance(response, _CompositeProjection):
             return None
         origin = getattr(response, "origin", None)
         if not isinstance(origin, str):
             return None
-        projected = OpenCLIWebChatModel._project_unescaped_composite_response(origin)
+        projected = OpenCLIWebChatModel._project_unescaped_composite_response(origin, journal)
         return origin if projected == response else None
 
     @staticmethod
@@ -1964,10 +2070,16 @@ class OpenCLIWebChatModel(BaseChatModel):
         except (json.JSONDecodeError, ValueError):
             return False
         projected_composite = OpenCLIWebChatModel._project_unescaped_composite_response(
-            invalid_response
+            invalid_response, journal
         )
         if projected_composite is not None and projected_composite != invalid_response:
-            return repaired_response == projected_composite
+            return (
+                repaired_response == projected_composite
+                and OpenCLIWebChatModel._inverse_repaired_composite_response(
+                    projected_composite, journal
+                )
+                == invalid_response
+            )
         projected_invalid = OpenCLIWebChatModel._project_unescaped_write_response(invalid_response)
         try:
             invalid_envelope, prefix_end = json.JSONDecoder(
@@ -2012,11 +2124,16 @@ class OpenCLIWebChatModel(BaseChatModel):
             and response == origin
         ):
             raise OpenCLIWebModelError("OPENCLI_WEB_TOOL_CALL_INVALID")
-        projected_composite = self._project_unescaped_composite_response(response)
+        projected_composite = self._project_unescaped_composite_response(
+            response, self._recovery_journal
+        )
         if (
             projected_composite is not None
             and projected_composite != response
-            and self._inverse_repaired_composite_response(projected_composite) == response
+            and self._inverse_repaired_composite_response(
+                projected_composite, self._recovery_journal
+            )
+            == response
         ):
             if self._recovery_journal is not None:
                 self._recovery_journal.protocol_repair_started(
