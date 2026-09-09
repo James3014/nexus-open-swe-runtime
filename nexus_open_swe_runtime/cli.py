@@ -3,8 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path, PurePosixPath
@@ -379,6 +383,419 @@ def _prompt_field(prompt: str, name: str) -> str:
     raise RuntimeErrorBounded(f"OPEN_SWE_{name.upper()}_MISSING")
 
 
+ADMIT = "ADMIT"
+FALLBACK = "FALLBACK"
+REJECT = "REJECT"
+
+
+@dataclass(frozen=True)
+class SemanticAdmission:
+    decision: str
+    raw_bytes: bytes = b""
+    envelope: Mapping[str, Any] | None = None
+    diagnosis: Mapping[str, Any] | None = None
+
+
+def _prompt_optional_field(prompt: str, name: str) -> str | None:
+    prefix = f"{name}="
+    for line in prompt.splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix) :].strip()
+    return None
+
+
+def _canonical_binding_repository(value: str) -> str:
+    text = value.strip()
+    match = re.fullmatch(r"([^/\s]+)/([^/\s]+)", text)
+    return f"{match.group(1)}/{match.group(2)}".lower() if match else ""
+
+
+def _canonical_origin_repository(value: str) -> str:
+    text = value.strip()
+    patterns = (
+        r"^https://github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$",
+        r"^git@github\.com:([^/\s]+)/([^/\s]+?)(?:\.git)?/?$",
+        r"^ssh://git@github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, text, re.IGNORECASE)
+        if match:
+            return f"{match.group(1)}/{match.group(2)}".lower()
+    return ""
+
+
+def _workspace_path_has_symlink(workspace: Path, relative: str) -> bool:
+    """Reject every symlink component, including links to paths inside workspace."""
+    current = workspace
+    for component in PurePosixPath(relative).parts:
+        current /= component
+        try:
+            if current.lstat().st_mode & 0o170000 == 0o120000:
+                return True
+        except FileNotFoundError:
+            break
+    return False
+
+
+def _git_output(workspace: Path, *args: str) -> str:
+    git = shutil.which("git")
+    if not git or not Path(git).is_absolute():
+        raise RuntimeErrorBounded("OPEN_SWE_V2_WORKSPACE_BINDING_INVALID")
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"})
+    try:
+        completed = subprocess.run(
+            [git, "-C", str(workspace), "--no-optional-locks", *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=True,
+            timeout=5,
+            env=env,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeErrorBounded("OPEN_SWE_V2_WORKSPACE_BINDING_INVALID") from exc
+    return completed.stdout.strip()
+
+
+def _read_regular_artifact(artifact: Path) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(artifact, flags)
+        stat = os.fstat(descriptor)
+        if stat.st_mode & 0o170000 != 0o100000:
+            raise RuntimeErrorBounded("OPEN_SWE_V2_ARTIFACT_INVALID")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            return stream.read()
+    except (OSError, RuntimeErrorBounded) as exc:
+        raise RuntimeErrorBounded("OPEN_SWE_V2_ARTIFACT_INVALID") from exc
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+
+
+def _contained_regular_card(workspace: Path, card_ref: str) -> tuple[Path, bytes, str]:
+    if not isinstance(card_ref, str) or not card_ref or card_ref.startswith(("/", "\\")):
+        raise RuntimeErrorBounded("OPEN_SWE_V2_TASK_CARD_INVALID")
+    card_rel = _safe_relative_path(card_ref)
+    card = workspace / card_rel
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = flags | nofollow | getattr(os, "O_DIRECTORY", 0)
+    parent_fd = -1
+    descriptor = -1
+    try:
+        parent_fd = os.open(workspace, directory_flags)
+        components = PurePosixPath(card_rel).parts
+        for component in components[:-1]:
+            next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = next_fd
+        descriptor = os.open(components[-1], flags | nofollow, dir_fd=parent_fd)
+        stat = os.fstat(descriptor)
+        if stat.st_mode & 0o170000 != 0o100000:
+            raise RuntimeErrorBounded("OPEN_SWE_V2_TASK_CARD_INVALID")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            raw = stream.read()
+        content = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError, ValueError, RuntimeErrorBounded) as exc:
+        raise RuntimeErrorBounded("OPEN_SWE_V2_TASK_CARD_INVALID") from exc
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+        if parent_fd != -1:
+            os.close(parent_fd)
+    return card, raw, content
+
+
+def _task_card_allows_exact_paths(content: str, task_id: str, allowed_paths: tuple[str, ...]) -> bool:
+    def value_without_backticks(value: str) -> str | None:
+        value = value.strip()
+        if value.startswith("`") or value.endswith("`"):
+            if len(value) < 2 or not value.startswith("`") or not value.endswith("`"):
+                return None
+            value = value[1:-1]
+        return value
+
+    fields: dict[str, str] = {}
+    for line in content.splitlines():
+        match = re.match(r"^\s*-\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*?)\s*$", line)
+        if not match:
+            continue
+        key, value = match.groups()
+        if key in fields:
+            return False
+        value = value_without_backticks(value)
+        if value is None:
+            return False
+        fields[key] = value
+    required = {
+        "task_id": task_id,
+        "status": "ACTIVE",
+        "AUTO_CHAIN": "false",
+        "allow_deletions": "false",
+        "worker_may_approve": "false",
+        "worker_may_integrate": "false",
+        "worker_may_push": "false",
+    }
+    if any(fields.get(key) != value for key, value in required.items()):
+        return False
+    section = re.search(
+        r"(?:^|\n)\s*#+\s*allowed files\s*\n(?P<body>.*?)(?=\n#+\s|\Z)",
+        content,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if section is None:
+        return False
+    listed: list[str] = []
+    for line in section.group("body").splitlines():
+        if not line.strip():
+            continue
+        stripped = line.strip()
+        if not stripped.startswith("-") or stripped.startswith("- ") is False:
+            return False
+        value = value_without_backticks(stripped[1:])
+        if value is None:
+            return False
+        try:
+            normalized = _safe_relative_path(value)
+        except RuntimeErrorBounded:
+            return False
+        listed.append(normalized)
+    if len(set(listed)) != len(listed):
+        return False
+    return tuple(listed) == allowed_paths
+
+
+def _source_ref_for_path(refs: list[Any], path: str) -> str | None:
+    prefix = f"source_absence:{path}@"
+    for ref in refs:
+        suffix = ref[len(prefix) :] if isinstance(ref, str) and ref.startswith(prefix) else ""
+        if re.fullmatch(r"(?:[0-9a-f]{16}|[0-9a-f]{64})", suffix):
+            return ref
+    return None
+
+
+_V2_KEYS = {
+    "binding", "definition_of_done", "diagnosis", "evidence_refs", "failure_guards",
+    "implementation_direction", "inspect_first", "objective", "required_semantics",
+    "schema", "scope_signal", "selected_worker", "stop_and_escalate", "verification_focus",
+}
+_V2_BINDING_KEYS = {
+    "context_pack_sha256", "item_id", "item_type", "main_sha", "repository", "revision",
+    "task_card_hash", "task_card_ref",
+}
+_V2_DIAGNOSIS_KEYS = {"hypothesis", "next_probe", "status"}
+_V2_SCOPE_KEYS = {
+    "conditional_migration_paths", "forbidden_paths", "max_files", "production_edit_paths",
+    "read_only_authorities", "required_test_edit_paths", "scope_block_conditions",
+    "scope_confidence", "verification_only_paths",
+}
+_V2_WORKER_KEYS = {
+    "admission_evidence_hash", "admission_evidence_ref", "model", "provider",
+    "role_ceiling", "selection_evidence_hash", "selection_evidence_ref", "worker_id",
+}
+
+
+def _parse_unique_json(raw: bytes) -> Mapping[str, Any]:
+    def pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    value = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+    if not isinstance(value, Mapping):
+        raise ValueError("envelope must be object")
+    return value
+
+
+def _string_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _hex_digest(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _evidence_anchor(value: str) -> bool:
+    return re.fullmatch(r"(?:[0-9a-f]{16}|[0-9a-f]{64})", value) is not None
+
+
+def _semantic_v2_admission(
+    request: Mapping[str, Any],
+    workspace: Path,
+    artifact: Path,
+    prompt: str,
+    allowed_paths: tuple[str, ...],
+    artifact_bytes: bytes | None = None,
+) -> SemanticAdmission:
+    """Classify a v2 packet without invoking a model or graph."""
+    raw = artifact_bytes or b""
+    try:
+        if artifact_bytes is None:
+            raw = _read_regular_artifact(artifact)
+        envelope = _parse_unique_json(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, RuntimeErrorBounded):
+        return SemanticAdmission(REJECT)
+    schema = envelope.get("schema")
+    if schema == "external_execution_envelope.v1":
+        return SemanticAdmission(FALLBACK, raw, envelope)
+    if schema != "external_execution_envelope.v2":
+        return SemanticAdmission(REJECT)
+    try:
+        if _workspace_path_has_symlink(workspace, "") or workspace.is_symlink():
+            return SemanticAdmission(REJECT)
+        if set(envelope) != _V2_KEYS:
+            return SemanticAdmission(REJECT)
+        supplied_hash = _prompt_field(prompt, "envelope_sha256")
+        if _sha256(_canonical_json(envelope)) != supplied_hash:
+            return SemanticAdmission(REJECT)
+        binding = envelope["binding"]
+        diagnosis = envelope["diagnosis"]
+        scope = envelope["scope_signal"]
+        selected = envelope["selected_worker"]
+        refs = envelope["evidence_refs"]
+        inspect_first = envelope["inspect_first"]
+        if not all(isinstance(value, Mapping) for value in (binding, diagnosis, scope, selected)):
+            return SemanticAdmission(REJECT)
+        if set(binding) != _V2_BINDING_KEYS or set(diagnosis) != _V2_DIAGNOSIS_KEYS:
+            return SemanticAdmission(REJECT)
+        if set(scope) != _V2_SCOPE_KEYS or set(selected) != _V2_WORKER_KEYS:
+            return SemanticAdmission(REJECT)
+        if not isinstance(refs, list) or not isinstance(inspect_first, list):
+            return SemanticAdmission(REJECT)
+        if not all(isinstance(value, str) for value in binding.values()):
+            return SemanticAdmission(REJECT)
+        if not _hex_digest(binding["context_pack_sha256"]):
+            return SemanticAdmission(REJECT)
+        if not _hex_digest(binding["task_card_hash"]):
+            return SemanticAdmission(REJECT)
+        if not re.fullmatch(r"[0-9a-f]{40}", binding["main_sha"]):
+            return SemanticAdmission(REJECT)
+        if not all(isinstance(value, str) for value in diagnosis.values()):
+            return SemanticAdmission(REJECT)
+        for key in (
+            "conditional_migration_paths", "forbidden_paths", "production_edit_paths",
+            "read_only_authorities", "required_test_edit_paths", "scope_block_conditions",
+            "verification_only_paths",
+        ):
+            if not _string_list(scope[key]):
+                return SemanticAdmission(REJECT)
+        if not isinstance(scope["scope_confidence"], str):
+            return SemanticAdmission(REJECT)
+        if not isinstance(scope["max_files"], int) or isinstance(scope["max_files"], bool):
+            return SemanticAdmission(REJECT)
+        if not all(isinstance(value, str) for value in selected.values()):
+            return SemanticAdmission(REJECT)
+        for key in ("admission_evidence_hash", "selection_evidence_hash"):
+            if not _hex_digest(selected[key]):
+                return SemanticAdmission(REJECT)
+        if not _string_list(refs) or not _string_list(inspect_first):
+            return SemanticAdmission(REJECT)
+        for key in (
+            "definition_of_done", "failure_guards", "implementation_direction",
+            "required_semantics", "stop_and_escalate", "verification_focus",
+        ):
+            if not _string_list(envelope[key]):
+                return SemanticAdmission(REJECT)
+        if not isinstance(envelope["objective"], str):
+            return SemanticAdmission(REJECT)
+        status = diagnosis.get("status")
+        if status in {"LIKELY", "UNKNOWN"}:
+            if not diagnosis.get("hypothesis") or not diagnosis.get("next_probe"):
+                return SemanticAdmission(REJECT)
+            return SemanticAdmission(FALLBACK, raw, envelope, diagnosis)
+        if status != "PROVEN":
+            return SemanticAdmission(REJECT)
+        expected_base = _prompt_field(prompt, "expected_base_sha")
+        task_id = _prompt_field(prompt, "task_id")
+        task_card_ref = binding["task_card_ref"]
+        task_card_hash = binding["task_card_hash"]
+        if binding["main_sha"] != expected_base or not isinstance(task_card_hash, str):
+            return SemanticAdmission(REJECT)
+        if _git_output(workspace, "rev-parse", "HEAD") != expected_base:
+            return SemanticAdmission(REJECT)
+        if _git_output(workspace, "status", "--porcelain"):
+            return SemanticAdmission(REJECT)
+        origin = _git_output(workspace, "remote", "get-url", "origin")
+        if not _canonical_origin_repository(origin) or _canonical_origin_repository(origin) != _canonical_binding_repository(str(binding["repository"])):
+            return SemanticAdmission(REJECT)
+        if _workspace_path_has_symlink(workspace, task_card_ref):
+            return SemanticAdmission(REJECT)
+        _card_path, card_raw, card_content = _contained_regular_card(workspace, task_card_ref)
+        if _sha256(card_raw) != task_card_hash:
+            return SemanticAdmission(REJECT)
+        if not _task_card_allows_exact_paths(card_content, task_id, allowed_paths):
+            return SemanticAdmission(REJECT)
+        if scope["scope_confidence"] != "HIGH":
+            return SemanticAdmission(REJECT)
+        if len(set(allowed_paths)) != len(allowed_paths):
+            return SemanticAdmission(REJECT)
+        if scope["production_edit_paths"] or scope["conditional_migration_paths"]:
+            return SemanticAdmission(REJECT)
+        if tuple(scope["read_only_authorities"]) != (task_card_ref,):
+            return SemanticAdmission(REJECT)
+        required = tuple(_safe_relative_path(str(path)) for path in scope["required_test_edit_paths"])
+        if required != allowed_paths or not isinstance(scope["max_files"], int) or isinstance(scope["max_files"], bool) or scope["max_files"] != len(allowed_paths):
+            return SemanticAdmission(REJECT)
+        if not all(isinstance(diagnosis[key], str) and diagnosis[key].strip() for key in ("hypothesis", "next_probe")):
+            return SemanticAdmission(REJECT)
+        task_ref = f"task_card:{task_card_ref}@"
+        task_card_evidence = next(
+            (
+                ref
+                for ref in refs
+                if isinstance(ref, str)
+                and ref.startswith(task_ref)
+                and _evidence_anchor(ref[len(task_ref) :])
+            ),
+            None,
+        )
+        if task_card_evidence is None:
+            return SemanticAdmission(REJECT)
+        if task_card_evidence not in inspect_first:
+            return SemanticAdmission(REJECT)
+        if not any(
+            isinstance(ref, str)
+            and ref.startswith(task_ref)
+            and _evidence_anchor(ref[len(task_ref) :])
+            for ref in refs
+        ):
+            return SemanticAdmission(REJECT)
+        for path in allowed_paths:
+            if _workspace_path_has_symlink(workspace, path):
+                return SemanticAdmission(REJECT)
+            source_ref = _source_ref_for_path(refs, path)
+            if source_ref is None or source_ref not in inspect_first:
+                return SemanticAdmission(REJECT)
+            target = workspace / path
+            try:
+                target.lstat()
+                return SemanticAdmission(REJECT)
+            except FileNotFoundError:
+                pass
+            parent = target.parent
+            while parent != workspace and not parent.exists():
+                parent = parent.parent
+            if parent.is_symlink() or not parent.resolve().is_relative_to(workspace) or not target.resolve().parent.is_relative_to(workspace):
+                return SemanticAdmission(REJECT)
+        identity = request.get("worker_identity")
+        if not isinstance(identity, Mapping) or dict(selected) != dict(identity):
+            return SemanticAdmission(REJECT)
+        expected_identity_hash = request.get("worker_identity_sha256")
+        if not isinstance(expected_identity_hash, str) or _sha256(_canonical_json(selected)) != expected_identity_hash:
+            return SemanticAdmission(REJECT)
+    except (KeyError, TypeError, ValueError, RuntimeErrorBounded):
+        return SemanticAdmission(REJECT)
+    return SemanticAdmission(ADMIT, raw, envelope, diagnosis)
+
 def _worker_result(task_id: str, unit_id: str, status: str, summary: str) -> str:
     return _canonical_json({
         "schema": "external_intelligence_worker_result.v1",
@@ -478,16 +895,20 @@ def _base_result(request: Mapping[str, Any], *, kind: str, status: str) -> dict[
     }
 
 
-def _worker_material_fingerprint(request: Mapping[str, Any]) -> str | None:
+def _worker_material_fingerprint(
+    request: Mapping[str, Any], artifact_bytes: bytes | None = None
+) -> str | None:
     prompt = request.get("prompt")
     artifact_path = request.get("artifact_path")
     if not isinstance(prompt, str) or not isinstance(artifact_path, str):
         return None
-    artifact = Path(artifact_path).expanduser().resolve()
-    try:
-        artifact_sha256 = _sha256(artifact.read_bytes())
-    except OSError:
-        artifact_sha256 = "unavailable"
+    artifact = Path(artifact_path).expanduser()
+    if artifact_bytes is None:
+        try:
+            artifact_bytes = _read_regular_artifact(artifact)
+        except RuntimeErrorBounded:
+            artifact_bytes = None
+    artifact_sha256 = _sha256(artifact_bytes) if artifact_bytes is not None else "unavailable"
     return _sha256(
         _canonical_json(
             {
@@ -509,13 +930,15 @@ def _worker_material_fingerprint(request: Mapping[str, Any]) -> str | None:
     )
 
 
-def _write_started(request: Mapping[str, Any], kind: str) -> dict[str, Any]:
+def _write_started(
+    request: Mapping[str, Any], kind: str, artifact_bytes: bytes | None = None
+) -> dict[str, Any]:
     state = _base_result(request, kind=kind, status="STARTED")
     if kind == "worker" and request.get("workspace_path"):
         state["directory"] = str(
             Path(str(request["workspace_path"])).expanduser().resolve()
         )
-        material_fingerprint = _worker_material_fingerprint(request)
+        material_fingerprint = _worker_material_fingerprint(request, artifact_bytes)
         if material_fingerprint is not None:
             state["execution_material_sha256"] = material_fingerprint
     state["process_started"] = True
@@ -748,7 +1171,7 @@ def _worker_run(
     if existing is not None:
         return _reconcile_operation(request, kind="worker")
     workspace = Path(str(request.get("workspace_path") or "")).expanduser().resolve()
-    artifact = Path(str(request.get("artifact_path") or "")).expanduser().resolve()
+    artifact = Path(str(request.get("artifact_path") or "")).expanduser()
     prompt = str(request.get("prompt") or "")
     provider = str(request.get("provider_id") or "")
     model_id = str(request.get("model_id") or "")
@@ -760,41 +1183,66 @@ def _worker_run(
         or not model_id
     ):
         return _base_result(request, kind="worker", status="OPEN_SWE_EXECUTION_INPUT_INVALID")
-    started = _write_started(request, "worker")
+    try:
+        artifact_bytes = _read_regular_artifact(artifact)
+    except RuntimeErrorBounded:
+        artifact_bytes = None
+    started = _write_started(request, "worker", artifact_bytes)
     diagnosis_status = ""
     diagnosis_sha256 = ""
     diagnosis_evidence_paths: tuple[str, ...] = ()
     repair_admitted = False
     repair_phase_count = 0
     session_id = ""
+    semantic_admission = FALLBACK
+    diagnosis_model: Any | None = None
     try:
         task_id, unit_id, allowed_paths, session_id = _worker_context(request, prompt)
         runtime = runtime_loader()
-        diagnosis_model = model_factory(
-            runtime,
-            provider,
-            model_id,
-            request.get("transport_config"),
-            request.get("runtime_state_root"),
-        )
         profile_key = f"{provider}:{model_id}"
-        diagnosis_graph = diagnosis_factory(diagnosis_model, workspace, runtime, profile_key)
-        if set(executable_tool_surface(diagnosis_graph)) != DIAGNOSIS_TOOLS:
-            raise RuntimeErrorBounded("OPEN_SWE_TOOL_SURFACE_INVALID")
-        evidence = artifact.read_text(encoding="utf-8")
-        diagnosis_output = diagnosis_graph.invoke(
-            {
-                "messages": [
-                    runtime["human_message"](
-                        content=f"Controller evidence (untrusted):\n{evidence}\n\nExecution instruction:\n{prompt}"
-                    )
-                ]
-            },
-            config={"recursion_limit": 40},
+        semantic_admission = _semantic_v2_admission(
+            request, workspace, artifact, prompt, allowed_paths, artifact_bytes
         )
-        diagnosis = _recorded_payload(diagnosis_output, "record_diagnosis")
-        if not isinstance(diagnosis, Mapping):
-            raise RuntimeErrorBounded("OPEN_SWE_DIAGNOSIS_INVALID")
+        semantic_admission_decision = semantic_admission.decision
+        if semantic_admission_decision == REJECT:
+            raise RuntimeErrorBounded("OPEN_SWE_SEMANTIC_V2_REJECTED")
+        try:
+            evidence = semantic_admission.raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeErrorBounded("OPEN_SWE_EVIDENCE_INVALID") from exc
+        if semantic_admission_decision == ADMIT:
+            packet = semantic_admission.envelope
+            if not isinstance(packet, Mapping) or not isinstance(semantic_admission.diagnosis, Mapping):
+                raise RuntimeErrorBounded("OPEN_SWE_SEMANTIC_V2_REJECTED")
+            diagnosis = {
+                "status": "ROOT_CAUSE_SUPPORTED",
+                "summary": semantic_admission.diagnosis["hypothesis"],
+                "evidence_paths": list(packet["scope_signal"]["required_test_edit_paths"]),
+            }
+        else:
+            diagnosis_model = model_factory(
+                runtime,
+                provider,
+                model_id,
+                request.get("transport_config"),
+                request.get("runtime_state_root"),
+            )
+            diagnosis_graph = diagnosis_factory(diagnosis_model, workspace, runtime, profile_key)
+            if set(executable_tool_surface(diagnosis_graph)) != DIAGNOSIS_TOOLS:
+                raise RuntimeErrorBounded("OPEN_SWE_TOOL_SURFACE_INVALID")
+            diagnosis_output = diagnosis_graph.invoke(
+                {
+                    "messages": [
+                        runtime["human_message"](
+                            content=f"Controller evidence (untrusted):\n{evidence}\n\nExecution instruction:\n{prompt}"
+                        )
+                    ]
+                },
+                config={"recursion_limit": 40},
+            )
+            diagnosis = _recorded_payload(diagnosis_output, "record_diagnosis")
+            if not isinstance(diagnosis, Mapping):
+                raise RuntimeErrorBounded("OPEN_SWE_DIAGNOSIS_INVALID")
         status = diagnosis.get("status")
         summary = diagnosis.get("summary")
         paths = diagnosis.get("evidence_paths")
@@ -830,7 +1278,7 @@ def _worker_run(
                 request.get("transport_config"),
                 request.get("runtime_state_root"),
             )
-            if repair_model is diagnosis_model:
+            if diagnosis_model is not None and repair_model is diagnosis_model:
                 raise RuntimeErrorBounded("OPEN_SWE_PHASE_MODEL_REUSE")
             if provider == "opencli_chatgpt" and getattr(repair_model, "_conversation_id", None):
                 raise RuntimeErrorBounded("OPENCLI_WEB_REPAIR_CONVERSATION_REUSE")

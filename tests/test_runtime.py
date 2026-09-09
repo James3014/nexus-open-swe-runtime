@@ -7,8 +7,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from langchain_core.messages import HumanMessage
 
 from nexus_open_swe_runtime import cli
+from nexus_open_swe_runtime.opencli_web_model import OpenCLIWebChatModel
 
 
 class FakeGraph:
@@ -77,7 +79,10 @@ def _worker_request(tmp_path: Path) -> dict:
     workspace.mkdir()
     (workspace / "a.py").write_text("VALUE = 1\n", encoding="utf-8")
     artifact = tmp_path / "evidence.json"
-    artifact.write_text('{"failure":"VALUE must be 2"}\n', encoding="utf-8")
+    artifact.write_text(
+        '{"schema":"external_execution_envelope.v1","failure":"VALUE must be 2"}\n',
+        encoding="utf-8",
+    )
     return {
         "schema": cli.REQUEST_SCHEMA,
         "operation": "worker_run",
@@ -1209,3 +1214,567 @@ def test_worker_blocks_repair_when_authorized_absent_path_is_dangling_symlink(tm
     assert target.is_symlink()
     assert target.readlink() == Path("missing-target.py")
     assert not missing_target.exists()
+
+
+def _v2_request(tmp_path: Path, *, status: str = "PROVEN") -> dict:
+    request = _worker_request(tmp_path)
+    request.update(
+        {
+            "provider_id": "opencli_chatgpt",
+            "model_id": "advanced",
+            "transport_config": {
+                "executable": "/usr/bin/opencli",
+                "profile": "r16",
+                "site_session": "ephemeral",
+                "timeout_seconds": 30,
+            },
+        }
+    )
+    workspace = Path(request["workspace_path"])
+    (workspace / "a.py").unlink()
+    card_ref = "tasks/task-card.md"
+    card = workspace / card_ref
+    card.parent.mkdir(parents=True)
+    card.write_text(
+        "\n".join(
+            [
+                "- task_id: `task-1`",
+                "- status: `ACTIVE`",
+                "- worker_may_approve: `false`",
+                "- worker_may_integrate: `false`",
+                "- worker_may_push: `false`",
+                "- AUTO_CHAIN: `false`",
+                "- allow_deletions: `false`",
+                "\n## Allowed files\n",
+                "- `a.py`",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    card_hash = cli._sha256(card.read_bytes())
+    envelope = {
+        "binding": {
+            "context_pack_sha256": "c" * 64,
+            "item_id": "task-1",
+            "item_type": "issue",
+            "main_sha": "b" * 40,
+            "repository": "James3014/Nexus-new",
+            "revision": "r16",
+            "task_card_ref": card_ref,
+            "task_card_hash": card_hash,
+        },
+        "diagnosis": {
+            "status": "UNKNOWN" if status == "INCONCLUSIVE" else status,
+            "hypothesis": "the required target is absent",
+            "next_probe": "inspect the absent target",
+        },
+        "definition_of_done": ["one bounded test"],
+        "evidence_refs": [
+            f"task_card:{card_ref}@" + "a" * 16,
+            "source_absence:a.py@" + "b" * 16,
+        ],
+        "inspect_first": [
+            f"task_card:{card_ref}@" + "a" * 16,
+            "source_absence:a.py@" + "b" * 16,
+        ],
+        "failure_guards": ["no other paths"],
+        "implementation_direction": ["create one test"],
+        "objective": "bounded repair",
+        "required_semantics": ["one deterministic test"],
+        "schema": "external_execution_envelope.v2",
+        "scope_signal": {
+            "conditional_migration_paths": [],
+            "forbidden_paths": [],
+            "max_files": 1,
+            "production_edit_paths": [],
+            "read_only_authorities": [card_ref],
+            "required_test_edit_paths": ["a.py"],
+            "scope_block_conditions": ["no extra files"],
+            "scope_confidence": "HIGH",
+            "verification_only_paths": ["a.py"],
+        },
+        "selected_worker": {
+            "admission_evidence_hash": "a" * 64,
+            "admission_evidence_ref": "admission.json",
+            "model": request["model_id"],
+            "provider": request["provider_id"],
+            "role_ceiling": "bounded_candidate_generation",
+            "selection_evidence_hash": "d" * 64,
+            "selection_evidence_ref": "selection.json",
+            "worker_id": "worker-1",
+        },
+        "stop_and_escalate": ["stop"],
+        "verification_focus": ["pytest"],
+    }
+    raw = cli._canonical_json(envelope)
+    Path(request["artifact_path"]).write_text(raw, encoding="utf-8")
+    selected = envelope["selected_worker"]
+    request["worker_identity"] = dict(selected)
+    request["worker_identity_sha256"] = cli._sha256(cli._canonical_json(selected))
+    request["prompt"] += "\n" + "\n".join(
+        [
+            f"envelope_sha256={cli._sha256(raw)}",
+            "expected_base_sha=" + "b" * 40,
+        ]
+    )
+    return request
+
+
+def test_worker_admits_strict_v2_without_diagnosis_model_or_graph(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "_git_output",
+        lambda _workspace, *args: {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
+        }[args],
+    )
+    model_calls = 0
+    diagnosis_calls = 0
+    repair = FakeGraph(cli.REPAIR_TOOLS, _record("record_worker_result", {"summary": "done"}))
+
+    def model_factory(_runtime, provider, model_id, transport_config, _state_root):
+        nonlocal model_calls
+        model_calls += 1
+        assert provider == "opencli_chatgpt"
+        assert model_id == "advanced"
+        assert transport_config["site_session"] == "ephemeral"
+        return SimpleNamespace(_conversation_id=None)
+
+    def diagnosis_factory(*_args):
+        nonlocal diagnosis_calls
+        diagnosis_calls += 1
+        raise AssertionError("admitted v2 must skip diagnosis")
+
+    def repair_factory(model, *_args):
+        assert model._conversation_id is None
+        return repair
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=model_factory,
+        diagnosis_factory=diagnosis_factory,
+        repair_factory=repair_factory,
+    )
+
+    assert result["status"] == "COMPLETED"
+    assert result["diagnosis_status"] == "ROOT_CAUSE_SUPPORTED"
+    assert result["repair_admitted"] is True
+    assert model_calls == 1
+    assert diagnosis_calls == 0
+    assert repair.calls == 1
+
+
+def test_worker_admit_r16_opencli_repair_uses_new_without_conversation(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "_git_output",
+        lambda _workspace, *args: {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
+        }[args],
+    )
+    ask_commands: list[list[str]] = []
+    latest_prompt = ""
+
+    def fake_run(argv, **_kwargs):
+        nonlocal latest_prompt
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_commands.append(args)
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": "r16-repair", "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    [
+                        {"Role": "User", "Text": latest_prompt, "Generating": False},
+                        {
+                            "Role": "Assistant",
+                            "Text": '{"type":"final","content":"repair ok"}',
+                            "Generating": False,
+                        },
+                    ]
+                ),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    repair_model_calls = 0
+
+    def model_factory(_runtime, provider, model_id, transport_config, state_root):
+        nonlocal repair_model_calls
+        repair_model_calls += 1
+        return OpenCLIWebChatModel(
+            executable=transport_config["executable"],
+            intelligence_level=model_id,
+            opencli_profile=transport_config["profile"],
+            timeout_seconds=transport_config["timeout_seconds"],
+            site_session=transport_config["site_session"],
+            runtime_state_root=state_root,
+        )
+
+    class RepairGraph(FakeGraph):
+        def __init__(self, model):
+            super().__init__(cli.REPAIR_TOOLS)
+            self.model = model
+
+        def invoke(self, _payload, config=None):
+            self.calls += 1
+            self.model.invoke([HumanMessage(content="repair")])
+            return _record("record_worker_result", {"summary": "repair ok"})
+
+    def repair_factory(model, *_args):
+        assert model._conversation_id is None
+        return RepairGraph(model)
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=model_factory,
+        diagnosis_factory=lambda *_args: pytest.fail("admitted v2 must skip diagnosis"),
+        repair_factory=repair_factory,
+    )
+    assert result["status"] == "COMPLETED"
+    assert repair_model_calls == 1
+    assert len(ask_commands) == 1
+    assert "--new" in ask_commands[0]
+    assert "--conversation" not in ask_commands[0]
+
+
+def test_worker_invalid_v2_hash_rejects_before_any_model_or_graph(tmp_path):
+    request = _v2_request(tmp_path)
+    request["prompt"] = request["prompt"].replace("envelope_sha256=", "envelope_sha256=" + "0" * 64 + "\n#")
+    model_calls = 0
+
+    def model_factory(*_args):
+        nonlocal model_calls
+        model_calls += 1
+        raise AssertionError("invalid v2 must not construct a model")
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=model_factory,
+        diagnosis_factory=lambda *_args: pytest.fail("invalid v2 diagnosis"),
+        repair_factory=lambda *_args: pytest.fail("invalid v2 repair"),
+    )
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert cli._semantic_v2_admission(
+        request,
+        Path(request["workspace_path"]),
+        Path(request["artifact_path"]),
+        request["prompt"],
+        ("a.py",),
+    ).decision == cli.REJECT
+    assert model_calls == 0
+
+
+def test_malformed_v2_rejects_without_fallback_model(tmp_path):
+    request = _v2_request(tmp_path)
+    Path(request["artifact_path"]).write_text(
+        '{"schema":"external_execution_envelope.v2",', encoding="utf-8"
+    )
+    model_calls = 0
+
+    def model_factory(*_args):
+        nonlocal model_calls
+        model_calls += 1
+        raise AssertionError("malformed v2 must not construct a model")
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=model_factory,
+        diagnosis_factory=lambda *_args: pytest.fail("malformed v2 diagnosis"),
+        repair_factory=lambda *_args: pytest.fail("malformed v2 repair"),
+    )
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert model_calls == 0
+
+
+def test_v2_artifact_symlink_rejects(tmp_path):
+    request = _v2_request(tmp_path)
+    artifact = Path(request["artifact_path"])
+    target = artifact.with_name("artifact-target.json")
+    artifact.replace(target)
+    artifact.symlink_to(target.name)
+    assert cli._semantic_v2_admission(
+        request,
+        Path(request["workspace_path"]),
+        artifact,
+        request["prompt"],
+        ("a.py",),
+    ).decision == cli.REJECT
+
+
+def test_v2_missing_full_worker_identity_rejects(tmp_path):
+    request = _v2_request(tmp_path)
+    request.pop("worker_identity")
+    assert cli._semantic_v2_admission(
+        request,
+        Path(request["workspace_path"]),
+        Path(request["artifact_path"]),
+        request["prompt"],
+        ("a.py",),
+    ).decision == cli.REJECT
+
+
+def test_v2_card_symlink_rejects(tmp_path):
+    request = _v2_request(tmp_path)
+    workspace = Path(request["workspace_path"])
+    card = workspace / "tasks/task-card.md"
+    target = workspace / "tasks/card-target.md"
+    card.replace(target)
+    card.symlink_to(target.name)
+    assert cli._semantic_v2_admission(
+        request,
+        workspace,
+        Path(request["artifact_path"]),
+        request["prompt"],
+        ("a.py",),
+    ).decision == cli.REJECT
+
+
+def test_v2_target_symlink_rejects(tmp_path):
+    request = _v2_request(tmp_path)
+    workspace = Path(request["workspace_path"])
+    (workspace / "a.py").symlink_to("tasks/task-card.md")
+    assert cli._semantic_v2_admission(
+        request,
+        workspace,
+        Path(request["artifact_path"]),
+        request["prompt"],
+        ("a.py",),
+    ).decision == cli.REJECT
+
+
+def test_v2_intermediate_parent_symlink_rejects_without_model_or_graph(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path)
+    workspace = Path(request["workspace_path"])
+    card = workspace / "tasks/task-card.md"
+    card_content = card.read_text(encoding="utf-8").replace("- `a.py`", "- `nested/new.py`")
+    card.write_text(card_content, encoding="utf-8")
+    envelope = json.loads(Path(request["artifact_path"]).read_text(encoding="utf-8"))
+    envelope["binding"]["task_card_hash"] = cli._sha256(card.read_bytes())
+    envelope["scope_signal"]["required_test_edit_paths"] = ["nested/new.py"]
+    envelope["scope_signal"]["verification_only_paths"] = ["nested/new.py"]
+    envelope["evidence_refs"][1] = "source_absence:nested/new.py@" + "b" * 16
+    envelope["inspect_first"][1] = envelope["evidence_refs"][1]
+    workspace.joinpath("nested").symlink_to("tasks")
+    request["prompt"] = request["prompt"].replace(
+        'authorized_mutation_paths=["a.py"]',
+        'authorized_mutation_paths=["nested/new.py"]',
+    )
+    _write_v2_mutation(request, envelope)
+    monkeypatch.setattr(
+        cli,
+        "_git_output",
+        lambda _workspace, *args: {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
+        }[args],
+    )
+    calls = {"model": 0, "diagnosis": 0, "repair": 0}
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: calls.__setitem__("model", calls["model"] + 1),
+        diagnosis_factory=lambda *_args: calls.__setitem__("diagnosis", calls["diagnosis"] + 1),
+        repair_factory=lambda *_args: calls.__setitem__("repair", calls["repair"] + 1),
+    )
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert calls == {"model": 0, "diagnosis": 0, "repair": 0}
+
+
+def _write_v2_mutation(request: dict, envelope: dict, *, refresh_hash: bool = True) -> None:
+    artifact = Path(request["artifact_path"])
+    canonical = cli._canonical_json(envelope)
+    artifact.write_text(canonical, encoding="utf-8")
+    if refresh_hash:
+        digest = cli._sha256(canonical)
+        request["prompt"] = "\n".join(
+            f"envelope_sha256={digest}" if line.startswith("envelope_sha256=") else line
+            for line in request["prompt"].splitlines()
+        )
+        assert cli._prompt_field(request["prompt"], "envelope_sha256") == digest
+    assert cli._sha256(artifact.read_bytes()) == cli._prompt_field(
+        request["prompt"], "envelope_sha256"
+    )
+
+
+def _v2_matrix_request(tmp_path: Path, mutate, *, refresh_hash: bool = True) -> dict:
+    request = _v2_request(tmp_path)
+    envelope = json.loads(Path(request["artifact_path"]).read_text(encoding="utf-8"))
+    mutate(request, envelope)
+    _write_v2_mutation(request, envelope, refresh_hash=refresh_hash)
+    return request
+
+
+def _mutate_card(request: dict, envelope: dict, old: str, new: str) -> None:
+    card = Path(request["workspace_path"]) / envelope["binding"]["task_card_ref"]
+    content = card.read_text(encoding="utf-8").replace(old, new, 1)
+    card.write_text(content, encoding="utf-8")
+    envelope["binding"]["task_card_hash"] = cli._sha256(card.read_bytes())
+
+
+@pytest.mark.parametrize(
+    "name,mutate",
+    [
+        ("binding_base", lambda _r, e: e["binding"].update(main_sha="a" * 40)),
+        ("physical_head", lambda _r, _e: None),
+        ("dirty_workspace", lambda _r, _e: None),
+        ("card_ref", lambda _r, e: e["binding"].update(task_card_ref="tasks/other.md")),
+        ("card_hash", lambda _r, e: e["binding"].update(task_card_hash="a" * 64)),
+        ("card_backtick", lambda r, e: _mutate_card(r, e, "- `a.py`", "- `a.py")),
+        ("card_status", lambda r, e: _mutate_card(r, e, "`ACTIVE`", "`PAUSED`")),
+        ("card_auto_chain", lambda r, e: _mutate_card(r, e, "- AUTO_CHAIN: `false`", "- AUTO_CHAIN: `true`")),
+        ("card_deletions", lambda r, e: _mutate_card(r, e, "- allow_deletions: `false`", "- allow_deletions: `true`")),
+        ("card_approve", lambda r, e: _mutate_card(r, e, "- worker_may_approve: `false`", "- worker_may_approve: `true`")),
+        ("card_integrate", lambda r, e: _mutate_card(r, e, "- worker_may_integrate: `false`", "- worker_may_integrate: `true`")),
+        ("card_push", lambda r, e: _mutate_card(r, e, "- worker_may_push: `false`", "- worker_may_push: `true`")),
+        ("scope_paths", lambda _r, e: e["scope_signal"].update(required_test_edit_paths=["b.py"])),
+        ("scope_max_files", lambda _r, e: e["scope_signal"].update(max_files=2)),
+        ("scope_read_only", lambda _r, e: e["scope_signal"].update(read_only_authorities=[])),
+        ("scope_production", lambda _r, e: e["scope_signal"].update(production_edit_paths=["a.py"])),
+        ("scope_migration", lambda _r, e: e["scope_signal"].update(conditional_migration_paths=["a.py"])),
+        ("task_evidence", lambda _r, e: e["evidence_refs"].__setitem__(0, "source_absence:a.py@" + "a" * 16)),
+        ("source_evidence", lambda _r, e: e["evidence_refs"].__setitem__(1, "source_absence:b.py@" + "b" * 16)),
+        ("inspect_first", lambda _r, e: e["inspect_first"].__setitem__(1, "wrong-entry")),
+        ("worker_mapping", lambda _r, _e: _r["worker_identity"].update(worker_id="other")),
+        ("worker_hash", lambda _r, _e: _r.update(worker_identity_sha256="0" * 64)),
+        ("context_digest_length", lambda _r, e: e["binding"].update(context_pack_sha256="c" * 16)),
+        ("selected_digest_length", lambda _r, e: e["selected_worker"].update(admission_evidence_hash="a" * 16)),
+        ("top_keyset", lambda _r, e: e.update(extra=True)),
+        ("nested_keyset", lambda _r, e: e["scope_signal"].update(extra=True)),
+        ("unknown_schema", lambda _r, e: e.update(schema="external_execution_envelope.unknown")),
+    ],
+)
+def test_v2_hostile_single_fault_rejects_without_model_or_graph(
+    tmp_path, monkeypatch, name, mutate
+):
+    request = _v2_matrix_request(tmp_path, mutate)
+    def fake_git(_workspace, *args):
+        if name == "physical_head" and args == ("rev-parse", "HEAD"):
+            return "a" * 40
+        if name == "dirty_workspace" and args == ("status", "--porcelain"):
+            return " M changed.py"
+        return {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
+        }[args]
+
+    monkeypatch.setattr(cli, "_git_output", fake_git)
+    calls = {"model": 0, "diagnosis": 0, "repair": 0}
+
+    def model_factory(*_args):
+        calls["model"] += 1
+        raise AssertionError(f"{name} must reject before model construction")
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=model_factory,
+        diagnosis_factory=lambda *_args: calls.__setitem__("diagnosis", calls["diagnosis"] + 1),
+        repair_factory=lambda *_args: calls.__setitem__("repair", calls["repair"] + 1),
+    )
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert calls == {"model": 0, "diagnosis": 0, "repair": 0}
+
+
+def test_v2_duplicate_json_key_rejects_without_model_or_graph(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path)
+    Path(request["artifact_path"]).write_text(
+        '{"schema":"external_execution_envelope.v2","schema":"external_execution_envelope.v2"}',
+        encoding="utf-8",
+    )
+    calls = {"model": 0, "diagnosis": 0, "repair": 0}
+
+    def model_factory(*_args):
+        calls["model"] += 1
+        return object()
+
+    def diagnosis_factory(*_args):
+        calls["diagnosis"] += 1
+        return None
+
+    def repair_factory(*_args):
+        calls["repair"] += 1
+        return None
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=model_factory,
+        diagnosis_factory=diagnosis_factory,
+        repair_factory=repair_factory,
+    )
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert calls == {"model": 0, "diagnosis": 0, "repair": 0}
+
+
+def test_v2_bare_binding_and_strict_origin_are_distinct(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "_git_output",
+        lambda _workspace, *args: {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "James3014/Nexus-new",
+        }[args],
+    )
+    assert cli._semantic_v2_admission(
+        request,
+        Path(request["workspace_path"]),
+        Path(request["artifact_path"]),
+        request["prompt"],
+        ("a.py",),
+    ).decision == cli.REJECT
+
+
+def test_worker_well_formed_inconclusive_v2_falls_back_to_diagnosis(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path, status="INCONCLUSIVE")
+    diagnosis = FakeGraph(
+        cli.DIAGNOSIS_TOOLS,
+        _record("record_diagnosis", {"status": "INCONCLUSIVE", "summary": "unclear", "evidence_paths": []}),
+    )
+    model_calls = 0
+
+    def model_factory(*_args):
+        nonlocal model_calls
+        model_calls += 1
+        return object()
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=model_factory,
+        diagnosis_factory=lambda *_args: diagnosis,
+        repair_factory=lambda *_args: pytest.fail("fallback must not repair"),
+    )
+    assert result["status"] == "COMPLETED"
+    assert cli._semantic_v2_admission(
+        request,
+        Path(request["workspace_path"]),
+        Path(request["artifact_path"]),
+        request["prompt"],
+        ("a.py",),
+    ).decision == cli.FALLBACK
+    assert model_calls == 1
+    assert diagnosis.calls == 1
