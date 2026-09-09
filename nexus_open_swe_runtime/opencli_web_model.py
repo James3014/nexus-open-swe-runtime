@@ -1943,7 +1943,9 @@ class OpenCLIWebChatModel(BaseChatModel):
         return response[:start] + "".join(inverse) + response[index:]
 
     @staticmethod
-    def _repair_matches_invalid_response(invalid_response: str, repaired_response: str) -> bool:
+    def _repair_matches_invalid_response(
+        invalid_response: str, repaired_response: str, journal: Any = None
+    ) -> bool:
         try:
             direct_value = json.loads(
                 invalid_response, object_pairs_hook=_reject_duplicate_json_keys
@@ -1952,16 +1954,8 @@ class OpenCLIWebChatModel(BaseChatModel):
             direct_value = None
         direct = _direct_composite(direct_value) if isinstance(direct_value, Mapping) else None
         if direct is not None:
-            expected = json.dumps(
-                {
-                    "type": "tool_call",
-                    "name": "write_file_and_record_worker_result",
-                    "arguments": direct[0],
-                },
-                separators=(",", ":"),
-                ensure_ascii=False,
-            )
-            return repaired_response == expected
+            expected = _canonicalize_direct_composite_response(invalid_response, journal)
+            return expected != invalid_response and repaired_response == expected
         try:
             repaired_envelope = json.loads(
                 repaired_response,
@@ -2098,7 +2092,9 @@ class OpenCLIWebChatModel(BaseChatModel):
         )
         if not self._is_complete_protocol_response(
             response
-        ) or not self._repair_matches_invalid_response(invalid_response, response):
+        ) or not self._repair_matches_invalid_response(
+            invalid_response, response, self._recovery_journal
+        ):
             raise OpenCLIWebModelError("OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID")
         return response
 

@@ -1094,7 +1094,11 @@ def test_worker_reconcile_repairs_malformed_write_before_checkpoint_resume(tmp_p
             OpenCLIWebChatModel._is_complete_protocol_response
         )
         _repair_matches_invalid_response = staticmethod(
-            OpenCLIWebChatModel._repair_matches_invalid_response
+            lambda invalid_response, repaired_response, _journal=None: (
+                OpenCLIWebChatModel._repair_matches_invalid_response(
+                    invalid_response, repaired_response, _journal
+                )
+            )
         )
 
         def _repair_protocol_response(self, response):
@@ -3640,6 +3644,230 @@ def test_worker_reconcile_terminalizes_direct_r25_composite_without_model_or_wri
     assert calls == {"model": 0, "graph": 0}
     assert (Path(request["workspace_path"]) / "a.py").read_text(encoding="utf-8") == "VALUE = 2\n"
     assert len(list(effects.root.glob("effect_*.json"))) == 1
+
+
+def test_worker_reconcile_flat_direct_response_with_checkpoint_has_one_local_effect(
+    tmp_path,
+):
+    """A flat r25 response is local projection, not an external protocol repair."""
+    from langchain_core.language_models.chat_models import BaseChatModel
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+
+    request = _v2_request(tmp_path)
+    request["operation"] = "worker_reconcile"
+    workspace = Path(request["workspace_path"])
+    state_root = Path(request["runtime_state_root"])
+    identity = RecoveryIdentity(
+        operation_id=request["operation_id"],
+        execution_material_sha256="b" * 64,
+        workspace=str(workspace.resolve()),
+        task_id="task-1",
+        unit_id="u1",
+        session_id="session-1",
+        allowed_paths=("a.py",),
+        provider_id=request["provider_id"],
+        model_id=request["model_id"],
+        worker_identity_sha256=request["worker_identity_sha256"],
+        transport_config_sha256=cli._sha256(cli._canonical_json(request["transport_config"])),
+        runtime_identity_sha256=cli._sha256(
+            cli._canonical_json({
+                "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
+                "deepagents": cli._deepagents_version(),
+                "checkpoint_namespace": "open-swe-repair-v1",
+            })
+        ),
+        composite_admitted=True,
+    )
+    journal = DurableOperationJournal(state_root, identity)
+    journal.prepare()
+    journal.ask_dispatching(turn_id="turn-1", prompt="repair", ordinal=0)
+    journal.conversation_bound("conversation-1")
+    raw_flat = json.dumps(
+        {
+            "type": "write_file_and_record_worker_result",
+            "file_path": "/a.py",
+            "content": "VALUE = 2\n",
+            "envelope": {
+                "schema": "external_intelligence_worker_result.v1",
+                "status": "IMPLEMENTATION_COMPLETED",
+                "task_id": "task-1",
+                "unit_id": "u1",
+                "summary": "repaired a.py",
+            },
+        },
+        separators=(",", ":"),
+    )
+    journal.response_recovered("turn-1", raw_flat)
+    cli._atomic_json(
+        cli._operation_path(request),
+        {
+            **cli._write_started(request, "worker"),
+            "status": "OPEN_SWE_OUTCOME_UNKNOWN",
+            "outcome_unknown": True,
+            "retry_safe": False,
+            "execution_material_sha256": identity.execution_material_sha256,
+            "session_id": identity.session_id,
+        },
+    )
+    checkpoint, _ = cli.create_checkpoint(
+        state_root, request["operation_id"], identity.checkpoint_namespace
+    )
+    checkpoint.conn.close()
+
+    class LocalRecoveryModel(BaseChatModel):
+        model_name: str = "advanced"
+        detail_calls: int = 0
+        repair_calls: int = 0
+        generate_calls: int = 0
+
+        @property
+        def _llm_type(self):
+            return "test-local-recovery-model"
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def configure_recovery_journal(self, value):
+            return None
+
+        def _detail_response(self, conversation_id, *, wait, turn_id):
+            self.detail_calls += 1
+            raise AssertionError("flat RESPONSE_RECOVERED must not call detail")
+
+        def _repair_protocol_response(self, response):
+            self.repair_calls += 1
+            raise AssertionError("flat r25 response must not call protocol repair")
+
+        _repair_matches_invalid_response = staticmethod(
+            OpenCLIWebChatModel._repair_matches_invalid_response
+        )
+
+        def _response_message(self, _response, _tools):
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_file_and_record_worker_result",
+                        "args": {
+                            "file_path": "a.py",
+                            "content": "VALUE = 2\n",
+                            "envelope": {"summary": "repaired a.py"},
+                        },
+                        "id": "call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+
+        def _generate(self, messages, **kwargs):
+            self.generate_calls += 1
+            if not any(
+                isinstance(message, ToolMessage)
+                and getattr(message, "name", None) == "write_file_and_record_worker_result"
+                for message in messages
+            ):
+                return ChatResult(
+                    generations=[
+                        ChatGeneration(
+                            message=AIMessage(
+                                content="",
+                                tool_calls=[
+                                    {
+                                        "name": "write_file_and_record_worker_result",
+                                        "args": {
+                                            "file_path": "a.py",
+                                            "content": "VALUE = 2\n",
+                                            "envelope": {"summary": "repaired a.py"},
+                                        },
+                                        "id": "call-1",
+                                        "type": "tool_call",
+                                    }
+                                ],
+                            )
+                        )
+                    ]
+                )
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="done"))])
+
+    model = LocalRecoveryModel()
+    graph_calls = 0
+
+    def graph_builder(
+        model,
+        root,
+        runtime,
+        allowed_paths,
+        key,
+        checkpointer=None,
+        effect_journal=None,
+        composite=False,
+    ):
+        nonlocal graph_calls
+        graph_calls += 1
+        graph = cli.build_repair_graph(
+            model,
+            root,
+            runtime,
+            allowed_paths,
+            key,
+            checkpointer=checkpointer,
+            effect_journal=effect_journal,
+            composite=composite,
+        )
+        original_invoke = graph.invoke
+
+        def invoke(*invoke_args, **invoke_kwargs):
+            output = original_invoke(*invoke_args, **invoke_kwargs)
+            return output
+
+        graph.invoke = invoke
+        return graph
+
+    result = cli._worker_reconcile(
+        request,
+        runtime_loader=cli._load_runtime,
+        model_builder=lambda *_args: model,
+        graph_builder=graph_builder,
+    )
+    assert result["status"] == "COMPLETED"
+    assert model.detail_calls == 0
+    assert model.repair_calls == 0
+    assert model.generate_calls == 1
+    assert graph_calls == 1
+    assert (workspace / "a.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    effects = list((state_root / "recovery" / "effects").glob("effect_*.json"))
+    assert len(effects) == 1
+    assert json.loads(effects[0].read_text(encoding="utf-8"))["status"] == "RESULT"
+    state = journal.read()
+    assert state["protocol_repair_origin"] == raw_flat
+    assert state["protocol_repair_origin_sha256"] == cli._sha256(raw_flat)
+    assert state["protocol_repair_status"] == "RECOVERED"
+    assert state["recovered_response"] == json.dumps(
+        {
+            "type": "tool_call",
+            "name": "write_file_and_record_worker_result",
+            "arguments": {
+                "file_path": "a.py",
+                "content": "VALUE = 2\n",
+                "envelope": {"summary": "repaired a.py"},
+            },
+        },
+        separators=(",", ":"),
+    )
+    assert state["response_sha256"] == cli._sha256(state["recovered_response"])
+
+    second = cli._worker_reconcile(
+        request,
+        runtime_loader=lambda: pytest.fail("second reconcile must not load runtime"),
+        model_builder=lambda *_args: pytest.fail("second reconcile must not build model"),
+        graph_builder=lambda *_args, **_kwargs: pytest.fail(
+            "second reconcile must not build graph"
+        ),
+    )
+    assert second == result
+    assert graph_calls == 1
+    assert len(list((state_root / "recovery" / "effects").glob("effect_*.json"))) == 1
 
 
 @pytest.mark.parametrize(

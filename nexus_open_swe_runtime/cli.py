@@ -2308,7 +2308,7 @@ def _worker_reconcile(
                 if (
                     not isinstance(origin_hash, str)
                     or _sha256(origin) != origin_hash
-                    or not model._repair_matches_invalid_response(origin, recovered)
+                    or not model._repair_matches_invalid_response(origin, recovered, journal)
                 ):
                     return cached
             elif (
