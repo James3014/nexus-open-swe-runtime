@@ -382,7 +382,7 @@ def test_worker_inconclusive_diagnosis_does_not_construct_repair_phase(tmp_path)
     def model_factory(*_args):
         nonlocal model_calls
         model_calls += 1
-        return object()
+        return SimpleNamespace(_conversation_id=None)
 
     def repair_factory(*_args):
         nonlocal repair_calls
@@ -1366,6 +1366,92 @@ def test_worker_admits_strict_v2_without_diagnosis_model_or_graph(tmp_path, monk
     assert model_calls == 1
     assert diagnosis_calls == 0
     assert repair.calls == 1
+
+
+def test_r17_prose_inspect_first_is_admitted_as_advisory(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path)
+    envelope = json.loads(Path(request["artifact_path"]).read_text(encoding="utf-8"))
+    envelope["inspect_first"] = [
+        "Read the Task Card and inspect the missing target before making the repair."
+    ]
+    raw = cli._canonical_json(envelope)
+    Path(request["artifact_path"]).write_text(raw, encoding="utf-8")
+    request["prompt"] = request["prompt"].replace(
+        next(line for line in request["prompt"].splitlines() if line.startswith("envelope_sha256=")),
+        f"envelope_sha256={cli._sha256(raw)}",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_git_output",
+        lambda _workspace, *args: {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
+        }[args],
+    )
+    repair = FakeGraph(cli.REPAIR_TOOLS, _record("record_worker_result", {"summary": "done"}))
+    assert cli._read_regular_artifact(Path(request["artifact_path"])) == raw.encode()
+    assert cli._parse_unique_json(raw.encode())["inspect_first"] == [
+        "Read the Task Card and inspect the missing target before making the repair."
+    ]
+    admission = cli._semantic_v2_admission(
+        request,
+        Path(request["workspace_path"]).resolve(),
+        Path(request["artifact_path"]),
+        request["prompt"],
+        ("a.py",),
+        raw.encode(),
+    )
+    assert admission.decision == cli.ADMIT, admission
+    model_calls = 0
+
+    def model_factory(*_args):
+        nonlocal model_calls
+        model_calls += 1
+        return SimpleNamespace(_conversation_id=None)
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=model_factory,
+        diagnosis_factory=lambda *_args: pytest.fail("r17 admission must skip diagnosis"),
+        repair_factory=lambda *_args: repair,
+    )
+    assert result["status"] == "COMPLETED"
+    assert result["repair_admitted"] is True
+    assert model_calls == 1
+    assert repair.calls == 1
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda _r, e: e["evidence_refs"].__setitem__(0, "source_absence:a.py@" + "a" * 16),
+        lambda _r, e: e["evidence_refs"].__setitem__(1, "source_absence:b.py@" + "b" * 16),
+        lambda _r, e: e["scope_signal"].update(read_only_authorities=[]),
+    ],
+)
+def test_r17_strict_evidence_and_authority_negatives_reject_without_calls(tmp_path, monkeypatch, mutate):
+    request = _v2_matrix_request(tmp_path, mutate)
+    monkeypatch.setattr(
+        cli,
+        "_git_output",
+        lambda _workspace, *args: {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
+        }[args],
+    )
+    calls = {"model": 0, "diagnosis": 0, "repair": 0}
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: calls.__setitem__("model", calls["model"] + 1),
+        diagnosis_factory=lambda *_args: calls.__setitem__("diagnosis", calls["diagnosis"] + 1),
+        repair_factory=lambda *_args: calls.__setitem__("repair", calls["repair"] + 1),
+    )
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert calls == {"model": 0, "diagnosis": 0, "repair": 0}
 
 
 def test_worker_admit_r16_opencli_repair_uses_new_without_conversation(tmp_path, monkeypatch):
