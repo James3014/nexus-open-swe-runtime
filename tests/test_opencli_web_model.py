@@ -2285,6 +2285,7 @@ def test_opencli_web_model_r18_poll_timeout_caps_remaining_deadline(
 ):
     detail_waits: list[str] = []
     subprocess_timeouts: list[float] = []
+    cli_timeouts: list[str] = []
     latest_prompt = ""
     late_now = 0.0
 
@@ -2303,6 +2304,7 @@ def test_opencli_web_model_r18_poll_timeout_caps_remaining_deadline(
         if args[1:3] == ["chatgpt", "detail"]:
             wait = args[args.index("--wait") + 1]
             detail_waits.append(wait)
+            cli_timeouts.append(args[args.index("--timeout") + 1])
             if wait == "true":
                 return SimpleNamespace(
                     returncode=1,
@@ -2310,7 +2312,7 @@ def test_opencli_web_model_r18_poll_timeout_caps_remaining_deadline(
                     stderr="Browser exec command timed out; it may still complete in the browser.",
                 )
             subprocess_timeouts.append(kwargs["timeout"])
-            late_now += 4.0
+            late_now += 4.25
             return SimpleNamespace(
                 returncode=0,
                 stdout=json.dumps([
@@ -2330,9 +2332,10 @@ def test_opencli_web_model_r18_poll_timeout_caps_remaining_deadline(
         model.invoke("deadline cap")
 
     assert detail_waits == ["true", "false", "false", "false", "false"]
-    assert subprocess_timeouts == [15.0, 11.0, 7.0, 3.0]
-    assert all(timeout <= remaining for timeout, remaining in zip(subprocess_timeouts, (15.0, 11.0, 7.0, 3.0)))
-    assert late_now == 16.0
+    assert subprocess_timeouts == [15.0, 10.75, 6.5, 2.25]
+    assert cli_timeouts == ["120", "15", "11", "7", "3"]
+    assert all(timeout <= remaining for timeout, remaining in zip(subprocess_timeouts, (15.0, 10.75, 6.5, 2.25)))
+    assert late_now == 17.0
 
 
 def test_opencli_web_model_r18_durable_lock_covers_late_polling(
