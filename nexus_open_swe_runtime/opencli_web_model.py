@@ -945,6 +945,9 @@ class OpenCLIWebChatModel(BaseChatModel):
                     if str(poll_error) != "OPENCLI_WEB_TIMEOUT":
                         raise
                     last_error = poll_error
+            remaining = deadline - self._late_clock()
+            if remaining > 0:
+                self._sleep(remaining)
             raise OpenCLIWebModelError("OPENCLI_WEB_TIMEOUT") from last_error
 
     def _detail_response_once(
@@ -958,7 +961,11 @@ class OpenCLIWebChatModel(BaseChatModel):
         readback_timeout = (
             max(self.timeout_seconds, 30)
             if wait
-            else (timeout_seconds if timeout_seconds is not None else self.timeout_seconds)
+            else (
+                math.ceil(timeout_seconds)
+                if timeout_seconds is not None
+                else self.timeout_seconds
+            )
         )
         detail = self._run([
             self.executable,
