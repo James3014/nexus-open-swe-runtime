@@ -760,7 +760,14 @@ def test_worker_reconcile_direct_restart_trace_has_one_winner_and_zero_call_lose
             self.effect_journal = effect_journal
 
         def get_graph(self):
-            return type("G", (), {"nodes": {"tools": type("T", (), {"data": type("D", (), {"tools_by_name": {}})()})()}})()
+            from langchain_core.tools import tool
+
+            @tool
+            def write_file(file_path: str, content: str) -> str:
+                """Write one file."""
+                return file_path + content
+
+            return type("G", (), {"nodes": {"tools": type("T", (), {"data": type("D", (), {"tools_by_name": {"write_file": write_file}})()})()}})()
 
         def update_state(self, config, values, *, as_node):
             counters["update"] += 1
@@ -791,6 +798,244 @@ def test_worker_reconcile_direct_restart_trace_has_one_winner_and_zero_call_lose
     assert first["status"] == second["status"] == "COMPLETED"
     assert counters == {"detail": 1, "update": 1, "invoke": 1, "effect": 1, "continuation": 1}
     assert target.read_text(encoding="utf-8") == "done\n"
+
+
+def test_worker_reconcile_repairs_malformed_write_before_checkpoint_resume(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "a.py"
+    target.write_text("old\n", encoding="utf-8")
+    state_root = tmp_path / "state"
+    operation_id = "q" * 64
+    runtime_identity = cli._sha256(cli._canonical_json({
+        "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
+        "deepagents": cli._deepagents_version(),
+        "checkpoint_namespace": "open-swe-repair-v1",
+    }))
+    identity = RecoveryIdentity(
+        operation_id=operation_id, execution_material_sha256="b" * 64,
+        workspace=str(workspace.resolve()), task_id="task-1", unit_id="unit-1",
+        session_id="session-1", allowed_paths=("a.py",), provider_id="google_genai",
+        model_id="test-model", worker_identity_sha256="c" * 64,
+        transport_config_sha256=cli._sha256("{}"), runtime_identity_sha256=runtime_identity,
+    )
+    journal = DurableOperationJournal(state_root, identity)
+    journal.prepare()
+    journal.ask_dispatching(turn_id="turn-1", prompt="repair", ordinal=0)
+    journal.conversation_bound("conversation-1")
+    cli._atomic_json(cli._operation_path({"runtime_state_root": str(state_root), "operation_id": operation_id}), {
+        "schema": cli.RESULT_SCHEMA, "kind": "worker", "status": "OPEN_SWE_OUTCOME_UNKNOWN",
+        "operation_id": operation_id, "directory": str(workspace.resolve()),
+        "provider_id": "google_genai", "model_id": "test-model",
+        "worker_identity_sha256": "c" * 64, "process_started": True,
+        "outcome_unknown": True, "retry_safe": False,
+    })
+    checkpoint_file = cli.checkpoint_path(state_root, operation_id)
+    checkpoint_file.write_bytes(b"checkpoint")
+    checkpoint_file.chmod(0o600)
+    monkeypatch.setattr(cli, "validate_checkpoint", lambda _path: True)
+    monkeypatch.setattr(cli, "create_checkpoint", lambda *_args: (object(), "open-swe-repair-v1"))
+    request = {
+        "schema": cli.REQUEST_SCHEMA, "operation": "worker_reconcile", "operation_id": operation_id,
+        "runtime_state_root": str(state_root), "workspace_path": str(workspace),
+        "provider_id": "google_genai", "model_id": "test-model",
+        "worker_identity_sha256": "c" * 64, "transport_config": {},
+    }
+    malformed = (
+        '{"type":"tool_call","name":"write_file","arguments":'
+        '{"file_path":"a.py","content":"VALUE = ' + '"2"' + '\\n"}}'
+    )
+    repaired = (
+        '{"type":"tool_call","name":"write_file","arguments":'
+        '{"file_path":"a.py","content":"VALUE = \\"2\\"\\n"}}'
+    )
+    calls = {"repair": 0, "update": 0, "invoke": 0, "write": 0}
+
+    class Model:
+        _conversation_id = "conversation-1"
+
+        def configure_recovery_journal(self, value):
+            self.journal = value
+
+        def _detail_response(self, *_args, **_kwargs):
+            return malformed
+
+        def _refresh_protocol_response(self, response, *, turn_id):
+            return response
+
+        _is_complete_protocol_response = staticmethod(OpenCLIWebChatModel._is_complete_protocol_response)
+        _repair_matches_invalid_response = staticmethod(OpenCLIWebChatModel._repair_matches_invalid_response)
+
+        def _repair_protocol_response(self, response):
+            calls["repair"] += 1
+            turn_id = "turn_repair_once"
+            self.journal.protocol_repair_started(
+                origin=response, origin_sha256=cli._sha256(response), turn_id=turn_id
+            )
+            self.journal.ask_dispatching(turn_id=turn_id, prompt="repair", ordinal=1)
+            self.journal.conversation_bound("conversation-repair")
+            return repaired
+
+        def _response_message(self, *_args):
+            from langchain_core.messages import AIMessage
+            return AIMessage(content="", tool_calls=[{
+                "name": "write_file", "args": {"file_path": "a.py", "content": 'VALUE = "2"\n'},
+                "id": "call-1", "type": "tool_call",
+            }])
+
+    class Graph:
+        def __init__(self, effect_journal):
+            self.effect_journal = effect_journal
+
+        def get_graph(self):
+            return type("G", (), {"nodes": {"tools": type("T", (), {"data": type("D", (), {"tools_by_name": {}})()})()}})()
+
+        def update_state(self, *_args, **_kwargs):
+            calls["update"] += 1
+
+        def invoke(self, *_args, **_kwargs):
+            calls["invoke"] += 1
+            class Delegate:
+                def write(_self, file_path, content):
+                    calls["write"] += 1
+                    target.write_text(content, encoding="utf-8")
+
+            cli.ScopedRepairBackend(
+                Delegate(), workspace, ("a.py",), self.effect_journal
+            ).write("a.py", 'VALUE = "2"\n')
+            return _record("record_worker_result", {"summary": "recovered"})
+
+    result = cli._worker_reconcile(
+        request, runtime_loader=lambda: {}, model_builder=lambda *_args: Model(),
+        graph_builder=lambda *_args: Graph(_args[-1]),
+    )
+    assert result["status"] == "COMPLETED"
+    assert calls == {"repair": 1, "update": 1, "invoke": 1, "write": 0}
+    assert target.read_text(encoding="utf-8") == 'VALUE = "2"\n'
+    effects = list((state_root / "recovery" / "effects").glob("*.json"))
+    assert len(effects) == 1
+    assert json.loads(effects[0].read_text(encoding="utf-8"))["status"] == "RESULT"
+
+
+'''REMOVED_PENDING_TEST'''
+def test_worker_reconcile_pending_repair_uses_history_once_then_same_conversation(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "a.py").write_text("old\n", encoding="utf-8")
+    state_root = tmp_path / "state"
+    operation_id = "h" * 64
+    runtime_identity = cli._sha256(cli._canonical_json({
+        "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
+        "deepagents": cli._deepagents_version(),
+        "checkpoint_namespace": "open-swe-repair-v1",
+    }))
+    identity = RecoveryIdentity(
+        operation_id=operation_id, execution_material_sha256="b" * 64,
+        workspace=str(workspace.resolve()), task_id="task-1", unit_id="unit-1",
+        session_id="session-1", allowed_paths=("a.py",), provider_id="opencli_chatgpt",
+        model_id="balanced", worker_identity_sha256="c" * 64,
+        transport_config_sha256=cli._sha256("{}"), runtime_identity_sha256=runtime_identity,
+    )
+    journal = DurableOperationJournal(state_root, identity)
+    journal.prepare()
+    journal.ask_dispatching(turn_id="turn_repair_1", prompt="repair", ordinal=1)
+    journal.conversation_bound("conversation-old")
+    origin = (
+        '{"type":"tool_call","name":"write_file","arguments":'
+        '{"file_path":"a.py","content":"new ' + '"v"' + '"}}'
+    )
+    journal.protocol_repair_started(
+        origin=origin,
+        origin_sha256="x" * 64,
+        turn_id="turn_repair_1",
+    )
+    # Preserve the old conversation as the pre-repair binding and dispatch state.
+    journal._transition(
+        protocol_repair_origin_sha256=cli._sha256(
+            origin
+        ),
+        turn_id="turn_repair_1",
+        status="ASK_DISPATCHING",
+    )
+    cli._atomic_json(cli._operation_path({"runtime_state_root": str(state_root), "operation_id": operation_id}), {
+        "schema": cli.RESULT_SCHEMA, "kind": "worker", "status": "OPEN_SWE_OUTCOME_UNKNOWN",
+        "operation_id": operation_id, "directory": str(workspace.resolve()),
+        "provider_id": "opencli_chatgpt", "model_id": "balanced",
+        "worker_identity_sha256": "c" * 64, "process_started": True,
+        "outcome_unknown": True, "retry_safe": False,
+    })
+    checkpoint_file = cli.checkpoint_path(state_root, operation_id)
+    checkpoint_file.write_bytes(b"checkpoint")
+    checkpoint_file.chmod(0o600)
+    monkeypatch.setattr(cli, "validate_checkpoint", lambda _path: True)
+    monkeypatch.setattr(cli, "create_checkpoint", lambda *_args: (object(), "open-swe-repair-v1"))
+    request = {
+        "schema": cli.REQUEST_SCHEMA, "operation": "worker_reconcile", "operation_id": operation_id,
+        "runtime_state_root": str(state_root), "workspace_path": str(workspace),
+        "provider_id": "opencli_chatgpt", "model_id": "balanced",
+        "worker_identity_sha256": "c" * 64, "transport_config": {},
+    }
+    repaired = '{"type":"tool_call","name":"write_file","arguments":{"file_path":"a.py","content":"new \\"v\\""}}'
+    counters = {"history": 0, "detail": 0, "repair": 0, "ask": 0}
+    latest_prompt = json.dumps({"turn_id": "turn_repair_1"})
+
+    model = OpenCLIWebChatModel(executable="/opt/opencli", intelligence_level="balanced")
+    from langchain_core.messages import AIMessage
+    model._response_message = lambda *_args: AIMessage(
+        content="", tool_calls=[{"name": "write_file", "args": {"file_path": "a.py", "content": 'new "v"'}, "id": "call-1", "type": "tool_call"}]
+    )
+
+    class Graph:
+        def __init__(self, model):
+            self.model = model
+
+        def get_graph(self):
+            from langchain_core.tools import tool
+
+            @tool
+            def write_file(file_path: str, content: str) -> str:
+                """Write one file."""
+                return file_path + content
+
+            return type("G", (), {"nodes": {"tools": type("T", (), {"data": type("D", (), {"tools_by_name": {"write_file": write_file}})()})()}})()
+
+        def update_state(self, *_args, **_kwargs):
+            pass
+
+        def invoke(self, *_args, **_kwargs):
+            self.model._send_and_reconcile('{"turn_id":"continuation"}')
+            return _record("record_worker_result", {"summary": "terminal"})
+
+    def fake_run(argv, **_kwargs):
+        nonlocal latest_prompt
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "history"]:
+            counters["history"] += 1
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{"Id": "conversation-old"}, {"Id": "conversation-repair"}]), stderr="")
+        if args[1:3] == ["chatgpt", "detail"]:
+            counters["detail"] += 1
+            return SimpleNamespace(returncode=0, stdout=json.dumps([
+                {"Role": "User", "Text": latest_prompt, "Generating": False},
+                {"Role": "Assistant", "Text": repaired, "Generating": False},
+            ]), stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            counters["ask"] += 1
+            latest_prompt = args[3]
+            assert "--conversation" in args
+            assert args[args.index("--conversation") + 1] == "conversation-repair"
+            assert "--new" not in args
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{"conversationId": "conversation-repair", "response": ""}]), stderr="")
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    result = cli._worker_reconcile(
+        request, runtime_loader=lambda: {}, model_builder=lambda *_args: model,
+        graph_builder=lambda model, *_args: Graph(model),
+    )
+    assert result["status"] == "COMPLETED"
+    assert counters == {"history": 1, "detail": 3, "repair": 0, "ask": 1}
 
 
 def test_worker_run_operation_fence_allows_one_initial_external_execution(tmp_path):

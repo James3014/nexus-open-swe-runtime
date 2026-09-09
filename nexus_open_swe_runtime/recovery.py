@@ -216,6 +216,33 @@ class DurableOperationJournal:
             recovered_response=response,
         )
 
+    def protocol_repair_started(
+        self, *, origin: str, origin_sha256: str, turn_id: str
+    ) -> dict[str, Any]:
+        """Persist the repair origin before dispatching its external turn."""
+        if not origin or not origin_sha256 or not turn_id:
+            raise RuntimeError("RECOVERY_PROTOCOL_REPAIR_INVALID")
+        state = self.read()
+        return self._transition(
+            protocol_repair_origin=origin,
+            protocol_repair_origin_sha256=origin_sha256,
+            protocol_repair_turn_id=turn_id,
+            protocol_repair_original_conversation_id=state.get("conversation_id", ""),
+            protocol_repair_status="DISPATCHING",
+        )
+
+    def protocol_repair_recovered(self, response: str) -> dict[str, Any]:
+        state = self.read()
+        origin = state.get("protocol_repair_origin")
+        expected = state.get("protocol_repair_origin_sha256")
+        if not isinstance(origin, str) or not isinstance(expected, str) or _sha(origin) != expected:
+            raise RuntimeError("RECOVERY_PROTOCOL_REPAIR_ORIGIN_INVALID")
+        return self._transition(
+            protocol_repair_status="RECOVERED",
+            protocol_repair_response_sha256=_sha(response),
+            protocol_repair_response=response,
+        )
+
     def checkpoint_bound(self, checkpoint_id: str) -> dict[str, Any]:
         return self._transition(checkpoint_id=checkpoint_id, checkpoint_status="BOUND")
 
