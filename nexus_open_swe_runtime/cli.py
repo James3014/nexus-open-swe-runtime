@@ -716,8 +716,58 @@ def _persisted_composite_worker_result(
     except (OSError, ValueError, RuntimeError):
         return None
     turn_id = operation_state.get("turn_id")
-    if not isinstance(turn_id, str) or not turn_id:
+    recovered_response = operation_state.get("recovered_response")
+    response_sha256 = operation_state.get("response_sha256")
+    if (
+        not isinstance(turn_id, str)
+        or not turn_id
+        or not isinstance(recovered_response, str)
+        or not isinstance(response_sha256, str)
+        or _sha256(recovered_response) != response_sha256
+    ):
         return None
+    try:
+        recovered_envelope = json.loads(
+            recovered_response, object_pairs_hook=_reject_duplicate_json_keys
+        )
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if (
+        not isinstance(recovered_envelope, Mapping)
+        or set(recovered_envelope) != {"type", "name", "arguments"}
+        or recovered_envelope.get("type") != "tool_call"
+        or recovered_envelope.get("name") != "write_file_and_record_worker_result"
+        or not isinstance(recovered_envelope.get("arguments"), Mapping)
+    ):
+        return None
+    recovered_arguments = recovered_envelope["arguments"]
+    if set(recovered_arguments) != {"file_path", "content", "envelope"}:
+        return None
+    recovered_envelope_args = recovered_arguments.get("envelope")
+    if (
+        not isinstance(recovered_envelope_args, Mapping)
+        or set(recovered_envelope_args) != {"summary"}
+        or not isinstance(recovered_arguments.get("file_path"), str)
+        or not isinstance(recovered_arguments.get("content"), str)
+        or not isinstance(recovered_envelope_args.get("summary"), str)
+    ):
+        return None
+    try:
+        recovered_file_path = _safe_relative_path(recovered_arguments["file_path"])
+    except RuntimeErrorBounded:
+        return None
+    if recovered_file_path != allowed_path:
+        return None
+    recovered_arguments = {
+        "file_path": recovered_file_path,
+        "content": recovered_arguments["content"],
+        "envelope": {"summary": recovered_envelope_args["summary"]},
+    }
+    recovered_call_id = "opencli_" + _sha256(_canonical_json({
+        "name": "write_file_and_record_worker_result",
+        "arguments": recovered_arguments,
+        "raw": recovered_response,
+    }))[:24]
     # Rebind the effect journal to the operation's durable turn.  A fresh
     # process otherwise has no in-memory turn binding and could accidentally
     # accept an effect from a different turn.
@@ -752,14 +802,11 @@ def _persisted_composite_worker_result(
             or value.get("operation_id") != operation_id
             or value.get("turn_id") != turn_id
             or value.get("tool_name") != tool_name
+            or value.get("tool_call_id") != recovered_call_id
             or not isinstance(file_path, str)
             or not isinstance(content, str)
             or not isinstance(summary, str)
-            or arguments != {
-                "file_path": allowed_path,
-                "content": content,
-                "envelope": {"summary": summary},
-            }
+            or arguments != recovered_arguments
             or file_path != allowed_path
             or value.get("path") != str(expected_path)
             or value.get("postimage") != content
@@ -772,9 +819,9 @@ def _persisted_composite_worker_result(
         expected_effect_id = "effect_" + _sha256(_canonical_json({
             "operation_id": operation_id,
             "turn_id": turn_id,
-            "tool_call_id": value.get("tool_call_id"),
+            "tool_call_id": recovered_call_id,
             "tool_name": tool_name,
-            "arguments": dict(arguments),
+            "arguments": recovered_arguments,
         }))
         if value.get("effect_id") != expected_effect_id:
             continue
