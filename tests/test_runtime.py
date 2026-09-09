@@ -2893,6 +2893,119 @@ def _v2_matrix_request(tmp_path: Path, mutate, *, refresh_hash: bool = True) -> 
     return request
 
 
+def _admission_git(monkeypatch):
+    monkeypatch.setattr(
+        cli,
+        "_git_output",
+        lambda _workspace, *args: {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
+        }[args],
+    )
+
+
+def test_v2_positive_admission_has_no_rejection_reason(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path)
+    _admission_git(monkeypatch)
+    admission = cli._semantic_v2_admission(
+        request,
+        Path(request["workspace_path"]),
+        Path(request["artifact_path"]),
+        request["prompt"],
+        ("a.py",),
+    )
+    assert admission.decision == cli.ADMIT
+    assert admission.reason_code is None
+
+
+@pytest.mark.parametrize(
+    "name,mutate,expected,refresh_hash",
+    [
+        (
+            "schema",
+            lambda _r, e: e.__setitem__("schema", "external_execution_envelope.v3"),
+            "schema",
+            True,
+        ),
+        ("hash", lambda _r, e: e.__setitem__("objective", "changed"), "envelope_hash", True),
+        ("base", lambda _r, e: e["binding"].update(main_sha="a" * 40), "base_binding", True),
+        (
+            "source",
+            lambda _r, e: e["evidence_refs"].__setitem__(1, "source_absence:a.py@bad"),
+            "source_evidence",
+            True,
+        ),
+    ],
+)
+def test_v2_rejection_reason_is_first_fail_closed_predicate(
+    tmp_path, monkeypatch, name, mutate, expected, refresh_hash
+):
+    request = _v2_matrix_request(tmp_path, mutate, refresh_hash=refresh_hash)
+    if name == "hash":
+        request["prompt"] = request["prompt"].replace(
+            cli._prompt_field(request["prompt"], "envelope_sha256"), "0" * 64
+        )
+    _admission_git(monkeypatch)
+    admission = cli._semantic_v2_admission(
+        request,
+        Path(request["workspace_path"]),
+        Path(request["artifact_path"]),
+        request["prompt"],
+        ("a.py",),
+    )
+    assert admission.decision == cli.REJECT
+    assert admission.reason_code == expected
+
+
+def test_worker_persists_pre_journal_semantic_reason_without_model_or_journal(
+    tmp_path, monkeypatch
+):
+    request = _v2_matrix_request(
+        tmp_path,
+        lambda _r, e: e["binding"].update(main_sha="a" * 40),
+    )
+    _admission_git(monkeypatch)
+    calls = {"model": 0, "diagnosis": 0, "repair": 0}
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: calls.__setitem__("model", calls["model"] + 1),
+        diagnosis_factory=lambda *_args: calls.__setitem__("diagnosis", calls["diagnosis"] + 1),
+        repair_factory=lambda *_args: calls.__setitem__("repair", calls["repair"] + 1),
+    )
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["failure_phase"] == "SEMANTIC_ADMISSION"
+    assert result["error_code"] == "OPEN_SWE_SEMANTIC_V2_REJECTED_BASE_BINDING"
+    assert calls == {"model": 0, "diagnosis": 0, "repair": 0}
+    assert not (Path(request["runtime_state_root"]) / "recovery" / "operations").exists()
+
+
+def test_worker_sanitizes_unknown_bounded_exception(tmp_path, monkeypatch):
+    request = _worker_request(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "_worker_context",
+        lambda *_args: (_ for _ in ()).throw(cli.RuntimeErrorBounded("secret=/tmp/private/prompt")),
+    )
+    result = cli._worker_run(request, runtime_loader=_runtime)
+    assert result["failure_phase"] == "WORKER_CONTEXT"
+    assert result["error_code"] == "OPEN_SWE_BOUNDED_FAILURE_UNCLASSIFIED"
+    assert "secret" not in json.dumps(result)
+
+
+def test_worker_keeps_non_bounded_exception_class_only(tmp_path):
+    request = _worker_request(tmp_path)
+
+    def runtime_loader():
+        raise ValueError("secret=/tmp/private/prompt")
+
+    result = cli._worker_run(request, runtime_loader=runtime_loader)
+    assert result["error"] == "ValueError"
+    assert "error_code" not in result
+    assert "secret" not in json.dumps(result)
+
+
 def _mutate_card(request: dict, envelope: dict, old: str, new: str) -> None:
     card = Path(request["workspace_path"]) / envelope["binding"]["task_card_ref"]
     content = card.read_text(encoding="utf-8").replace(old, new, 1)
