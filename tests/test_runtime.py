@@ -2392,6 +2392,34 @@ def test_worker_admits_strict_v2_without_diagnosis_model_or_graph(tmp_path, monk
     assert repair.calls == 1
 
 
+def test_r24_issue_metadata_authority_is_admitted(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path)
+    envelope = json.loads(Path(request["artifact_path"]).read_text(encoding="utf-8"))
+    envelope["binding"].update(item_id="853", item_type="issue")
+    envelope["scope_signal"]["read_only_authorities"].append("GitHub Issue 853 binding metadata")
+    envelope["evidence_refs"].append(
+        "github_issue:github://James3014/Nexus-new/issues/853@" + "e" * 16
+    )
+    _write_v2_mutation(request, envelope)
+    monkeypatch.setattr(
+        cli,
+        "_git_output",
+        lambda _workspace, *args: {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
+        }[args],
+    )
+    admission = cli._semantic_v2_admission(
+        request,
+        Path(request["workspace_path"]),
+        Path(request["artifact_path"]),
+        request["prompt"],
+        ("a.py",),
+    )
+    assert admission.decision == cli.ADMIT, admission
+
+
 @pytest.mark.parametrize("variant", ["empty", "prose", "exact_refs"])
 def test_r17_prose_inspect_first_is_admitted_as_advisory(tmp_path, monkeypatch, variant):
     request = _v2_request(tmp_path)
@@ -2850,6 +2878,99 @@ def _mutate_card(request: dict, envelope: dict, old: str, new: str) -> None:
         ("scope_paths", lambda _r, e: e["scope_signal"].update(required_test_edit_paths=["b.py"])),
         ("scope_max_files", lambda _r, e: e["scope_signal"].update(max_files=2)),
         ("scope_read_only", lambda _r, e: e["scope_signal"].update(read_only_authorities=[])),
+        (
+            "scope_extra_path",
+            lambda _r, e: e["scope_signal"]["read_only_authorities"].append("tasks/other.md"),
+        ),
+        (
+            "scope_marker_only",
+            lambda _r, e: e["scope_signal"]["read_only_authorities"].append(
+                "GitHub Issue 853 binding metadata"
+            ),
+        ),
+        (
+            "scope_mismatched_issue_evidence",
+            lambda _r, e: (
+                e["binding"].update(item_id="853", item_type="issue"),
+                e["scope_signal"]["read_only_authorities"].append(
+                    "GitHub Issue 853 binding metadata"
+                ),
+                e["evidence_refs"].append(
+                    "github_issue:github://James3014/Nexus-new/issues/854@" + "e" * 16
+                ),
+            ),
+        ),
+        (
+            "scope_mismatched_issue_repository",
+            lambda _r, e: (
+                e["binding"].update(item_id="853", item_type="issue"),
+                e["scope_signal"]["read_only_authorities"].append(
+                    "GitHub Issue 853 binding metadata"
+                ),
+                e["evidence_refs"].append(
+                    "github_issue:github://other/repo/issues/853@" + "e" * 16
+                ),
+            ),
+        ),
+        (
+            "scope_non_issue_item_type",
+            lambda _r, e: (
+                e["binding"].update(item_id="853", item_type="task"),
+                e["scope_signal"]["read_only_authorities"].append(
+                    "GitHub Issue 853 binding metadata"
+                ),
+                e["evidence_refs"].append(
+                    "github_issue:github://James3014/Nexus-new/issues/853@" + "e" * 16
+                ),
+            ),
+        ),
+        (
+            "scope_zero_issue",
+            lambda _r, e: (
+                e["binding"].update(item_id="0", item_type="issue"),
+                e["scope_signal"]["read_only_authorities"].append(
+                    "GitHub Issue 0 binding metadata"
+                ),
+                e["evidence_refs"].append(
+                    "github_issue:github://James3014/Nexus-new/issues/0@" + "e" * 16
+                ),
+            ),
+        ),
+        (
+            "scope_leading_zero_issue",
+            lambda _r, e: (
+                e["binding"].update(item_id="0853", item_type="issue"),
+                e["scope_signal"]["read_only_authorities"].append(
+                    "GitHub Issue 0853 binding metadata"
+                ),
+                e["evidence_refs"].append(
+                    "github_issue:github://James3014/Nexus-new/issues/0853@" + "e" * 16
+                ),
+            ),
+        ),
+        (
+            "scope_broad_authority",
+            lambda _r, e: e["scope_signal"]["read_only_authorities"].append("repository contents"),
+        ),
+        (
+            "scope_path_like_marker",
+            lambda _r, e: e["scope_signal"]["read_only_authorities"].append(
+                "GitHub Issue 853 binding metadata/tasks/other.md"
+            ),
+        ),
+        (
+            "scope_duplicate_marker",
+            lambda _r, e: (
+                e["binding"].update(item_id="853", item_type="issue"),
+                e["scope_signal"]["read_only_authorities"].extend([
+                    "GitHub Issue 853 binding metadata",
+                    "GitHub Issue 853 binding metadata",
+                ]),
+                e["evidence_refs"].append(
+                    "github_issue:github://James3014/Nexus-new/issues/853@" + "e" * 16
+                ),
+            ),
+        ),
         (
             "scope_production",
             lambda _r, e: e["scope_signal"].update(production_edit_paths=["a.py"]),
