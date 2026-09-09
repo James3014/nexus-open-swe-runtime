@@ -116,7 +116,7 @@ def test_effect_journal_accepts_exact_already_applied_write(tmp_path: Path):
     assert journal.read(effect.effect_id)["status"] == "RESULT"
 
 
-def test_effect_journal_fails_closed_on_unresolved_edit_intent(tmp_path: Path):
+def test_effect_journal_recovers_edit_from_preimage(tmp_path: Path):
     target = tmp_path / "a.py"
     target.write_text("old\n", encoding="utf-8")
     journal = DurableEffectJournal(tmp_path / "state", _identity(tmp_path))
@@ -129,8 +129,61 @@ def test_effect_journal_fails_closed_on_unresolved_edit_intent(tmp_path: Path):
         preimage="old\n",
         postimage="new\n",
     )
-    with pytest.raises(RuntimeError, match="UNRESOLVED"):
+    assert journal.recover_write(effect) == "RESULT"
+    assert target.read_text(encoding="utf-8") == "new\n"
+    assert journal.read(effect.effect_id)["status"] == "RESULT"
+
+
+def test_effect_journal_accepts_edit_postimage_and_rejects_divergent(tmp_path: Path):
+    journal = DurableEffectJournal(tmp_path / "state", _identity(tmp_path))
+    postimage = tmp_path / "post.py"
+    postimage.write_text("new\n", encoding="utf-8")
+    effect = journal.intent(
+        turn_id="turn_1",
+        tool_call_id="call_post",
+        tool_name="edit_file",
+        arguments={"file_path": "post.py"},
+        path=postimage,
+        preimage="old\n",
+        postimage="new\n",
+    )
+    assert journal.recover_write(effect) == "RESULT"
+
+    divergent = tmp_path / "divergent.py"
+    divergent.write_text("other\n", encoding="utf-8")
+    effect = journal.intent(
+        turn_id="turn_1",
+        tool_call_id="call_divergent",
+        tool_name="edit_file",
+        arguments={"file_path": "divergent.py"},
+        path=divergent,
+        preimage="old\n",
+        postimage="new\n",
+    )
+    with pytest.raises(RuntimeError, match="PREIMAGE_MISMATCH"):
         journal.recover_write(effect)
+    assert divergent.read_text(encoding="utf-8") == "other\n"
+
+
+def test_scoped_backend_replays_edit_result_sync_and_async(tmp_path: Path):
+    import asyncio
+
+    target = tmp_path / "a.py"
+    target.write_text("old\n", encoding="utf-8")
+    journal = DurableEffectJournal(tmp_path / "state", _identity(tmp_path))
+    journal.bind_turn("turn_9", "call_9")
+    backend = cli.ScopedRepairBackend(object(), tmp_path, ("a.py",), journal)
+    result = backend.edit("a.py", "old\n", "new\n")
+    assert result.path == "a.py"
+    assert result.occurrences == 1
+    assert target.read_text(encoding="utf-8") == "new\n"
+
+    target.write_text("new\n", encoding="utf-8")
+    journal.bind_turn("turn_10", "call_10")
+    result = asyncio.run(backend.aedit("a.py", "new\n", "final\n"))
+    assert result.path == "a.py"
+    assert result.occurrences == 1
+    assert target.read_text(encoding="utf-8") == "final\n"
 
 
 def test_scoped_backend_records_write_effect_and_reads_operation_turn(tmp_path: Path):
