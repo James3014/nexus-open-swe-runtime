@@ -74,6 +74,77 @@ def _direct_terminal_recorder(envelope: Mapping[str, Any]) -> tuple[str, dict[st
     return name, {"envelope": dict(payload)}
 
 
+def _direct_composite(
+    envelope: Mapping[str, Any],
+) -> tuple[dict[str, Any], Mapping[str, Any]] | None:
+    if set(envelope) != {"type", "file_path", "content", "envelope"}:
+        return None
+    if envelope.get("type") != "write_file_and_record_worker_result":
+        return None
+    payload = envelope.get("envelope")
+    if (
+        not isinstance(envelope.get("file_path"), str)
+        or not isinstance(envelope.get("content"), str)
+        or not isinstance(payload, Mapping)
+        or set(payload) != {"schema", "status", "summary", "task_id", "unit_id"}
+        or payload.get("schema") != "external_intelligence_worker_result.v1"
+        or payload.get("status") != "IMPLEMENTATION_COMPLETED"
+        or not isinstance(payload.get("task_id"), str)
+        or not payload.get("task_id")
+        or not isinstance(payload.get("unit_id"), str)
+        or not payload.get("unit_id")
+        or not isinstance(payload.get("summary"), str)
+        or not payload.get("summary")
+    ):
+        return None
+    return {
+        "file_path": envelope["file_path"],
+        "content": envelope["content"],
+        "envelope": {"summary": payload["summary"]},
+    }, payload
+
+
+def _canonicalize_direct_composite_response(response: str, journal: Any = None) -> str:
+    try:
+        envelope = json.loads(response, object_pairs_hook=_reject_duplicate_json_keys)
+    except (json.JSONDecodeError, ValueError):
+        return response
+    if not isinstance(envelope, Mapping):
+        return response
+    direct = _direct_composite(envelope)
+    if direct is None:
+        return response
+    arguments, payload = direct
+    if journal is None:
+        return response
+    identity = getattr(getattr(journal, "effect_journal", None), "identity", None)
+    allowed = tuple(getattr(identity, "allowed_paths", ()) or ())
+    if (
+        identity is None
+        or not getattr(identity, "composite_admitted", False)
+        or len(allowed) != 1
+        or payload["task_id"] != getattr(identity, "task_id", None)
+        or payload["unit_id"] != getattr(identity, "unit_id", None)
+    ):
+        return response
+    path = arguments["file_path"]
+    allowed_path = allowed[0]
+    if path == "/" + allowed_path:
+        path = allowed_path
+    if path != allowed_path:
+        return response
+    arguments["file_path"] = allowed_path
+    return json.dumps(
+        {
+            "type": "tool_call",
+            "name": "write_file_and_record_worker_result",
+            "arguments": arguments,
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
 def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -800,11 +871,29 @@ class OpenCLIWebChatModel(BaseChatModel):
             self._recovery_journal.conversation_bound(conversation_id)
 
     def _journal_response(self, turn_id: str, response: str) -> None:
+        origin = response
+        response = _canonicalize_direct_composite_response(response, self._recovery_journal)
         if self._recovery_journal is not None:
+            if response != origin:
+                self._journal_protocol_repair(
+                    origin=origin,
+                    origin_sha256=hashlib.sha256(origin.encode("utf-8")).hexdigest(),
+                    turn_id=turn_id,
+                )
+                self._recovery_journal.protocol_repair_recovered(response)
             if getattr(self._recovery_journal, "effect_journal", None) is not None:
                 try:
-                    envelope = json.loads(response)
-                    if envelope.get("type") == "tool_call":
+                    envelope = json.loads(response, object_pairs_hook=_reject_duplicate_json_keys)
+                    direct = (
+                        _direct_terminal_recorder(envelope)
+                        if isinstance(envelope, Mapping)
+                        else None
+                    )
+                    if direct is not None:
+                        name, args = direct
+                        call_id = _tool_call_id(name, args, response)
+                        self._recovery_journal.effect_journal.bind_turn(turn_id, call_id)
+                    elif isinstance(envelope, Mapping) and envelope.get("type") == "tool_call":
                         args = envelope.get("arguments") or {}
                         call_id = _tool_call_id(str(envelope.get("name") or ""), args, response)
                         self._recovery_journal.effect_journal.bind_turn(turn_id, call_id)
@@ -1854,7 +1943,19 @@ class OpenCLIWebChatModel(BaseChatModel):
         return response[:start] + "".join(inverse) + response[index:]
 
     @staticmethod
-    def _repair_matches_invalid_response(invalid_response: str, repaired_response: str) -> bool:
+    def _repair_matches_invalid_response(
+        invalid_response: str, repaired_response: str, journal: Any = None
+    ) -> bool:
+        try:
+            direct_value = json.loads(
+                invalid_response, object_pairs_hook=_reject_duplicate_json_keys
+            )
+        except (json.JSONDecodeError, ValueError):
+            direct_value = None
+        direct = _direct_composite(direct_value) if isinstance(direct_value, Mapping) else None
+        if direct is not None:
+            expected = _canonicalize_direct_composite_response(invalid_response, journal)
+            return expected != invalid_response and repaired_response == expected
         try:
             repaired_envelope = json.loads(
                 repaired_response,
@@ -1899,9 +2000,22 @@ class OpenCLIWebChatModel(BaseChatModel):
         return canonical(repaired_envelope) == canonical(invalid_envelope)
 
     def _refresh_protocol_response(self, response: str, *, turn_id: str) -> str:
+        origin = response
+        response = _canonicalize_direct_composite_response(response, self._recovery_journal)
+        try:
+            parsed = json.loads(origin, object_pairs_hook=_reject_duplicate_json_keys)
+        except (json.JSONDecodeError, ValueError):
+            parsed = None
+        if (
+            isinstance(parsed, Mapping)
+            and parsed.get("type") == "write_file_and_record_worker_result"
+            and response == origin
+        ):
+            raise OpenCLIWebModelError("OPENCLI_WEB_TOOL_CALL_INVALID")
         projected_composite = self._project_unescaped_composite_response(response)
         if (
             projected_composite is not None
+            and projected_composite != response
             and self._inverse_repaired_composite_response(projected_composite) == response
         ):
             if self._recovery_journal is not None:
@@ -1978,7 +2092,9 @@ class OpenCLIWebChatModel(BaseChatModel):
         )
         if not self._is_complete_protocol_response(
             response
-        ) or not self._repair_matches_invalid_response(invalid_response, response):
+        ) or not self._repair_matches_invalid_response(
+            invalid_response, response, self._recovery_journal
+        ):
             raise OpenCLIWebModelError("OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID")
         return response
 
