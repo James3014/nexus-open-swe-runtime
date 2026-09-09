@@ -205,14 +205,24 @@ class ScopedRepairBackend:
     ) -> Any:
         self._authorize(file_path)
         target = self._root / _safe_relative_path(file_path)
-        old = target.read_text(encoding="utf-8") if target.exists() else None
-        expected = old.replace(old_string, new_string, -1 if replace_all else 1) if old is not None else new_string
+        if not target.exists() or not target.is_file():
+            from deepagents.backends.protocol import EditResult
+
+            return EditResult(error=f"Error: File '{file_path}' not found")
+        old = target.read_text(encoding="utf-8")
+        from deepagents.backends.utils import perform_string_replacement
+
+        replacement = perform_string_replacement(old, old_string, new_string, replace_all)
+        if isinstance(replacement, str):
+            from deepagents.backends.protocol import EditResult
+
+            return EditResult(error=replacement)
+        expected, occurrences = replacement
         effect = self._effect("edit_file", _safe_relative_path(file_path), expected, old)
         if effect is not None:
             self._effect_journal.recover_write(effect)
             from deepagents.backends.protocol import EditResult
 
-            occurrences = old.count(old_string) if old is not None and replace_all else 1
             return EditResult(path=file_path, occurrences=occurrences)
         return self._delegate.edit(file_path, old_string, new_string, replace_all)
 
@@ -225,14 +235,24 @@ class ScopedRepairBackend:
     ) -> Any:
         self._authorize(file_path)
         target = self._root / _safe_relative_path(file_path)
-        old = target.read_text(encoding="utf-8") if target.exists() else None
-        expected = old.replace(old_string, new_string, -1 if replace_all else 1) if old is not None else new_string
+        if not target.exists() or not target.is_file():
+            from deepagents.backends.protocol import EditResult
+
+            return EditResult(error=f"Error: File '{file_path}' not found")
+        old = target.read_text(encoding="utf-8")
+        from deepagents.backends.utils import perform_string_replacement
+
+        replacement = perform_string_replacement(old, old_string, new_string, replace_all)
+        if isinstance(replacement, str):
+            from deepagents.backends.protocol import EditResult
+
+            return EditResult(error=replacement)
+        expected, occurrences = replacement
         effect = self._effect("edit_file", _safe_relative_path(file_path), expected, old)
         if effect is not None:
             self._effect_journal.recover_write(effect)
             from deepagents.backends.protocol import EditResult
 
-            occurrences = old.count(old_string) if old is not None and replace_all else 1
             return EditResult(path=file_path, occurrences=occurrences)
         return await self._delegate.aedit(file_path, old_string, new_string, replace_all)
 

@@ -1434,6 +1434,43 @@ def test_scoped_repair_backend_rejects_out_of_scope_write(tmp_path):
     assert (tmp_path / "a.py").read_text(encoding="utf-8") == "allowed\n"
 
 
+@pytest.mark.parametrize(
+    ("content", "old_string", "replace_all", "error_fragment"),
+    [
+        ("alpha\n", "missing", False, "String not found"),
+        ("same\nsame\n", "same", False, "appears 2 times"),
+    ],
+)
+def test_scoped_repair_backend_edit_recovery_preserves_replace_contract(
+    tmp_path, content, old_string, replace_all, error_fragment
+):
+    target = tmp_path / "a.py"
+    target.write_text(content, encoding="utf-8")
+    identity = RecoveryIdentity(
+        operation_id="o" * 64,
+        execution_material_sha256="e" * 64,
+        workspace=str(tmp_path.resolve()),
+        task_id="task-1",
+        unit_id="unit-1",
+        session_id="session-1",
+        allowed_paths=("a.py",),
+        provider_id="test",
+        model_id="test",
+        worker_identity_sha256="w" * 64,
+        transport_config_sha256="t" * 64,
+        runtime_identity_sha256="r" * 64,
+    )
+    journal = cli.DurableEffectJournal(tmp_path, identity)
+    journal.bind_turn("turn-1", "call-1")
+    backend = cli.ScopedRepairBackend(object(), tmp_path, ("a.py",), journal)
+
+    result = backend.edit("a.py", old_string, "replacement", replace_all=replace_all)
+
+    assert result.error is not None and error_fragment in result.error
+    assert target.read_text(encoding="utf-8") == content
+    assert list(journal.root.glob("*.json")) == []
+
+
 def test_real_deepagents_graphs_expose_only_qualified_surfaces(tmp_path):
     from langchain_core.language_models.chat_models import BaseChatModel
     from langchain_core.messages import AIMessage
