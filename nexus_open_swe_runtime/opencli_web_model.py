@@ -548,6 +548,8 @@ def _composite_terminal_completed(
     if len(messages) < 2 or not isinstance(messages[-1], ToolMessage):
         return False
     result = messages[-1]
+    if getattr(result, "status", None) != "success":
+        return False
     if not isinstance(result.content, str):
         return False
     try:
@@ -596,9 +598,12 @@ def _composite_terminal_completed(
         return False
     if journal is None:
         return False
-    identity = getattr(journal, "identity", None)
+    effect_journal = getattr(journal, "effect_journal", None)
+    if effect_journal is None:
+        return False
+    identity = getattr(effect_journal, "identity", None)
     operation_id = str(getattr(identity, "operation_id", "") or "")
-    turn_id = str(getattr(journal, "_current_turn_id", "") or "")
+    turn_id = str(getattr(effect_journal, "_current_turn_id", "") or "")
     allowed = tuple(getattr(identity, "allowed_paths", ()) or ())
     workspace = str(getattr(identity, "workspace", "") or "")
     if not operation_id or not turn_id or len(allowed) != 1:
@@ -620,6 +625,28 @@ def _composite_terminal_completed(
     effect_material = {"operation_id": operation_id, "turn_id": turn_id, "tool_call_id": call.get("id"), "tool_name": call.get("name"), "arguments": {"file_path": normalized_path, "content": content, "envelope": {"summary": summary}}}
     expected_effect = "effect_" + hashlib.sha256(json.dumps(effect_material, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
     if receipt.get("effect_id") != expected_effect:
+        return False
+    try:
+        persisted = effect_journal.read(expected_effect)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if (
+        persisted.get("status") != "RESULT"
+        or persisted.get("operation_id") != operation_id
+        or persisted.get("turn_id") != turn_id
+        or persisted.get("tool_call_id") != call.get("id")
+        or persisted.get("tool_name") != call.get("name")
+        or persisted.get("arguments") != {
+            "file_path": normalized_path,
+            "content": content,
+            "envelope": {"summary": summary},
+        }
+        or persisted.get("postimage") != content
+        or persisted.get("postimage_sha256") != hashlib.sha256(content.encode()).hexdigest()
+        or persisted.get("worker_result") != dict(receipt)
+        or persisted.get("worker_result_sha256")
+        != hashlib.sha256(json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    ):
         return False
     receipt_hash = receipt.get("receipt_sha256")
     material = dict(receipt)
@@ -1967,7 +1994,12 @@ class OpenCLIWebChatModel(BaseChatModel):
             return ChatResult(generations=[ChatGeneration(message=message)])
 
         self._reserve_web_turn()
-        self._select_intelligence_level()
+        # A caller that supplies its own transport implementation owns model
+        # selection as well.  This keeps injected/replayed transports fully
+        # local and avoids probing the external CLI before their send hook.
+        send_impl = getattr(self._send_and_reconcile, "__func__", None)
+        if send_impl is OpenCLIWebChatModel._send_and_reconcile:
+            self._select_intelligence_level()
         prompt = self._render_prompt(messages, normalized_tools, tool_choice)
         turn_id = str(json.loads(prompt)["turn_id"])
         response = self._send_and_reconcile(prompt, budget_reserved=True)
