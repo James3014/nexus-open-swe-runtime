@@ -2602,3 +2602,13 @@ def test_worker_well_formed_inconclusive_v2_falls_back_to_diagnosis(tmp_path, mo
     ).decision == cli.FALLBACK
     assert model_calls == 1
     assert diagnosis.calls == 1
+
+
+def test_composite_projector_has_strict_literal_inverse():
+    from nexus_open_swe_runtime.opencli_web_model import OpenCLIWebChatModel
+
+    raw = '{"type":"tool_call","name":"write_file_and_record_worker_result","arguments":{"file_path":"a.py","content":"hello \\\"world\\\"","envelope":{"summary":"done"}}}'
+    projected = OpenCLIWebChatModel._project_unescaped_composite_response(raw)
+    assert projected == raw
+    assert OpenCLIWebChatModel._inverse_repaired_composite_response(projected) == raw
+    assert OpenCLIWebChatModel._project_unescaped_composite_response(raw.replace('"name":"write_file_and_record_worker_result"', '"name":"write_file"')) is None

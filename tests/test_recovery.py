@@ -116,6 +116,20 @@ def test_effect_journal_accepts_exact_already_applied_write(tmp_path: Path):
     assert journal.read(effect.effect_id)["status"] == "RESULT"
 
 
+def test_effect_journal_persists_one_runtime_worker_receipt(tmp_path: Path):
+    target = tmp_path / "a.py"
+    journal = DurableEffectJournal(tmp_path / "state", _identity(tmp_path))
+    effect = journal.intent(
+        turn_id="turn_1", tool_call_id="call_1", tool_name="write_file",
+        arguments={"file_path": "a.py", "content": "done\n"},
+        path=target, preimage=None, postimage="done\n",
+    )
+    journal.recover_write(effect)
+    receipt = journal.record_worker_result(effect, {"summary": "done"})
+    assert receipt["schema"] == "nexus.open_swe_runtime.worker_result.v1"
+    assert journal.read(effect.effect_id)["worker_result"]["effect_id"] == effect.effect_id
+
+
 def test_effect_journal_recovers_edit_from_preimage(tmp_path: Path):
     target = tmp_path / "a.py"
     target.write_text("old\n", encoding="utf-8")

@@ -126,6 +126,7 @@ class ScopedRepairBackend:
         self._root = root.resolve()
         self._allowed = tuple(_safe_relative_path(path) for path in allowed_paths)
         self._effect_journal = effect_journal
+        self._last_effect: Any = None
 
     def _effect(self, tool_name: str, file_path: str, content: str, old: str | None) -> Any:
         if self._effect_journal is None:
@@ -178,11 +179,28 @@ class ScopedRepairBackend:
         old = target.read_text(encoding="utf-8") if target.exists() else None
         effect = self._effect("write_file", _safe_relative_path(file_path), content, old)
         if effect is not None:
+            self._last_effect = effect
             self._effect_journal.recover_write(effect)
             from deepagents.backends.protocol import WriteResult
 
             return WriteResult(path=file_path)
         return self._delegate.write(file_path, content)
+
+    def write_and_record_worker_result(self, file_path: str, content: str, envelope: Mapping[str, Any]) -> Any:
+        self._authorize(file_path)
+        if not isinstance(envelope, Mapping) or not isinstance(envelope.get("summary"), str):
+            raise RuntimeErrorBounded("OPEN_SWE_COMPOSITE_RESULT_INVALID")
+        target = self._root / _safe_relative_path(file_path)
+        old = target.read_text(encoding="utf-8") if target.exists() else None
+        effect = self._effect_journal.intent(
+            turn_id=str(self._effect_journal._current_turn_id or "turn_unknown"),
+            tool_call_id=str(self._effect_journal._current_tool_call_id or ""),
+            tool_name="write_file_and_record_worker_result",
+            arguments={"file_path": _safe_relative_path(file_path), "content": content, "envelope": {"summary": envelope["summary"]}},
+            path=target, preimage=old, postimage=content,
+        )
+        self._effect_journal.recover_write(effect)
+        return effect
 
     async def awrite(self, file_path: str, content: str) -> Any:
         self._authorize(file_path)
@@ -222,6 +240,7 @@ class ScopedRepairBackend:
         expected, occurrences = replacement
         effect = self._effect("edit_file", _safe_relative_path(file_path), expected, old)
         if effect is not None:
+            self._last_effect = effect
             self._effect_journal.recover_write(effect)
             from deepagents.backends.protocol import EditResult
 
@@ -409,6 +428,7 @@ def build_repair_graph(
     key: str,
     checkpointer: Any | None = None,
     effect_journal: DurableEffectJournal | None = None,
+    composite: bool = False,
 ) -> Any:
     @runtime["tool"]
     def record_worker_result(envelope: dict[str, Any]) -> str:
@@ -418,6 +438,19 @@ def build_repair_graph(
     _profile(runtime, key)
     filesystem = runtime["filesystem_backend"](root_dir=root, virtual_mode=True)
     backend = ScopedRepairBackend(filesystem, root, allowed_paths, effect_journal)
+    composite_tool = None
+    if composite:
+        @runtime["tool"]
+        def write_file_and_record_worker_result(
+            file_path: str, content: str, envelope: dict[str, Any]
+        ) -> str:
+            """Atomically apply one authorized write and return its worker result."""
+            if not isinstance(envelope, Mapping) or not isinstance(envelope.get("summary"), str):
+                raise RuntimeErrorBounded("OPEN_SWE_COMPOSITE_RESULT_INVALID")
+            effect = backend.write_and_record_worker_result(file_path, content, envelope)
+            receipt = backend._effect_journal.record_worker_result(effect, envelope)
+            return _canonical_json(receipt)
+        composite_tool = write_file_and_record_worker_result
     return runtime["create_deep_agent"](
         model=model,
         system_prompt=(
@@ -427,13 +460,14 @@ def build_repair_graph(
             "access network, use Git/GitHub, commit, approve, merge, release, or deploy. Call "
             "record_worker_result exactly once with a short factual summary."
         ),
-        tools=[record_worker_result],
+        tools=([record_worker_result, composite_tool] if composite_tool is not None else [record_worker_result]),
         subagents=[],
         backend=backend,
         middleware=[
             runtime["filesystem_middleware"](
                 backend=backend,
-                tools=["read_file", "ls", "glob", "grep", "write_file", "edit_file"],
+                tools=["read_file", "ls", "glob", "grep", "write_file", "edit_file"]
+                + (["write_file_and_record_worker_result"] if composite else []),
             )
         ],
         checkpointer=checkpointer,
@@ -444,6 +478,7 @@ def _repair_graph(
     factory: Callable[..., Any], model: Any, workspace: Path, runtime: Mapping[str, Any],
     allowed_paths: tuple[str, ...], key: str, checkpointer: Any | None,
     effect_journal: DurableEffectJournal | None = None,
+    composite: bool = False,
 ) -> Any:
     if checkpointer is not None:
         try:
@@ -453,6 +488,8 @@ def _repair_graph(
         kwargs: dict[str, Any] = {"checkpointer": checkpointer}
         if "effect_journal" in parameters:
             kwargs["effect_journal"] = effect_journal
+        if "composite" in parameters:
+            kwargs["composite"] = composite
         if "checkpointer" in parameters:
             return factory(model, workspace, runtime, allowed_paths, key, **kwargs)
     if effect_journal is not None:
@@ -461,7 +498,10 @@ def _repair_graph(
         except (TypeError, ValueError):
             parameters = {}
         if "effect_journal" in parameters:
-            return factory(model, workspace, runtime, allowed_paths, key, effect_journal=effect_journal)
+            kwargs = {"effect_journal": effect_journal}
+            if "composite" in parameters:
+                kwargs["composite"] = composite
+            return factory(model, workspace, runtime, allowed_paths, key, **kwargs)
     return factory(model, workspace, runtime, allowed_paths, key)
 
 
@@ -505,6 +545,24 @@ def _recorded_payload(output: Any, tool_name: str) -> dict[str, Any] | None:
             else:
                 return None
     return found[0] if len(found) == 1 else None
+
+
+def _composite_worker_result(journal: DurableEffectJournal) -> dict[str, Any] | None:
+    records = []
+    for path in sorted(journal.root.glob("effect_*.json")):
+        try:
+            value = journal.read(path.stem)
+        except (OSError, ValueError, RuntimeError):
+            continue
+        receipt = value.get("worker_result") if isinstance(value, Mapping) else None
+        if isinstance(receipt, Mapping) and receipt.get("schema") == "nexus.open_swe_runtime.worker_result.v1":
+            records.append(dict(receipt))
+    if len(records) != 1:
+        return None
+    receipt = records[0]
+    if receipt.get("operation_id") != journal.identity.operation_id or receipt.get("status") != "IMPLEMENTATION_EFFECT_COMPLETE":
+        return None
+    return receipt
 
 
 def _prompt_field(prompt: str, name: str) -> str:
@@ -1352,6 +1410,15 @@ def _worker_run(
         semantic_admission_decision = semantic_admission.decision
         if semantic_admission_decision == REJECT:
             raise RuntimeErrorBounded("OPEN_SWE_SEMANTIC_V2_REJECTED")
+        packet = semantic_admission.envelope
+        scope = packet.get("scope_signal") if isinstance(packet, Mapping) else None
+        composite_admitted = bool(
+            semantic_admission_decision == ADMIT
+            and len(allowed_paths) == 1
+            and isinstance(scope, Mapping)
+            and scope.get("max_files") == 1
+            and scope.get("required_test_edit_paths", list(allowed_paths)) == list(allowed_paths)
+        )
         recovery_identity = RecoveryIdentity(
             operation_id=str(request.get("operation_id") or ""),
             execution_material_sha256=str(started.get("execution_material_sha256") or ""),
@@ -1364,6 +1431,7 @@ def _worker_run(
                 "deepagents": _deepagents_version(),
                 "checkpoint_namespace": "open-swe-repair-v1",
             })),
+            composite_admitted=composite_admitted,
         )
         recovery_journal = DurableOperationJournal(
             request.get("runtime_state_root") or "", recovery_identity
@@ -1467,8 +1535,12 @@ def _worker_run(
                 profile_key,
                 checkpoint_saver,
                 effect_journal,
+                composite=composite_admitted,
             )
-            if set(executable_tool_surface(repair_graph)) != REPAIR_TOOLS:
+            repair_tools = set(executable_tool_surface(repair_graph))
+            composite_runtime = composite_admitted and "write_file_and_record_worker_result" in repair_tools
+            expected_tools = REPAIR_TOOLS | {"write_file_and_record_worker_result"} if composite_runtime else REPAIR_TOOLS
+            if repair_tools != expected_tools:
                 raise RuntimeErrorBounded("OPEN_SWE_TOOL_SURFACE_INVALID")
             repair_config = {
                 "configurable": {
@@ -1489,7 +1561,11 @@ def _worker_run(
                 },
                 config=repair_config,
             )
-            repair = _recorded_payload(repair_output, "record_worker_result")
+            repair = (
+                _composite_worker_result(recovery_journal)
+                if composite_runtime
+                else _recorded_payload(repair_output, "record_worker_result")
+            )
             repair_summary = repair.get("summary") if isinstance(repair, Mapping) else None
             if not isinstance(repair_summary, str) or not repair_summary.strip():
                 raise RuntimeErrorBounded("OPEN_SWE_REPAIR_RESULT_INVALID")
@@ -1583,6 +1659,7 @@ def _worker_reconcile(
             transport_config_sha256=str(identity_data["transport_config_sha256"]),
             runtime_identity_sha256=str(identity_data["runtime_identity_sha256"]),
             checkpoint_namespace=str(identity_data.get("checkpoint_namespace", "open-swe-repair-v1")),
+            composite_admitted=bool(identity_data.get("composite_admitted", False)),
         )
         if identity.operation_id != operation_id:
             return cached
@@ -1650,9 +1727,17 @@ def _worker_reconcile(
         journal.effect_journal = effect_journal
         if hasattr(model, "configure_recovery_journal"):
             model.configure_recovery_journal(journal)
-        graph = graph_builder(model, Path(identity.workspace), runtime, identity.allowed_paths,
-                              f"{identity.provider_id}:{identity.model_id}", checkpoint_saver,
-                              effect_journal)
+        graph_args = [
+            model, Path(identity.workspace), runtime, identity.allowed_paths,
+            f"{identity.provider_id}:{identity.model_id}", checkpoint_saver, effect_journal,
+        ]
+        graph_kwargs: dict[str, Any] = {}
+        try:
+            if "composite" in inspect.signature(graph_builder).parameters:
+                graph_kwargs["composite"] = identity.composite_admitted
+        except (TypeError, ValueError):
+            pass
+        graph = graph_builder(*graph_args, **graph_kwargs)
         repair_conversation_unbound = protocol_repair_pending and (
             recovery_state.get("conversation_id", "")
             == recovery_state.get("protocol_repair_original_conversation_id", "")
@@ -1706,7 +1791,10 @@ def _worker_reconcile(
         }
         graph.update_state(config, {"messages": [recovered_message]}, as_node="model")
         output = graph.invoke(None, config=config)
-        envelope = _recorded_payload(output, "record_worker_result")
+        envelope = _recorded_payload(
+            output,
+            "write_file_and_record_worker_result" if identity.composite_admitted else "record_worker_result",
+        )
         if envelope is None or not isinstance(envelope.get("summary"), str):
             return cached
         result = {

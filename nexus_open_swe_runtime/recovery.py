@@ -107,6 +107,7 @@ class RecoveryIdentity:
     transport_config_sha256: str
     runtime_identity_sha256: str
     checkpoint_namespace: str = "open-swe-repair-v1"
+    composite_admitted: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -284,7 +285,7 @@ class DurableEffectJournal:
         self, *, turn_id: str, tool_call_id: str, tool_name: str, arguments: Mapping[str, Any],
         path: Path, preimage: str | None, postimage: str,
     ) -> Effect:
-        if tool_name not in {"write_file", "edit_file"}:
+        if tool_name not in {"write_file", "edit_file", "write_file_and_record_worker_result"}:
             raise RuntimeError("RECOVERY_TOOL_FORBIDDEN")
         effect_id = "effect_" + _sha(_canonical({
             "operation_id": self.identity.operation_id, "turn_id": turn_id,
@@ -358,6 +359,32 @@ class DurableEffectJournal:
             raise RuntimeError("RECOVERY_WRITE_POSTIMAGE_MISMATCH")
         _fsync_replace(self._path(effect.effect_id), {"status": "RESULT", **asdict(effect)})
         return "RESULT"
+
+    def record_worker_result(self, effect: Effect, envelope: Mapping[str, Any]) -> dict[str, Any]:
+        state = self.read(effect.effect_id)
+        if state.get("status") != "RESULT":
+            raise RuntimeError("RECOVERY_EFFECT_NOT_RESULT")
+        summary = envelope.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise RuntimeError("RECOVERY_WORKER_RESULT_INVALID")
+        receipt = {
+            "schema": "nexus.open_swe_runtime.worker_result.v1",
+            "status": "IMPLEMENTATION_EFFECT_COMPLETE",
+            "operation_id": self.identity.operation_id,
+            "turn_id": effect.turn_id,
+            "tool_call_id": effect.tool_call_id,
+            "effect_id": effect.effect_id,
+            "tool_name": effect.tool_name,
+            "path": effect.path,
+            "postimage_sha256": effect.postimage_sha256,
+            "summary": summary,
+        }
+        receipt["content_sha256"] = _sha(effect.postimage)
+        receipt["summary_sha256"] = _sha(summary)
+        receipt["receipt_sha256"] = _sha(_canonical(receipt))
+        updated = {**state, "worker_result": receipt, "worker_result_sha256": _sha(_canonical(receipt))}
+        _fsync_replace(self._path(effect.effect_id), updated)
+        return receipt
 
 
 def checkpoint_path(state_root: str | Path, operation_id: str) -> Path:

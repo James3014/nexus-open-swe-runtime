@@ -14,6 +14,7 @@ import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from langchain_core.language_models.base import LangSmithParams, LanguageModelInput
@@ -530,6 +531,93 @@ def _terminal_recorder_completed(
     name = str(call.get("name") or "")
     declared = {declared_name for tool in tools if (declared_name := _tool_name(tool))}
     return name in _TERMINAL_RECORDER_TOOLS and name in declared
+
+
+def _composite_terminal_completed(
+    messages: Sequence[BaseMessage], tools: Sequence[Mapping[str, Any]], journal: Any = None
+) -> bool:
+    if len(messages) < 2 or not isinstance(messages[-1], ToolMessage):
+        return False
+    result = messages[-1]
+    if not isinstance(result.content, str):
+        return False
+    try:
+        receipt = json.loads(result.content, object_pairs_hook=_reject_duplicate_json_keys)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    required = {
+        "schema", "status", "operation_id", "turn_id", "tool_call_id", "effect_id",
+        "tool_name", "path", "postimage_sha256", "summary", "content_sha256",
+        "summary_sha256", "receipt_sha256",
+    }
+    if (
+        not isinstance(receipt, Mapping)
+        or set(receipt) != required
+        or receipt.get("schema") != "nexus.open_swe_runtime.worker_result.v1"
+        or receipt.get("status") != "IMPLEMENTATION_EFFECT_COMPLETE"
+    ):
+        return False
+    request = messages[-2]
+    if not isinstance(request, AIMessage) or len(request.tool_calls) != 1:
+        return False
+    call = request.tool_calls[0]
+    if call.get("name") != "write_file_and_record_worker_result" or str(call.get("id") or "") != str(result.tool_call_id or ""):
+        return False
+    declared = {_tool_name(tool) for tool in tools}
+    if call.get("name") not in declared:
+        return False
+    args = call.get("args")
+    if not isinstance(args, Mapping):
+        return False
+    envelope = args.get("envelope")
+    file_path = args.get("file_path")
+    content = args.get("content")
+    summary = envelope.get("summary") if isinstance(envelope, Mapping) else None
+    if (
+        not isinstance(file_path, str)
+        or not isinstance(content, str)
+        or not isinstance(summary, str)
+        or receipt.get("tool_name") != call.get("name")
+        or receipt.get("summary") != summary
+        or receipt.get("content_sha256") != hashlib.sha256(content.encode()).hexdigest()
+        or receipt.get("postimage_sha256") != hashlib.sha256(content.encode()).hexdigest()
+        or receipt.get("summary_sha256") != hashlib.sha256(summary.encode()).hexdigest()
+        or not re.fullmatch(r"effect_[0-9a-f]{64}", str(receipt.get("effect_id") or ""))
+    ):
+        return False
+    if journal is None:
+        return False
+    identity = getattr(journal, "identity", None)
+    operation_id = str(getattr(identity, "operation_id", "") or "")
+    turn_id = str(getattr(journal, "_current_turn_id", "") or "")
+    allowed = tuple(getattr(identity, "allowed_paths", ()) or ())
+    workspace = str(getattr(identity, "workspace", "") or "")
+    if not operation_id or not turn_id or len(allowed) != 1:
+        return False
+    try:
+        normalized_path = Path(file_path).relative_to(Path(workspace)).as_posix() if Path(file_path).is_absolute() else file_path.lstrip("/")
+    except ValueError:
+        return False
+    if normalized_path != allowed[0] or receipt.get("operation_id") != operation_id or receipt.get("turn_id") != turn_id:
+        return False
+    try:
+        expected_physical = str((Path(workspace) / allowed[0]).resolve())
+        if str(Path(str(receipt.get("path") or "")).resolve()) != expected_physical:
+            return False
+    except (OSError, ValueError):
+        return False
+    if receipt.get("tool_call_id") != call.get("id") or receipt.get("tool_call_id") != result.tool_call_id:
+        return False
+    effect_material = {"operation_id": operation_id, "turn_id": turn_id, "tool_call_id": call.get("id"), "tool_name": call.get("name"), "arguments": {"file_path": normalized_path, "content": content, "envelope": {"summary": summary}}}
+    expected_effect = "effect_" + hashlib.sha256(json.dumps(effect_material, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    if receipt.get("effect_id") != expected_effect:
+        return False
+    receipt_hash = receipt.get("receipt_sha256")
+    material = dict(receipt)
+    material.pop("receipt_sha256", None)
+    return isinstance(receipt_hash, str) and receipt_hash == hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
 
 
 def _tool_call_id(name: str, arguments: Mapping[str, Any], raw: str) -> str:
@@ -1483,6 +1571,37 @@ class OpenCLIWebChatModel(BaseChatModel):
         )
 
     @staticmethod
+    def _project_unescaped_composite_response(response: str) -> str | None:
+        """Project only the strict composite write/result response shape."""
+        match = re.fullmatch(
+            r'\{"type":"tool_call","name":"write_file_and_record_worker_result",'
+            r'"arguments":\{"file_path":(?P<path>"(?:\\.|[^"\\])*"),'
+            r'"content":"(?P<content>.*?)","envelope":\{"summary":"(?P<summary>.*?)"\}\}\}',
+            response,
+            re.DOTALL,
+        )
+        if match is None:
+            return None
+        try:
+            path = json.loads(match.group("path"), object_pairs_hook=_reject_duplicate_json_keys)
+            content = json.loads('"' + match.group("content") + '"')
+            summary = json.loads('"' + match.group("summary") + '"')
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not all(isinstance(value, str) for value in (path, content, summary)):
+            return None
+        return json.dumps({
+            "type": "tool_call",
+            "name": "write_file_and_record_worker_result",
+            "arguments": {"file_path": path, "content": content, "envelope": {"summary": summary}},
+        }, separators=(",", ":"), ensure_ascii=False)
+
+    @staticmethod
+    def _inverse_repaired_composite_response(response: str) -> str | None:
+        projected = OpenCLIWebChatModel._project_unescaped_composite_response(response)
+        return projected if projected == response else None
+
+    @staticmethod
     def _is_complete_protocol_response(response: str) -> bool:
         try:
             envelope = json.loads(response, object_pairs_hook=_reject_duplicate_json_keys)
@@ -1722,7 +1841,7 @@ class OpenCLIWebChatModel(BaseChatModel):
         if tool_choice is not None and not isinstance(tool_choice, str):
             raise OpenCLIWebModelError("OPENCLI_WEB_TOOL_CHOICE_INVALID")
 
-        if _terminal_recorder_completed(messages, normalized_tools):
+        if _terminal_recorder_completed(messages, normalized_tools) or _composite_terminal_completed(messages, normalized_tools, self._recovery_journal):
             message = AIMessage(content="Terminal recorder completed.")
             return ChatResult(generations=[ChatGeneration(message=message)])
 
