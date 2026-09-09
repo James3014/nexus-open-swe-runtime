@@ -2967,6 +2967,81 @@ def test_opencli_web_model_classifies_opencli_detail_timeout_exit_code(
         model._run(["opencli", "chatgpt", "detail", "conversation"])
 
 
+def test_opencli_web_model_gives_default_subprocess_sixty_seconds_headroom(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    observed_timeouts: list[float] = []
+
+    def fake_run(_argv, **kwargs):
+        observed_timeouts.append(kwargs["timeout"])
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(
+        "nexus_open_swe_runtime.opencli_web_model.subprocess.run",
+        fake_run,
+    )
+    model = OpenCLIWebChatModel(timeout_seconds=180)
+
+    assert model._run(["opencli", "chatgpt", "status"]) == "ok"
+    assert model._run(["opencli", "chatgpt", "detail", "conversation"], timeout_seconds=7.25) == "ok"
+
+    assert observed_timeouts == [240, 7.25]
+
+
+def test_opencli_web_model_accepts_late_primary_result_without_readback_or_redispatch(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    commands: list[list[str]] = []
+    latest_prompt = ""
+
+    def fake_run(argv, **kwargs):
+        nonlocal latest_prompt
+        args = list(argv)
+        commands.append(args)
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            latest_prompt = args[3]
+            assert kwargs["timeout"] >= 199
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": "late-conversation", "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False},
+                    {
+                        "Index": 2,
+                        "Role": "Assistant",
+                        "Text": '{"type":"final","content":"complete"}',
+                        "Generating": False,
+                    },
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr(
+        "nexus_open_swe_runtime.opencli_web_model.subprocess.run",
+        fake_run,
+    )
+    model = OpenCLIWebChatModel(timeout_seconds=180)
+
+    result = model.invoke("return the complete result")
+
+    assert result.content == "complete"
+    assert [args[1:3] for args in commands] == [
+        ["chatgpt", "model"],
+        ["chatgpt", "ask"],
+        ["chatgpt", "detail"],
+    ]
+    assert sum(args[1:3] == ["chatgpt", "detail"] for args in commands) == 1
+    assert not any(args[1:3] == ["chatgpt", "history"] for args in commands)
+
+
 # ---------------------------------------------------------------------------
 # Durable cross-process pacing tests
 

@@ -661,7 +661,7 @@ class OpenCLIWebChatModel(BaseChatModel):
                 timeout=(
                     timeout_seconds
                     if timeout_seconds is not None
-                    else max(self.timeout_seconds + 5, 35)
+                    else self.timeout_seconds + 60
                 ),
                 shell=False,
                 env=self._environment(),
