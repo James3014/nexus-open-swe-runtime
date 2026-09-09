@@ -14,7 +14,7 @@ import pytest
 from langchain_core.messages import HumanMessage, ToolMessage
 
 from nexus_open_swe_runtime import cli
-from nexus_open_swe_runtime.opencli_web_model import OpenCLIWebChatModel
+from nexus_open_swe_runtime.opencli_web_model import OpenCLIWebChatModel, _tool_call_id
 from nexus_open_swe_runtime.recovery import (
     DurableEffectJournal,
     DurableOperationJournal,
@@ -2710,14 +2710,19 @@ def test_composite_projector_has_strict_literal_inverse():
     assert OpenCLIWebChatModel._project_unescaped_composite_response(raw.replace('"name":"write_file_and_record_worker_result"', '"name":"write_file"')) is None
 
 
-def _composite_worker_model(model: OpenCLIWebChatModel, sends: list[str]) -> None:
+def _composite_worker_model(
+    model: OpenCLIWebChatModel,
+    sends: list[str],
+    *,
+    response_override: str | None = None,
+) -> None:
     """Make the real web model return one valid composite tool call."""
     def one_model_send(prompt, **_kwargs):
         sends.append(prompt)
         turn_id = json.loads(prompt)["turn_id"]
         model._journal_ask(turn_id, prompt)
         model._journal_bound("conversation-1")
-        response = json.dumps(
+        response = response_override or json.dumps(
             {
                 "type": "tool_call",
                 "name": "write_file_and_record_worker_result",
@@ -2769,16 +2774,30 @@ def _composite_recovery_fixture(tmp_path: Path) -> tuple[dict, DurableOperationJ
     journal.prepare()
     journal.ask_dispatching(turn_id="turn-1", prompt="repair", ordinal=0)
     journal.conversation_bound("conversation-1")
+    recovered_arguments = {
+        "file_path": "a.py",
+        "content": "VALUE = 2\n",
+        "envelope": {"summary": "repaired a.py"},
+    }
+    recovered_response = json.dumps(
+        {
+            "type": "tool_call",
+            "name": "write_file_and_record_worker_result",
+            "arguments": recovered_arguments,
+        },
+        separators=(",", ":"),
+    )
+    journal.response_recovered("turn-1", recovered_response)
     effects = DurableEffectJournal(request["runtime_state_root"], identity)
     journal.effect_journal = effects
-    effects.bind_turn("turn-1", "call-1")
+    tool_call_id = _tool_call_id(
+        "write_file_and_record_worker_result", recovered_arguments, recovered_response
+    )
+    effects.bind_turn("turn-1", tool_call_id)
     effect = effects.intent(
-        turn_id="turn-1", tool_call_id="call-1",
+        turn_id="turn-1", tool_call_id=tool_call_id,
         tool_name="write_file_and_record_worker_result",
-        arguments={
-            "file_path": "a.py", "content": "VALUE = 2\n",
-            "envelope": {"summary": "repaired a.py"},
-        },
+        arguments=recovered_arguments,
         path=target, preimage="VALUE = 1\n", postimage="VALUE = 2\n",
     )
     effects.recover_write(effect)
@@ -2829,6 +2848,12 @@ def test_worker_run_admitted_v2_executes_real_composite_graph_once(tmp_path, mon
     assert result["status"] == "COMPLETED"
     assert result["diagnosis_status"] == "ROOT_CAUSE_SUPPORTED"
     assert len(sends) == 1
+    assert "write_file_and_record_worker_result" in sends[0]
+    assert (
+        "For the final mutation and result, call write_file_and_record_worker_result exactly once"
+        in sends[0]
+    )
+    assert "Never use write_file_and_record_worker_result" not in sends[0]
     assert (Path(request["workspace_path"]) / "a.py").read_text(encoding="utf-8") == "VALUE = 2\n"
     effects = list((Path(request["runtime_state_root"]) / "recovery" / "effects").glob("effect_*.json"))
     assert len(effects) == 1
@@ -3007,3 +3032,138 @@ def test_worker_reconcile_tampered_durable_composite_receipt_fails_closed(tmp_pa
 
     assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
     assert result["outcome_unknown"] is True
+
+
+@pytest.mark.parametrize("tamper", ["summary", "path", "turn", "tool", "effect_id"])
+def test_worker_reconcile_rehashed_composite_identity_mutations_remain_unknown(tmp_path, tamper):
+    """A receipt remains bound to its durable effect and operation identity."""
+    request, _journal, effects = _composite_recovery_fixture(tmp_path)
+    effect_path = next(effects.root.glob("effect_*.json"))
+    record = json.loads(effect_path.read_text(encoding="utf-8"))
+    receipt = dict(record["worker_result"])
+    arguments = dict(record["arguments"])
+    envelope = dict(arguments["envelope"])
+
+    if tamper == "summary":
+        envelope["summary"] = "rehashed but unbound"
+        arguments["envelope"] = envelope
+        receipt["summary"] = envelope["summary"]
+        receipt["summary_sha256"] = cli._sha256(receipt["summary"])
+    elif tamper == "path":
+        arguments["file_path"] = "other.py"
+        record["path"] = str(Path(request["workspace_path"]) / "other.py")
+        receipt["path"] = record["path"]
+    elif tamper == "turn":
+        record["turn_id"] = "turn-tampered"
+        receipt["turn_id"] = record["turn_id"]
+    elif tamper == "tool":
+        record["tool_name"] = "write_file"
+        receipt["tool_name"] = record["tool_name"]
+    else:
+        receipt["effect_id"] = "effect_" + "f" * 64
+
+    record["arguments"] = arguments
+    effect_material = {
+        "operation_id": record["operation_id"],
+        "turn_id": record["turn_id"],
+        "tool_call_id": record["tool_call_id"],
+        "tool_name": record["tool_name"],
+        "arguments": arguments,
+    }
+    expected_effect_id = "effect_" + cli._sha256(cli._canonical_json(effect_material))
+    if tamper != "effect_id":
+        receipt["effect_id"] = expected_effect_id
+    record["effect_id"] = receipt["effect_id"]
+    receipt_material = dict(receipt)
+    receipt_material.pop("receipt_sha256", None)
+    receipt["receipt_sha256"] = cli._sha256(cli._canonical_json(receipt_material))
+    record["worker_result"] = receipt
+    record["worker_result_sha256"] = cli._sha256(cli._canonical_json(receipt))
+
+    replacement = effects.root / f"{record['effect_id']}.json"
+    effect_path.rename(replacement)
+    replacement.write_text(cli._canonical_json(record), encoding="utf-8")
+
+    result = cli._worker_reconcile(
+        request,
+        runtime_loader=_runtime,
+        model_builder=lambda *_args: pytest.fail("rehashed identity mutation must not build model"),
+        graph_builder=lambda *_args: pytest.fail("rehashed identity mutation must not build graph"),
+    )
+
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["outcome_unknown"] is True
+
+
+def test_worker_run_malformed_r23_composite_completes_once_then_reconcile_is_local(
+    tmp_path, monkeypatch
+):
+    """Malformed r23 free text is repaired once; restart does no second write or web call."""
+    request = _v2_request(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "_git_output",
+        lambda _workspace, *args: {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
+        }[args],
+    )
+    monkeypatch.setattr(
+        cli, "create_checkpoint", lambda _state_root, _operation_id, namespace: (None, namespace)
+    )
+    sends: list[str] = []
+    malformed_r23 = (
+        '{"type":"tool_call","name":"write_file_and_record_worker_result",'
+        '"arguments":{"file_path":"a.py","content":"VALUE = "2"\\n",'
+        '"envelope":{"summary":"repaired "a.py""}}}'
+    )
+
+    def model_factory(_runtime, provider, model_id, transport_config, state_root):
+        model = OpenCLIWebChatModel(
+            executable=transport_config["executable"],
+            intelligence_level=model_id,
+            opencli_profile=transport_config["profile"],
+            site_session=transport_config["site_session"],
+            timeout_seconds=transport_config["timeout_seconds"],
+            runtime_state_root=state_root,
+        )
+        assert (provider, model_id) == ("opencli_chatgpt", "advanced")
+        _composite_worker_model(model, sends, response_override=malformed_r23)
+        return model
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=cli._load_runtime,
+        model_factory=model_factory,
+        repair_factory=cli.build_repair_graph,
+    )
+
+    assert result["status"] == "COMPLETED"
+    assert len(sends) == 1
+    assert (Path(request["workspace_path"]) / "a.py").read_text(encoding="utf-8") == 'VALUE = "2"\n'
+
+    replace_calls: list[tuple[object, object]] = []
+    original_replace = cli.os.replace
+
+    def forbidden_reconcile_replace(source, target):
+        replace_calls.append((source, target))
+        return original_replace(source, target)
+
+    monkeypatch.setattr(cli.os, "replace", forbidden_reconcile_replace)
+    model_calls = 0
+
+    def forbidden_model(*_args):
+        nonlocal model_calls
+        model_calls += 1
+        raise AssertionError("completed malformed composite must not call model on reconcile")
+
+    reconciled = cli._worker_reconcile(
+        request,
+        runtime_loader=_runtime,
+        model_builder=forbidden_model,
+        graph_builder=lambda *_args: pytest.fail("completed malformed composite must not build graph"),
+    )
+    assert reconciled["status"] == "COMPLETED"
+    assert model_calls == 0
+    assert replace_calls == []
