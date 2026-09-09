@@ -52,6 +52,15 @@ _MAX_HISTORY_CANDIDATES = 12
 _TERMINAL_RECORDER_TOOLS = frozenset({"record_finding", "record_diagnosis", "record_worker_result"})
 
 
+class _CompositeProjection(str):
+    """A projected response carrying the exact malformed source it repaired."""
+
+    def __new__(cls, value: str, *, origin: str) -> "_CompositeProjection":
+        projected = str.__new__(cls, value)
+        projected.origin = origin
+        return projected
+
+
 def _direct_terminal_recorder(envelope: Mapping[str, Any]) -> tuple[str, dict[str, Any]] | None:
     """Return a strict direct terminal-record form and its internal arguments."""
     if set(envelope) != {"type", "envelope"}:
@@ -1572,34 +1581,133 @@ class OpenCLIWebChatModel(BaseChatModel):
 
     @staticmethod
     def _project_unescaped_composite_response(response: str) -> str | None:
-        """Project only the strict composite write/result response shape."""
-        match = re.fullmatch(
-            r'\{"type":"tool_call","name":"write_file_and_record_worker_result",'
-            r'"arguments":\{"file_path":(?P<path>"(?:\\.|[^"\\])*"),'
-            r'"content":"(?P<content>.*?)","envelope":\{"summary":"(?P<summary>.*?)"\}\}\}',
-            response,
-            re.DOTALL,
+        """Project one exact composite response with only quote repair allowed.
+
+        The two free-text fields are parsed against a unique structural boundary;
+        this prevents a quote inside content or summary from being mistaken for
+        the end of a field.  A projected value retains its source so the local
+        repair path can prove a literal inverse without guessing from JSON alone.
+        """
+        prefix = (
+            '{"type":"tool_call","name":"write_file_and_record_worker_result",'
+            '"arguments":{"file_path":'
         )
-        if match is None:
+        boundary = ',"content":"'
+        summary_boundary = '","envelope":{"summary":"'
+        suffix = '"}}}'
+        if not response.startswith(prefix) or not response.endswith(suffix):
             return None
+
+        # A strict, already-valid canonical response is accepted unchanged.  It
+        # still receives provenance so inverse validation remains fail-closed.
         try:
-            path = json.loads(match.group("path"), object_pairs_hook=_reject_duplicate_json_keys)
-            content = json.loads('"' + match.group("content") + '"')
-            summary = json.loads('"' + match.group("summary") + '"')
-        except (json.JSONDecodeError, ValueError):
+            canonical_value = json.loads(response, object_pairs_hook=_reject_duplicate_json_keys)
+            canonical_arguments = (
+                canonical_value.get("arguments")
+                if isinstance(canonical_value, Mapping)
+                else None
+            )
+            canonical_envelope = (
+                canonical_arguments.get("envelope")
+                if isinstance(canonical_arguments, Mapping)
+                else None
+            )
+            if not (
+                isinstance(canonical_value, Mapping)
+                and list(canonical_value) == ["type", "name", "arguments"]
+                and canonical_value.get("type") == "tool_call"
+                and canonical_value.get("name") == "write_file_and_record_worker_result"
+                and isinstance(canonical_arguments, Mapping)
+                and list(canonical_arguments) == ["file_path", "content", "envelope"]
+                and isinstance(canonical_arguments.get("file_path"), str)
+                and isinstance(canonical_arguments.get("content"), str)
+                and isinstance(canonical_envelope, Mapping)
+                and list(canonical_envelope) == ["summary"]
+                and isinstance(canonical_envelope.get("summary"), str)
+            ):
+                return None
+            canonical_response = json.dumps(
+                canonical_value,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            if canonical_response == response:
+                return _CompositeProjection(response, origin=response)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+        decoder = json.JSONDecoder(object_pairs_hook=_reject_duplicate_json_keys)
+        try:
+            path, path_end = decoder.raw_decode(response[len(prefix) :])
+        except (json.JSONDecodeError, TypeError, ValueError):
             return None
-        if not all(isinstance(value, str) for value in (path, content, summary)):
+        if not isinstance(path, str):
             return None
-        return json.dumps({
-            "type": "tool_call",
-            "name": "write_file_and_record_worker_result",
-            "arguments": {"file_path": path, "content": content, "envelope": {"summary": summary}},
-        }, separators=(",", ":"), ensure_ascii=False)
+        rest = response[len(prefix) + path_end :]
+        if not rest.startswith(boundary):
+            return None
+        raw_fields = rest[len(boundary) :]
+        if raw_fields.count(summary_boundary) != 1:
+            return None
+        raw_content, raw_summary = raw_fields.split(summary_boundary, 1)
+        if raw_summary.count(suffix) != 1 or not raw_summary.endswith(suffix):
+            return None
+        raw_summary = raw_summary[: -len(suffix)]
+
+        def decode_unescaped_field(raw: str) -> str | None:
+            escaped: list[str] = []
+            index = 0
+            while index < len(raw):
+                character = raw[index]
+                if character == "\\":
+                    if index + 1 >= len(raw):
+                        return None
+                    escaped.append(raw[index : index + 2])
+                    index += 2
+                    continue
+                if character == '"':
+                    # A colon after an unescaped quote indicates a structural
+                    # key boundary, rather than literal field text.
+                    if re.match(r"\s*:", raw[index + 1 :]):
+                        return None
+                    escaped.append('\\"')
+                else:
+                    escaped.append(character)
+                index += 1
+            try:
+                value = json.loads('"' + "".join(escaped) + '"')
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return None
+            return value if isinstance(value, str) else None
+
+        content = decode_unescaped_field(raw_content)
+        summary = decode_unescaped_field(raw_summary)
+        if content is None or summary is None:
+            return None
+        projected = json.dumps(
+            {
+                "type": "tool_call",
+                "name": "write_file_and_record_worker_result",
+                "arguments": {
+                    "file_path": path,
+                    "content": content,
+                    "envelope": {"summary": summary},
+                },
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        return _CompositeProjection(projected, origin=response)
 
     @staticmethod
     def _inverse_repaired_composite_response(response: str) -> str | None:
-        projected = OpenCLIWebChatModel._project_unescaped_composite_response(response)
-        return projected if projected == response else None
+        if not isinstance(response, _CompositeProjection):
+            return None
+        origin = getattr(response, "origin", None)
+        if not isinstance(origin, str):
+            return None
+        projected = OpenCLIWebChatModel._project_unescaped_composite_response(origin)
+        return origin if projected == response else None
 
     @staticmethod
     def _is_complete_protocol_response(response: str) -> bool:
@@ -1681,6 +1789,11 @@ class OpenCLIWebChatModel(BaseChatModel):
             )
         except (json.JSONDecodeError, ValueError):
             return False
+        projected_composite = OpenCLIWebChatModel._project_unescaped_composite_response(
+            invalid_response
+        )
+        if projected_composite is not None and projected_composite != invalid_response:
+            return repaired_response == projected_composite
         projected_invalid = OpenCLIWebChatModel._project_unescaped_write_response(invalid_response)
         try:
             invalid_envelope, prefix_end = json.JSONDecoder(
@@ -1710,6 +1823,12 @@ class OpenCLIWebChatModel(BaseChatModel):
         return canonical(repaired_envelope) == canonical(invalid_envelope)
 
     def _refresh_protocol_response(self, response: str, *, turn_id: str) -> str:
+        projected_composite = self._project_unescaped_composite_response(response)
+        if (
+            projected_composite is not None
+            and self._inverse_repaired_composite_response(projected_composite) == response
+        ):
+            return projected_composite
         if self._is_complete_protocol_response(response) or not self._conversation_id:
             return response
         latest = response
@@ -1732,7 +1851,9 @@ class OpenCLIWebChatModel(BaseChatModel):
             ).raw_decode(invalid_response)
             malformed = bool(invalid_response[prefix_end:].strip())
         except (json.JSONDecodeError, ValueError):
-            projected = self._project_unescaped_write_response(invalid_response)
+            projected = self._project_unescaped_composite_response(invalid_response)
+            if projected is None:
+                projected = self._project_unescaped_write_response(invalid_response)
             if projected is None:
                 raise OpenCLIWebModelError("OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID")
             invalid_envelope = json.loads(projected, object_pairs_hook=_reject_duplicate_json_keys)
