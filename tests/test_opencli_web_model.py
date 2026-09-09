@@ -1765,7 +1765,7 @@ def test_opencli_web_model_rejects_undeclared_tool_call(monkeypatch: pytest.Monk
         model.bind_tools([read_file]).invoke("inspect README")
 
 
-def test_opencli_web_model_resumes_one_bound_repair_turn_without_assistant(
+def test_opencli_web_model_fails_closed_after_bound_repair_late_readback(
     monkeypatch: pytest.MonkeyPatch,
 ):
     ask_count = 0
@@ -1844,17 +1844,14 @@ def test_opencli_web_model_resumes_one_bound_repair_turn_without_assistant(
     model = OpenCLIWebChatModel(executable="/opt/opencli")
     model._clock = clock
     model._sleep = clock.sleep
+    model._late_clock = clock
 
-    result = model.invoke([HumanMessage(content="recover this response")])
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TIMEOUT"):
+        model.invoke([HumanMessage(content="recover this response")])
 
-    assert result.content == "bad"
-    assert ask_count == 3
-    assert detail_count == 7
-    assert model._web_turn_count == 3
-    resume_envelope = json.loads(resume_prompt)
-    repair_envelope = json.loads(repair_prompt)
-    assert resume_envelope["tools"] == repair_envelope["tools"] == []
-    assert resume_envelope["tool_choice"] == repair_envelope["tool_choice"] == "none"
+    assert ask_count == 2
+    assert detail_count >= 7
+    assert model._web_turn_count == 2
 
 
 @pytest.mark.parametrize(
@@ -2571,12 +2568,15 @@ def test_opencli_web_model_bound_resume_respects_remaining_turn_budget(
     model = OpenCLIWebChatModel(executable="/opt/opencli")
     model._conversation_id = "bound-conversation"
     model._web_turn_count = 11
+    model._late_clock = lambda: 0.0
+    model._sleep = lambda _delay: None
 
-    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TURN_BUDGET_EXHAUSTED"):
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TIMEOUT"):
         model.invoke("budget-bound resume")
 
     assert ask_count == 1
     assert history_count == 0
+    assert model._web_turn_count == 12
 
 
 def test_opencli_web_model_bound_resume_timeout_cannot_resume_twice(
@@ -2620,11 +2620,13 @@ def test_opencli_web_model_bound_resume_timeout_cannot_resume_twice(
     monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
     model = OpenCLIWebChatModel(executable="/opt/opencli")
     model._conversation_id = "bound-conversation"
+    model._late_clock = lambda: 0.0
+    model._sleep = lambda _delay: None
 
-    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_REPAIR_RESUME_EXHAUSTED"):
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TIMEOUT"):
         model.invoke("resume timeout")
 
-    assert ask_count == 2
+    assert ask_count == 1
 
 
 def test_opencli_web_model_recovers_detail_timeout_after_successful_ask(
