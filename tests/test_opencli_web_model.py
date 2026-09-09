@@ -4264,3 +4264,107 @@ def test_invalid_composite_receipt_does_not_short_circuit(monkeypatch):
     monkeypatch.setattr(model, "_send_and_reconcile", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("sentinel")))
     with pytest.raises(AssertionError, match="sentinel"):
         model._generate([AIMessage(content="", tool_calls=[{"name": "write_file_and_record_worker_result", "args": args, "id": call_id}]), ToolMessage(content=json.dumps({"status": "IMPLEMENTATION_EFFECT_COMPLETE"}), tool_call_id=call_id)], tools=[{"type": "function", "function": {"name": "write_file_and_record_worker_result"}}])
+
+
+def _r23_malformed_composite_response() -> tuple[str, str]:
+    origin = (
+        '{"type":"tool_call","name":"write_file_and_record_worker_result",'
+        '"arguments":{"file_path":"tests/r23.py","content":"def run():\\n'
+        '    return "quoted"\\n","envelope":{"summary":"writes "quoted""}}}'
+    )
+    expected = json.dumps(
+        {
+            "type": "tool_call",
+            "name": "write_file_and_record_worker_result",
+            "arguments": {
+                "file_path": "tests/r23.py",
+                "content": 'def run():\n    return "quoted"\n',
+                "envelope": {"summary": 'writes "quoted"'},
+            },
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return origin, expected
+
+
+def test_r23_malformed_composite_projection_preserves_path_content_and_summary():
+    origin, expected = _r23_malformed_composite_response()
+
+    projected = OpenCLIWebChatModel._project_unescaped_composite_response(origin)
+
+    assert projected == expected
+    assert json.loads(projected)["arguments"] == {
+        "file_path": "tests/r23.py",
+        "content": 'def run():\n    return "quoted"\n',
+        "envelope": {"summary": 'writes "quoted"'},
+    }
+    assert OpenCLIWebChatModel._inverse_repaired_composite_response(projected) == origin
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda value: value.replace(
+            '"name":"write_file_and_record_worker_result"', '"name":"write_file"'
+        ),
+        lambda value: value.replace(
+            '"type":"tool_call","name"', '"name":"write_file_and_record_worker_result","type"'
+        ),
+        lambda value: value.replace(
+            '"file_path":"tests/r23.py","content"', '"content":"x","file_path":"tests/r23.py"'
+        ),
+        lambda value: " " + value,
+        lambda value: value.replace(
+            '"envelope":{"summary":"writes "quoted""}',
+            '"envelope":{"summary":"writes "quoted"","summary":"duplicate"}',
+        ),
+        lambda value: value.replace(
+            '"envelope":{"summary":"writes "quoted""}',
+            '"envelope":{"summary":"writes "quoted"","extra":true}',
+        ),
+        lambda value: value + value,
+        lambda value: value.replace(
+            'return "quoted"\\n', 'return ","envelope":{"summary":"fake"}}\\n'
+        ),
+    ],
+)
+def test_r23_malformed_composite_projection_rejects_shape_or_boundary_drift(mutation):
+    origin, _expected = _r23_malformed_composite_response()
+
+    assert OpenCLIWebChatModel._project_unescaped_composite_response(mutation(origin)) is None
+
+
+def test_r23_projection_accepts_structural_path_summary_changes_but_rejects_provenance():
+    origin, _expected = _r23_malformed_composite_response()
+    changed = origin.replace('"file_path":"tests/r23.py"', '"file_path":"other.py"')
+    changed = changed.replace('"summary":"writes "quoted""', '"summary":"other"')
+
+    projected = OpenCLIWebChatModel._project_unescaped_composite_response(changed)
+
+    assert projected is not None
+    assert json.loads(projected)["arguments"]["file_path"] == "other.py"
+    assert json.loads(projected)["arguments"]["envelope"]["summary"] == "other"
+    assert not OpenCLIWebChatModel._repair_matches_invalid_response(origin, projected)
+    assert OpenCLIWebChatModel._inverse_repaired_composite_response(projected) != origin
+
+
+def test_r23_composite_repair_equivalence_and_refresh_use_local_projection(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    origin, projected = _r23_malformed_composite_response()
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model._conversation_id = "r23-conversation"
+    monkeypatch.setattr(
+        model,
+        "_detail_response",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("same-family malformed response must project locally")
+        ),
+    )
+
+    assert OpenCLIWebChatModel._repair_matches_invalid_response(origin, projected)
+    assert model._refresh_protocol_response(origin, turn_id="turn_r23") == projected
+
+    mismatch = projected.replace('writes \\\"quoted\\\"', 'writes \\\"changed\\\"')
+    assert OpenCLIWebChatModel._inverse_repaired_composite_response(mismatch) is None
