@@ -42,9 +42,14 @@ def _contending_fence(state_root: str, workspace: str, marker: str) -> None:
         operation_id="a" * 64,
         execution_material_sha256="b" * 64,
         workspace=workspace,
-        task_id="task-1", unit_id="unit-1", session_id="session-1",
-        allowed_paths=("a.py",), provider_id="opencli_chatgpt", model_id="balanced",
-        worker_identity_sha256="c" * 64, transport_config_sha256="d" * 64,
+        task_id="task-1",
+        unit_id="unit-1",
+        session_id="session-1",
+        allowed_paths=("a.py",),
+        provider_id="opencli_chatgpt",
+        model_id="balanced",
+        worker_identity_sha256="c" * 64,
+        transport_config_sha256="d" * 64,
         runtime_identity_sha256="e" * 64,
     )
     journal = DurableOperationJournal(state_root, identity)
@@ -122,9 +127,13 @@ def test_effect_journal_persists_one_runtime_worker_receipt(tmp_path: Path):
     target = tmp_path / "a.py"
     journal = DurableEffectJournal(tmp_path / "state", _identity(tmp_path))
     effect = journal.intent(
-        turn_id="turn_1", tool_call_id="call_1", tool_name="write_file",
+        turn_id="turn_1",
+        tool_call_id="call_1",
+        tool_name="write_file",
         arguments={"file_path": "a.py", "content": "done\n"},
-        path=target, preimage=None, postimage="done\n",
+        path=target,
+        preimage=None,
+        postimage="done\n",
     )
     journal.recover_write(effect)
     receipt = journal.record_worker_result(effect, {"summary": "done"})
@@ -175,7 +184,8 @@ def test_composite_recovery_orders_intent_physical_postimage_result_then_receipt
 
 
 def test_composite_recovery_persists_result_only_after_postimage_replace(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     target, journal, effect, _arguments = _composite_effect(tmp_path)
     real_replace = recovery.os.replace
@@ -233,9 +243,12 @@ def test_composite_receipt_hash_is_recomputed_from_exact_receipt_material(
         json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     ).hexdigest()
     assert receipt["receipt_sha256"] == expected
-    assert journal.read(effect.effect_id)["worker_result_sha256"] == hashlib.sha256(
-        json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-    ).hexdigest()
+    assert (
+        journal.read(effect.effect_id)["worker_result_sha256"]
+        == hashlib.sha256(
+            json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+    )
 
 
 @pytest.mark.parametrize(
@@ -247,7 +260,8 @@ def test_composite_receipt_hash_is_recomputed_from_exact_receipt_material(
     ],
 )
 def test_composite_receipt_rejects_changed_effect_identity(
-    tmp_path: Path, mutation,
+    tmp_path: Path,
+    mutation,
 ):
     _target, journal, effect, arguments = _composite_effect(tmp_path)
     journal.recover_write(effect)
@@ -278,7 +292,8 @@ def test_composite_recovery_rejects_divergent_physical_bytes_without_receipt(
 
 
 def test_composite_recovery_replays_physical_write_without_duplicate_replace(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     target, journal, effect, _arguments = _composite_effect(tmp_path)
     replaces = 0
@@ -506,7 +521,9 @@ def test_reconcile_bound_turn_reuses_persisted_response_without_detail(tmp_path:
     assert reconcile_bound_turn(journal, Model()) == response
 
 
-def test_restart_trace_recovered_response_updates_graph_once_and_terminal_reconcile_is_idempotent(tmp_path: Path):
+def test_restart_trace_recovered_response_updates_graph_once_and_terminal_reconcile_is_idempotent(
+    tmp_path: Path,
+):
     journal = DurableOperationJournal(tmp_path / "state", _identity(tmp_path))
     journal.prepare()
     journal.ask_dispatching(turn_id="turn_1", prompt="payload", ordinal=0)

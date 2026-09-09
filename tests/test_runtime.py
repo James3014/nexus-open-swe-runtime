@@ -46,14 +46,12 @@ def test_root_checkpoint_config_reads_sqlite_checkpoint_without_subgraph_namespa
         ("",)
     ]
     with pytest.raises(ValueError, match="Subgraph open-swe-repair-v1 not found"):
-        graph.get_state(
-            {
-                "configurable": {
-                    "thread_id": "operation-1",
-                    "checkpoint_ns": "open-swe-repair-v1",
-                }
+        graph.get_state({
+            "configurable": {
+                "thread_id": "operation-1",
+                "checkpoint_ns": "open-swe-repair-v1",
             }
-        )
+        })
 
 
 def test_worker_reconcile_real_graph_replays_write_effect_once_after_restart(tmp_path):
@@ -66,25 +64,43 @@ def test_worker_reconcile_real_graph_replays_write_effect_once_after_restart(tmp
     workspace = Path(request["workspace_path"])
     state_root = Path(request["runtime_state_root"])
     identity = RecoveryIdentity(
-        operation_id=request["operation_id"], execution_material_sha256="b" * 64,
-        workspace=str(workspace.resolve()), task_id="task-1", unit_id="u1", session_id="session-1",
-        allowed_paths=("a.py",), provider_id="google_genai", model_id="test-model",
-        worker_identity_sha256=request["worker_identity_sha256"], transport_config_sha256=cli._sha256("{}"),
-        runtime_identity_sha256=cli._sha256(cli._canonical_json({
-            "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
-            "deepagents": cli._deepagents_version(), "checkpoint_namespace": "open-swe-repair-v1",
-        })),
+        operation_id=request["operation_id"],
+        execution_material_sha256="b" * 64,
+        workspace=str(workspace.resolve()),
+        task_id="task-1",
+        unit_id="u1",
+        session_id="session-1",
+        allowed_paths=("a.py",),
+        provider_id="google_genai",
+        model_id="test-model",
+        worker_identity_sha256=request["worker_identity_sha256"],
+        transport_config_sha256=cli._sha256("{}"),
+        runtime_identity_sha256=cli._sha256(
+            cli._canonical_json({
+                "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
+                "deepagents": cli._deepagents_version(),
+                "checkpoint_namespace": "open-swe-repair-v1",
+            })
+        ),
     )
     journal = DurableOperationJournal(state_root, identity)
     journal.prepare()
     journal.ask_dispatching(turn_id="turn-1", prompt="repair", ordinal=0)
     journal.conversation_bound("conversation-1")
-    cli._atomic_json(cli._operation_path(request), {
-        **cli._write_started(request, "worker"), "status": "OPEN_SWE_OUTCOME_UNKNOWN",
-        "outcome_unknown": True, "retry_safe": False,
-        "execution_material_sha256": identity.execution_material_sha256, "session_id": identity.session_id,
-    })
-    checkpoint, _ = cli.create_checkpoint(state_root, request["operation_id"], identity.checkpoint_namespace)
+    cli._atomic_json(
+        cli._operation_path(request),
+        {
+            **cli._write_started(request, "worker"),
+            "status": "OPEN_SWE_OUTCOME_UNKNOWN",
+            "outcome_unknown": True,
+            "retry_safe": False,
+            "execution_material_sha256": identity.execution_material_sha256,
+            "session_id": identity.session_id,
+        },
+    )
+    checkpoint, _ = cli.create_checkpoint(
+        state_root, request["operation_id"], identity.checkpoint_namespace
+    )
     checkpoint.conn.close()
 
     class RecoveryModel(BaseChatModel):
@@ -106,23 +122,47 @@ def test_worker_reconcile_real_graph_replays_write_effect_once_after_restart(tmp
             return '{"type":"tool_call","name":"write_file","arguments":{"file_path":"a.py","content":"done\\n"}}'
 
         def _response_message(self, _response, _tools):
-            return AIMessage(content="", tool_calls=[{
-                "name": "write_file", "args": {"file_path": "a.py", "content": "done\n"},
-                "id": "call-1", "type": "tool_call",
-            }])
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_file",
+                        "args": {"file_path": "a.py", "content": "done\n"},
+                        "id": "call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            )
 
         def _generate(self, messages, **kwargs):
-            if any(getattr(message, "name", None) == "record_worker_result" for message in messages):
+            if any(
+                getattr(message, "name", None) == "record_worker_result" for message in messages
+            ):
                 return ChatResult(generations=[ChatGeneration(message=AIMessage(content="done"))])
             self.continuation_conversations.append("conversation-1")
-            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="", tool_calls=[{
-                "name": "record_worker_result", "args": {"envelope": {"summary": "done"}},
-                "id": "record-1", "type": "tool_call",
-            }]))])
+            return ChatResult(
+                generations=[
+                    ChatGeneration(
+                        message=AIMessage(
+                            content="",
+                            tool_calls=[
+                                {
+                                    "name": "record_worker_result",
+                                    "args": {"envelope": {"summary": "done"}},
+                                    "id": "record-1",
+                                    "type": "tool_call",
+                                }
+                            ],
+                        )
+                    )
+                ]
+            )
 
     model = RecoveryModel()
     result = cli._worker_reconcile(
-        request, runtime_loader=cli._load_runtime, model_builder=lambda *_args: model,
+        request,
+        runtime_loader=cli._load_runtime,
+        model_builder=lambda *_args: model,
         graph_builder=cli.build_repair_graph,
     )
     assert result["status"] == "COMPLETED"
@@ -143,7 +183,9 @@ class FakeGraph:
 
     def get_graph(self):
         tools = {name: object() for name in self.surface}
-        return SimpleNamespace(nodes={"tools": SimpleNamespace(data=SimpleNamespace(tools_by_name=tools))})
+        return SimpleNamespace(
+            nodes={"tools": SimpleNamespace(data=SimpleNamespace(tools_by_name=tools))}
+        )
 
     def invoke(self, _payload, config=None):
         self.calls += 1
@@ -212,14 +254,12 @@ def _worker_request(tmp_path: Path) -> dict:
         "runtime_state_root": str(tmp_path / "state"),
         "workspace_path": str(workspace),
         "artifact_path": str(artifact),
-        "prompt": "\n".join(
-            [
-                "task_id=task-1",
-                "unit_id=u1",
-                'authorized_mutation_paths=["a.py"]',
-                "bounded repair",
-            ]
-        ),
+        "prompt": "\n".join([
+            "task_id=task-1",
+            "unit_id=u1",
+            'authorized_mutation_paths=["a.py"]',
+            "bounded repair",
+        ]),
         "session_id": "",
         "worker_identity_sha256": "c" * 64,
     }
@@ -418,23 +458,28 @@ def test_worker_supported_diagnosis_and_repair_use_distinct_phase_models(tmp_pat
         request.get("transport_config"),
         request["runtime_state_root"],
     )
-    assert events == ["model", "diagnosis_graph", "diagnosis_invoke", "model", "repair_graph", "repair_invoke"]
+    assert events == [
+        "model",
+        "diagnosis_graph",
+        "diagnosis_invoke",
+        "model",
+        "repair_graph",
+        "repair_invoke",
+    ]
 
 
 def test_worker_opencli_repair_phase_starts_without_diagnosis_conversation(tmp_path):
     request = _worker_request(tmp_path)
-    request.update(
-        {
-            "provider_id": "opencli_chatgpt",
-            "model_id": "very-high",
-            "transport_config": {
-                "executable": "/opt/opencli",
-                "profile": "balanced",
-                "site_session": "ephemeral",
-                "timeout_seconds": 120,
-            },
-        }
-    )
+    request.update({
+        "provider_id": "opencli_chatgpt",
+        "model_id": "very-high",
+        "transport_config": {
+            "executable": "/opt/opencli",
+            "profile": "balanced",
+            "site_session": "ephemeral",
+            "timeout_seconds": 120,
+        },
+    })
     diagnosis = FakeGraph(
         cli.DIAGNOSIS_TOOLS,
         _record(
@@ -712,7 +757,9 @@ def test_worker_ambiguous_repair_is_durable_unknown_and_not_reexecuted(tmp_path)
     assert repair.calls == 1
 
 
-def test_worker_reconcile_does_not_substitute_completed_operation_from_stale_workspace_index(tmp_path):
+def test_worker_reconcile_does_not_substitute_completed_operation_from_stale_workspace_index(
+    tmp_path,
+):
     """A workspace index entry for operation A cannot complete target operation B."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -729,9 +776,7 @@ def test_worker_reconcile_does_not_substitute_completed_operation_from_stale_wor
         "outcome_unknown": False,
         "retry_safe": False,
     }
-    cli._atomic_json(
-        state_root / "operations" / f"{operation_a}.json", completed_a
-    )
+    cli._atomic_json(state_root / "operations" / f"{operation_a}.json", completed_a)
     cli._atomic_json(
         state_root / "workspaces" / f"{cli._sha256(str(workspace.resolve()))}.json",
         completed_a,
@@ -746,15 +791,13 @@ def test_worker_reconcile_does_not_substitute_completed_operation_from_stale_wor
         },
     )
 
-    result = cli.dispatch(
-        {
-            "schema": cli.REQUEST_SCHEMA,
-            "operation": "worker_reconcile",
-            "operation_id": operation_b,
-            "runtime_state_root": str(state_root),
-            "workspace_path": str(workspace),
-        }
-    )
+    result = cli.dispatch({
+        "schema": cli.REQUEST_SCHEMA,
+        "operation": "worker_reconcile",
+        "operation_id": operation_b,
+        "runtime_state_root": str(state_root),
+        "workspace_path": str(workspace),
+    })
 
     assert result["operation_id"] == operation_b
     assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
@@ -785,18 +828,16 @@ def test_worker_reconcile_fails_closed_on_same_operation_material_mismatch(tmp_p
         },
     )
 
-    result = cli.dispatch(
-        {
-            "schema": cli.REQUEST_SCHEMA,
-            "operation": "worker_reconcile",
-            "operation_id": operation_id,
-            "runtime_state_root": str(state_root),
-            "workspace_path": str(other_workspace),
-            "provider_id": "provider-a",
-            "model_id": "model-a",
-            "worker_identity_sha256": "d" * 64,
-        }
-    )
+    result = cli.dispatch({
+        "schema": cli.REQUEST_SCHEMA,
+        "operation": "worker_reconcile",
+        "operation_id": operation_id,
+        "runtime_state_root": str(state_root),
+        "workspace_path": str(other_workspace),
+        "provider_id": "provider-a",
+        "model_id": "model-a",
+        "worker_identity_sha256": "d" * 64,
+    })
 
     assert result["operation_id"] == operation_id
     assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
@@ -810,36 +851,59 @@ def test_worker_reconcile_direct_restart_trace_has_one_winner_and_zero_call_lose
     target.write_text("old\n", encoding="utf-8")
     state_root = tmp_path / "state"
     operation_id = "r" * 64
-    runtime_identity = cli._sha256(cli._canonical_json({
-        "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
-        "deepagents": cli._deepagents_version(),
-        "checkpoint_namespace": "open-swe-repair-v1",
-    }))
+    runtime_identity = cli._sha256(
+        cli._canonical_json({
+            "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
+            "deepagents": cli._deepagents_version(),
+            "checkpoint_namespace": "open-swe-repair-v1",
+        })
+    )
     identity = RecoveryIdentity(
-        operation_id=operation_id, execution_material_sha256="b" * 64,
-        workspace=str(workspace.resolve()), task_id="task-1", unit_id="unit-1",
-        session_id="session-1", allowed_paths=("a.py",), provider_id="google_genai",
-        model_id="test-model", worker_identity_sha256="c" * 64,
-        transport_config_sha256=cli._sha256("{}"), runtime_identity_sha256=runtime_identity,
+        operation_id=operation_id,
+        execution_material_sha256="b" * 64,
+        workspace=str(workspace.resolve()),
+        task_id="task-1",
+        unit_id="unit-1",
+        session_id="session-1",
+        allowed_paths=("a.py",),
+        provider_id="google_genai",
+        model_id="test-model",
+        worker_identity_sha256="c" * 64,
+        transport_config_sha256=cli._sha256("{}"),
+        runtime_identity_sha256=runtime_identity,
     )
     journal = DurableOperationJournal(state_root, identity)
     journal.prepare()
     journal.ask_dispatching(turn_id="turn-1", prompt="repair", ordinal=0)
     journal.conversation_bound("conversation-1")
     op_state = {
-        "schema": cli.RESULT_SCHEMA, "kind": "worker", "status": "OPEN_SWE_OUTCOME_UNKNOWN",
-        "operation_id": operation_id, "directory": str(workspace.resolve()),
-        "provider_id": "google_genai", "model_id": "test-model",
-        "worker_identity_sha256": "c" * 64, "process_started": True,
-        "outcome_unknown": True, "retry_safe": False,
+        "schema": cli.RESULT_SCHEMA,
+        "kind": "worker",
+        "status": "OPEN_SWE_OUTCOME_UNKNOWN",
+        "operation_id": operation_id,
+        "directory": str(workspace.resolve()),
+        "provider_id": "google_genai",
+        "model_id": "test-model",
+        "worker_identity_sha256": "c" * 64,
+        "process_started": True,
+        "outcome_unknown": True,
+        "retry_safe": False,
     }
-    cli._atomic_json(cli._operation_path({"runtime_state_root": str(state_root), "operation_id": operation_id}), op_state)
+    cli._atomic_json(
+        cli._operation_path({"runtime_state_root": str(state_root), "operation_id": operation_id}),
+        op_state,
+    )
     checkpoint, _ = create_checkpoint(state_root, operation_id, "open-swe-repair-v1")
     request = {
-        "schema": cli.REQUEST_SCHEMA, "operation": "worker_reconcile", "operation_id": operation_id,
-        "runtime_state_root": str(state_root), "workspace_path": str(workspace),
-        "provider_id": "google_genai", "model_id": "test-model",
-        "worker_identity_sha256": "c" * 64, "transport_config": {},
+        "schema": cli.REQUEST_SCHEMA,
+        "operation": "worker_reconcile",
+        "operation_id": operation_id,
+        "runtime_state_root": str(state_root),
+        "workspace_path": str(workspace),
+        "provider_id": "google_genai",
+        "model_id": "test-model",
+        "worker_identity_sha256": "c" * 64,
+        "transport_config": {},
     }
     counters = {"detail": 0, "update": 0, "invoke": 0, "effect": 0, "continuation": 0}
     barrier = __import__("threading").Barrier(2)
@@ -857,7 +921,18 @@ def test_worker_reconcile_direct_restart_trace_has_one_winner_and_zero_call_lose
 
         def _response_message(self, response, tools):
             from langchain_core.messages import AIMessage
-            return AIMessage(content="", tool_calls=[{"name": "write_file", "args": {"file_path": "a.py", "content": "done\n"}, "id": "call-1", "type": "tool_call"}])
+
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_file",
+                        "args": {"file_path": "a.py", "content": "done\n"},
+                        "id": "call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            )
 
         def continue_same_conversation(self):
             assert self._conversation_id == "conversation-1"
@@ -880,7 +955,23 @@ def test_worker_reconcile_direct_restart_trace_has_one_winner_and_zero_call_lose
                 """Write one file."""
                 return file_path + content
 
-            return type("G", (), {"nodes": {"tools": type("T", (), {"data": type("D", (), {"tools_by_name": {"write_file": write_file}})()})()}})()
+            return type(
+                "G",
+                (),
+                {
+                    "nodes": {
+                        "tools": type(
+                            "T",
+                            (),
+                            {
+                                "data": type(
+                                    "D", (), {"tools_by_name": {"write_file": write_file}}
+                                )()
+                            },
+                        )()
+                    }
+                },
+            )()
 
         def update_state(self, config, values, *, as_node):
             counters["update"] += 1
@@ -891,9 +982,7 @@ def test_worker_reconcile_direct_restart_trace_has_one_winner_and_zero_call_lose
         def invoke(self, payload, *, config):
             counters["invoke"] += 1
             assert payload is None
-            backend = cli.ScopedRepairBackend(
-                Delegate(), workspace, ("a.py",), self.effect_journal
-            )
+            backend = cli.ScopedRepairBackend(Delegate(), workspace, ("a.py",), self.effect_journal)
             backend.write("a.py", "done\n")
             counters["effect"] += 1
             self.model.continue_same_conversation()
@@ -902,7 +991,9 @@ def test_worker_reconcile_direct_restart_trace_has_one_winner_and_zero_call_lose
     def run():
         barrier.wait()
         return cli._worker_reconcile(
-            request, runtime_loader=lambda: {}, model_builder=lambda *_args: Model(),
+            request,
+            runtime_loader=lambda: {},
+            model_builder=lambda *_args: Model(),
             graph_builder=lambda model, *_args: Graph(model, _args[-1]),
         )
 
@@ -920,39 +1011,62 @@ def test_worker_reconcile_repairs_malformed_write_before_checkpoint_resume(tmp_p
     target.write_text("old\n", encoding="utf-8")
     state_root = tmp_path / "state"
     operation_id = "q" * 64
-    runtime_identity = cli._sha256(cli._canonical_json({
-        "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
-        "deepagents": cli._deepagents_version(),
-        "checkpoint_namespace": "open-swe-repair-v1",
-    }))
+    runtime_identity = cli._sha256(
+        cli._canonical_json({
+            "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
+            "deepagents": cli._deepagents_version(),
+            "checkpoint_namespace": "open-swe-repair-v1",
+        })
+    )
     identity = RecoveryIdentity(
-        operation_id=operation_id, execution_material_sha256="b" * 64,
-        workspace=str(workspace.resolve()), task_id="task-1", unit_id="unit-1",
-        session_id="session-1", allowed_paths=("a.py",), provider_id="google_genai",
-        model_id="test-model", worker_identity_sha256="c" * 64,
-        transport_config_sha256=cli._sha256("{}"), runtime_identity_sha256=runtime_identity,
+        operation_id=operation_id,
+        execution_material_sha256="b" * 64,
+        workspace=str(workspace.resolve()),
+        task_id="task-1",
+        unit_id="unit-1",
+        session_id="session-1",
+        allowed_paths=("a.py",),
+        provider_id="google_genai",
+        model_id="test-model",
+        worker_identity_sha256="c" * 64,
+        transport_config_sha256=cli._sha256("{}"),
+        runtime_identity_sha256=runtime_identity,
     )
     journal = DurableOperationJournal(state_root, identity)
     journal.prepare()
     journal.ask_dispatching(turn_id="turn-1", prompt="repair", ordinal=0)
     journal.conversation_bound("conversation-1")
-    cli._atomic_json(cli._operation_path({"runtime_state_root": str(state_root), "operation_id": operation_id}), {
-        "schema": cli.RESULT_SCHEMA, "kind": "worker", "status": "OPEN_SWE_OUTCOME_UNKNOWN",
-        "operation_id": operation_id, "directory": str(workspace.resolve()),
-        "provider_id": "google_genai", "model_id": "test-model",
-        "worker_identity_sha256": "c" * 64, "process_started": True,
-        "outcome_unknown": True, "retry_safe": False,
-    })
+    cli._atomic_json(
+        cli._operation_path({"runtime_state_root": str(state_root), "operation_id": operation_id}),
+        {
+            "schema": cli.RESULT_SCHEMA,
+            "kind": "worker",
+            "status": "OPEN_SWE_OUTCOME_UNKNOWN",
+            "operation_id": operation_id,
+            "directory": str(workspace.resolve()),
+            "provider_id": "google_genai",
+            "model_id": "test-model",
+            "worker_identity_sha256": "c" * 64,
+            "process_started": True,
+            "outcome_unknown": True,
+            "retry_safe": False,
+        },
+    )
     checkpoint_file = cli.checkpoint_path(state_root, operation_id)
     checkpoint_file.write_bytes(b"checkpoint")
     checkpoint_file.chmod(0o600)
     monkeypatch.setattr(cli, "validate_checkpoint", lambda _path: True)
     monkeypatch.setattr(cli, "create_checkpoint", lambda *_args: (object(), "open-swe-repair-v1"))
     request = {
-        "schema": cli.REQUEST_SCHEMA, "operation": "worker_reconcile", "operation_id": operation_id,
-        "runtime_state_root": str(state_root), "workspace_path": str(workspace),
-        "provider_id": "google_genai", "model_id": "test-model",
-        "worker_identity_sha256": "c" * 64, "transport_config": {},
+        "schema": cli.REQUEST_SCHEMA,
+        "operation": "worker_reconcile",
+        "operation_id": operation_id,
+        "runtime_state_root": str(state_root),
+        "workspace_path": str(workspace),
+        "provider_id": "google_genai",
+        "model_id": "test-model",
+        "worker_identity_sha256": "c" * 64,
+        "transport_config": {},
     }
     malformed = (
         '{"type":"tool_call","name":"write_file","arguments":'
@@ -976,8 +1090,12 @@ def test_worker_reconcile_repairs_malformed_write_before_checkpoint_resume(tmp_p
         def _refresh_protocol_response(self, response, *, turn_id):
             return response
 
-        _is_complete_protocol_response = staticmethod(OpenCLIWebChatModel._is_complete_protocol_response)
-        _repair_matches_invalid_response = staticmethod(OpenCLIWebChatModel._repair_matches_invalid_response)
+        _is_complete_protocol_response = staticmethod(
+            OpenCLIWebChatModel._is_complete_protocol_response
+        )
+        _repair_matches_invalid_response = staticmethod(
+            OpenCLIWebChatModel._repair_matches_invalid_response
+        )
 
         def _repair_protocol_response(self, response):
             calls["repair"] += 1
@@ -991,35 +1109,54 @@ def test_worker_reconcile_repairs_malformed_write_before_checkpoint_resume(tmp_p
 
         def _response_message(self, *_args):
             from langchain_core.messages import AIMessage
-            return AIMessage(content="", tool_calls=[{
-                "name": "write_file", "args": {"file_path": "a.py", "content": 'VALUE = "2"\n'},
-                "id": "call-1", "type": "tool_call",
-            }])
+
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_file",
+                        "args": {"file_path": "a.py", "content": 'VALUE = "2"\n'},
+                        "id": "call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            )
 
     class Graph:
         def __init__(self, effect_journal):
             self.effect_journal = effect_journal
 
         def get_graph(self):
-            return type("G", (), {"nodes": {"tools": type("T", (), {"data": type("D", (), {"tools_by_name": {}})()})()}})()
+            return type(
+                "G",
+                (),
+                {
+                    "nodes": {
+                        "tools": type("T", (), {"data": type("D", (), {"tools_by_name": {}})()})()
+                    }
+                },
+            )()
 
         def update_state(self, *_args, **_kwargs):
             calls["update"] += 1
 
         def invoke(self, *_args, **_kwargs):
             calls["invoke"] += 1
+
             class Delegate:
                 def write(_self, file_path, content):
                     calls["write"] += 1
                     target.write_text(content, encoding="utf-8")
 
-            cli.ScopedRepairBackend(
-                Delegate(), workspace, ("a.py",), self.effect_journal
-            ).write("a.py", 'VALUE = "2"\n')
+            cli.ScopedRepairBackend(Delegate(), workspace, ("a.py",), self.effect_journal).write(
+                "a.py", 'VALUE = "2"\n'
+            )
             return _record("record_worker_result", {"summary": "recovered"})
 
     result = cli._worker_reconcile(
-        request, runtime_loader=lambda: {}, model_builder=lambda *_args: Model(),
+        request,
+        runtime_loader=lambda: {},
+        model_builder=lambda *_args: Model(),
         graph_builder=lambda *_args: Graph(_args[-1]),
     )
     assert result["status"] == "COMPLETED"
@@ -1030,7 +1167,9 @@ def test_worker_reconcile_repairs_malformed_write_before_checkpoint_resume(tmp_p
     assert json.loads(effects[0].read_text(encoding="utf-8"))["status"] == "RESULT"
 
 
-'''REMOVED_PENDING_TEST'''
+"""REMOVED_PENDING_TEST"""
+
+
 def test_worker_reconcile_pending_repair_projects_locally_then_continues_original_conversation(
     tmp_path, monkeypatch
 ):
@@ -1039,17 +1178,26 @@ def test_worker_reconcile_pending_repair_projects_locally_then_continues_origina
     (workspace / "a.py").write_text("old\n", encoding="utf-8")
     state_root = tmp_path / "state"
     operation_id = "h" * 64
-    runtime_identity = cli._sha256(cli._canonical_json({
-        "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
-        "deepagents": cli._deepagents_version(),
-        "checkpoint_namespace": "open-swe-repair-v1",
-    }))
+    runtime_identity = cli._sha256(
+        cli._canonical_json({
+            "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
+            "deepagents": cli._deepagents_version(),
+            "checkpoint_namespace": "open-swe-repair-v1",
+        })
+    )
     identity = RecoveryIdentity(
-        operation_id=operation_id, execution_material_sha256="b" * 64,
-        workspace=str(workspace.resolve()), task_id="task-1", unit_id="unit-1",
-        session_id="session-1", allowed_paths=("a.py",), provider_id="opencli_chatgpt",
-        model_id="balanced", worker_identity_sha256="c" * 64,
-        transport_config_sha256=cli._sha256("{}"), runtime_identity_sha256=runtime_identity,
+        operation_id=operation_id,
+        execution_material_sha256="b" * 64,
+        workspace=str(workspace.resolve()),
+        task_id="task-1",
+        unit_id="unit-1",
+        session_id="session-1",
+        allowed_paths=("a.py",),
+        provider_id="opencli_chatgpt",
+        model_id="balanced",
+        worker_identity_sha256="c" * 64,
+        transport_config_sha256=cli._sha256("{}"),
+        runtime_identity_sha256=runtime_identity,
     )
     journal = DurableOperationJournal(state_root, identity)
     journal.prepare()
@@ -1066,29 +1214,41 @@ def test_worker_reconcile_pending_repair_projects_locally_then_continues_origina
     )
     # Preserve the old conversation as the pre-repair binding and dispatch state.
     journal._transition(
-        protocol_repair_origin_sha256=cli._sha256(
-            origin
-        ),
+        protocol_repair_origin_sha256=cli._sha256(origin),
         turn_id="turn_repair_1",
         status="ASK_DISPATCHING",
     )
-    cli._atomic_json(cli._operation_path({"runtime_state_root": str(state_root), "operation_id": operation_id}), {
-        "schema": cli.RESULT_SCHEMA, "kind": "worker", "status": "OPEN_SWE_OUTCOME_UNKNOWN",
-        "operation_id": operation_id, "directory": str(workspace.resolve()),
-        "provider_id": "opencli_chatgpt", "model_id": "balanced",
-        "worker_identity_sha256": "c" * 64, "process_started": True,
-        "outcome_unknown": True, "retry_safe": False,
-    })
+    cli._atomic_json(
+        cli._operation_path({"runtime_state_root": str(state_root), "operation_id": operation_id}),
+        {
+            "schema": cli.RESULT_SCHEMA,
+            "kind": "worker",
+            "status": "OPEN_SWE_OUTCOME_UNKNOWN",
+            "operation_id": operation_id,
+            "directory": str(workspace.resolve()),
+            "provider_id": "opencli_chatgpt",
+            "model_id": "balanced",
+            "worker_identity_sha256": "c" * 64,
+            "process_started": True,
+            "outcome_unknown": True,
+            "retry_safe": False,
+        },
+    )
     checkpoint_file = cli.checkpoint_path(state_root, operation_id)
     checkpoint_file.write_bytes(b"checkpoint")
     checkpoint_file.chmod(0o600)
     monkeypatch.setattr(cli, "validate_checkpoint", lambda _path: True)
     monkeypatch.setattr(cli, "create_checkpoint", lambda *_args: (object(), "open-swe-repair-v1"))
     request = {
-        "schema": cli.REQUEST_SCHEMA, "operation": "worker_reconcile", "operation_id": operation_id,
-        "runtime_state_root": str(state_root), "workspace_path": str(workspace),
-        "provider_id": "opencli_chatgpt", "model_id": "balanced",
-        "worker_identity_sha256": "c" * 64, "transport_config": {},
+        "schema": cli.REQUEST_SCHEMA,
+        "operation": "worker_reconcile",
+        "operation_id": operation_id,
+        "runtime_state_root": str(state_root),
+        "workspace_path": str(workspace),
+        "provider_id": "opencli_chatgpt",
+        "model_id": "balanced",
+        "worker_identity_sha256": "c" * 64,
+        "transport_config": {},
     }
     repaired = '{"type":"tool_call","name":"write_file","arguments":{"file_path":"a.py","content":"new \\"v\\""}}'
     counters = {"history": 0, "detail": 0, "repair": 0, "ask": 0}
@@ -1096,8 +1256,17 @@ def test_worker_reconcile_pending_repair_projects_locally_then_continues_origina
 
     model = OpenCLIWebChatModel(executable="/opt/opencli", intelligence_level="balanced")
     from langchain_core.messages import AIMessage
+
     model._response_message = lambda *_args: AIMessage(
-        content="", tool_calls=[{"name": "write_file", "args": {"file_path": "a.py", "content": 'new "v"'}, "id": "call-1", "type": "tool_call"}]
+        content="",
+        tool_calls=[
+            {
+                "name": "write_file",
+                "args": {"file_path": "a.py", "content": 'new "v"'},
+                "id": "call-1",
+                "type": "tool_call",
+            }
+        ],
     )
 
     class Graph:
@@ -1112,7 +1281,23 @@ def test_worker_reconcile_pending_repair_projects_locally_then_continues_origina
                 """Write one file."""
                 return file_path + content
 
-            return type("G", (), {"nodes": {"tools": type("T", (), {"data": type("D", (), {"tools_by_name": {"write_file": write_file}})()})()}})()
+            return type(
+                "G",
+                (),
+                {
+                    "nodes": {
+                        "tools": type(
+                            "T",
+                            (),
+                            {
+                                "data": type(
+                                    "D", (), {"tools_by_name": {"write_file": write_file}}
+                                )()
+                            },
+                        )()
+                    }
+                },
+            )()
 
         def update_state(self, *_args, **_kwargs):
             pass
@@ -1129,22 +1314,32 @@ def test_worker_reconcile_pending_repair_projects_locally_then_continues_origina
             raise AssertionError("local projection must not scan history")
         if args[1:3] == ["chatgpt", "detail"]:
             counters["detail"] += 1
-            return SimpleNamespace(returncode=0, stdout=json.dumps([
-                {"Role": "User", "Text": latest_prompt, "Generating": False},
-                {"Role": "Assistant", "Text": repaired, "Generating": False},
-            ]), stderr="")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Role": "User", "Text": latest_prompt, "Generating": False},
+                    {"Role": "Assistant", "Text": repaired, "Generating": False},
+                ]),
+                stderr="",
+            )
         if args[1:3] == ["chatgpt", "ask"]:
             counters["ask"] += 1
             latest_prompt = args[3]
             assert "--conversation" in args
             assert args[args.index("--conversation") + 1] == "conversation-old"
             assert "--new" not in args
-            return SimpleNamespace(returncode=0, stdout=json.dumps([{"conversationId": "conversation-old", "response": ""}]), stderr="")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": "conversation-old", "response": ""}]),
+                stderr="",
+            )
         raise AssertionError(args)
 
     monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
     result = cli._worker_reconcile(
-        request, runtime_loader=lambda: {}, model_builder=lambda *_args: model,
+        request,
+        runtime_loader=lambda: {},
+        model_builder=lambda *_args: model,
         graph_builder=lambda model, *_args: Graph(model),
     )
     assert result["status"] == "COMPLETED"
@@ -1201,9 +1396,12 @@ def test_fresh_repair_timeout_with_non_projectable_pending_origin_uses_history_f
     monkeypatch.setattr(model, "_run", fake_run)
     monkeypatch.setattr(model, "_detail_response", lambda *_args, **_kwargs: repaired)
 
-    assert model._reconcile_fresh_repair_timeout(
-        "turn_repair_fallback", "conversation-original", "resume"
-    ) == repaired
+    assert (
+        model._reconcile_fresh_repair_timeout(
+            "turn_repair_fallback", "conversation-original", "resume"
+        )
+        == repaired
+    )
     assert [call[2] for call in calls] == ["history", "detail"]
     assert calls[1][3] == "conversation-repair"
     assert model._conversation_id == "conversation-repair"
@@ -1271,9 +1469,14 @@ def test_restart_trace_uses_real_opencli_conversation_for_continuation(tmp_path,
         operation_id="s" * 64,
         execution_material_sha256="a" * 64,
         workspace=str(workspace.resolve()),
-        task_id="task-1", unit_id="unit-1", session_id="session-1",
-        allowed_paths=("a.py",), provider_id="opencli_chatgpt", model_id="balanced",
-        worker_identity_sha256="b" * 64, transport_config_sha256=cli._sha256("{}"),
+        task_id="task-1",
+        unit_id="unit-1",
+        session_id="session-1",
+        allowed_paths=("a.py",),
+        provider_id="opencli_chatgpt",
+        model_id="balanced",
+        worker_identity_sha256="b" * 64,
+        transport_config_sha256=cli._sha256("{}"),
         runtime_identity_sha256="c" * 64,
     )
     journal = DurableOperationJournal(state_root, identity)
@@ -1300,13 +1503,26 @@ def test_restart_trace_uses_real_opencli_conversation_for_continuation(tmp_path,
             response = (
                 '{"type":"tool_call","name":"write_file","arguments":'
                 '{"file_path":"a.py","content":"done\\n"}}'
-                if ask_count == 1 else '{"type":"final","content":"continued"}'
+                if ask_count == 1
+                else '{"type":"final","content":"continued"}'
             )
             return SimpleNamespace(
                 returncode=0,
                 stdout=json.dumps([
-                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False, "StableSeconds": 6},
-                    {"Index": 2, "Role": "Assistant", "Text": response, "Generating": False, "StableSeconds": 6},
+                    {
+                        "Index": 1,
+                        "Role": "User",
+                        "Text": latest_prompt,
+                        "Generating": False,
+                        "StableSeconds": 6,
+                    },
+                    {
+                        "Index": 2,
+                        "Role": "Assistant",
+                        "Text": response,
+                        "Generating": False,
+                        "StableSeconds": 6,
+                    },
                 ]),
                 stderr="",
             )
@@ -1315,8 +1531,12 @@ def test_restart_trace_uses_real_opencli_conversation_for_continuation(tmp_path,
     monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
     first_model = OpenCLIWebChatModel(executable="/opt/opencli", intelligence_level="balanced")
     first_model.configure_recovery_journal(journal)
-    tools = [{"type": "function", "function": {"name": "write_file", "parameters": {"type": "object"}}}]
-    first = first_model._generate([HumanMessage(content="initial")], tools=tools).generations[0].message
+    tools = [
+        {"type": "function", "function": {"name": "write_file", "parameters": {"type": "object"}}}
+    ]
+    first = (
+        first_model._generate([HumanMessage(content="initial")], tools=tools).generations[0].message
+    )
     assert first.tool_calls[0]["id"]
     assert journal.read()["conversation_id"] == "conversation-1"
 
@@ -1325,10 +1545,20 @@ def test_restart_trace_uses_real_opencli_conversation_for_continuation(tmp_path,
     assert restarted._detail_response is not None
     recovered = cli.reconcile_bound_turn(journal, restarted)
     assert json.loads(recovered)["type"] == "tool_call"
-    continuation = restarted._generate(
-        [first, ToolMessage(content="written", tool_call_id=first.tool_calls[0]["id"], name="write_file")],
-        tools=tools,
-    ).generations[0].message
+    continuation = (
+        restarted
+        ._generate(
+            [
+                first,
+                ToolMessage(
+                    content="written", tool_call_id=first.tool_calls[0]["id"], name="write_file"
+                ),
+            ],
+            tools=tools,
+        )
+        .generations[0]
+        .message
+    )
     assert continuation.content == "continued"
     asks = [argv for argv, _kwargs in calls if argv[1:3] == ["chatgpt", "ask"]]
     assert len(asks) == 2
@@ -1338,7 +1568,9 @@ def test_restart_trace_uses_real_opencli_conversation_for_continuation(tmp_path,
     assert "--new" not in asks[1]
 
 
-def test_worker_replay_with_changed_material_does_not_return_cached_terminal_or_redispatch(tmp_path):
+def test_worker_replay_with_changed_material_does_not_return_cached_terminal_or_redispatch(
+    tmp_path,
+):
     request = _worker_request(tmp_path)
     workspace = Path(request["workspace_path"])
     operation_id = request["operation_id"]
@@ -1379,7 +1611,15 @@ def test_worker_replay_with_changed_material_does_not_return_cached_terminal_or_
 
 @pytest.mark.parametrize(
     "material",
-    ["prompt", "artifact", "session", "operation", "provider_id", "model_id", "worker_identity_sha256"],
+    [
+        "prompt",
+        "artifact",
+        "session",
+        "operation",
+        "provider_id",
+        "model_id",
+        "worker_identity_sha256",
+    ],
 )
 def test_worker_replay_changed_execution_material_fails_closed(tmp_path, material):
     request = _worker_request(tmp_path)
@@ -1617,7 +1857,9 @@ def test_runtime_state_files_are_restrictive_and_contain_no_environment(tmp_path
         model_factory=lambda *_args: object(),
         graph_factory=lambda *_args: graph,
     )
-    state_file = Path(request["runtime_state_root"]) / "operations" / f"{request['operation_id']}.json"
+    state_file = (
+        Path(request["runtime_state_root"]) / "operations" / f"{request['operation_id']}.json"
+    )
     text = state_file.read_text(encoding="utf-8")
     assert "GEMINI_API_KEY" not in text
     assert "GITHUB_TOKEN" not in text
@@ -1808,10 +2050,13 @@ def test_legacy_client_contract_frozen_fixture(tmp_path: Path):
 
     graph = FakeGraph(
         cli.SEMANTIC_TOOLS,
-        _record("record_finding", {
-            "schema": "external_execution_envelope.v1",
-            "findings": [{"file": "sample.py", "line": 1}],
-        }),
+        _record(
+            "record_finding",
+            {
+                "schema": "external_execution_envelope.v1",
+                "findings": [{"file": "sample.py", "line": 1}],
+            },
+        ),
     )
 
     result = cli._semantic_run(
@@ -1841,14 +2086,12 @@ def test_worker_admits_repair_when_absent_create_target_matches_authorized_mutat
     target = workspace / target_rel
     assert not target.exists()
 
-    request["prompt"] = "\n".join(
-        [
-            "task_id=task-1",
-            "unit_id=u1",
-            f'authorized_mutation_paths=["{target_rel}"]',
-            "bounded repair create target",
-        ]
-    )
+    request["prompt"] = "\n".join([
+        "task_id=task-1",
+        "unit_id=u1",
+        f'authorized_mutation_paths=["{target_rel}"]',
+        "bounded repair create target",
+    ])
 
     diagnosis = FakeGraph(
         cli.DIAGNOSIS_TOOLS,
@@ -1892,19 +2135,19 @@ def test_worker_admits_repair_when_absent_create_target_matches_authorized_mutat
 def test_worker_blocks_repair_when_absent_evidence_path_outside_authorized_mutation_paths(tmp_path):
     request = _worker_request(tmp_path)
     workspace = Path(request["workspace_path"])
-    initial_files = {p.relative_to(workspace): p.read_bytes() for p in workspace.rglob("*") if p.is_file()}
+    initial_files = {
+        p.relative_to(workspace): p.read_bytes() for p in workspace.rglob("*") if p.is_file()
+    }
     unauthorized_rel = "tests/ops/unauthorized_absent.py"
     target = workspace / unauthorized_rel
     assert not target.exists()
 
-    request["prompt"] = "\n".join(
-        [
-            "task_id=task-1",
-            "unit_id=u1",
-            'authorized_mutation_paths=["tests/ops/new_canary.py"]',
-            "bounded repair unauthorized",
-        ]
-    )
+    request["prompt"] = "\n".join([
+        "task_id=task-1",
+        "unit_id=u1",
+        'authorized_mutation_paths=["tests/ops/new_canary.py"]',
+        "bounded repair unauthorized",
+    ])
 
     diagnosis = FakeGraph(
         cli.DIAGNOSIS_TOOLS,
@@ -1942,7 +2185,9 @@ def test_worker_blocks_repair_when_absent_evidence_path_outside_authorized_mutat
     assert result["repair_phase_count"] == 0
     assert repair.calls == 0
     assert diagnosis.calls == 1
-    current_files = {p.relative_to(workspace): p.read_bytes() for p in workspace.rglob("*") if p.is_file()}
+    current_files = {
+        p.relative_to(workspace): p.read_bytes() for p in workspace.rglob("*") if p.is_file()
+    }
     assert current_files == initial_files
     assert not target.exists()
 
@@ -1958,14 +2203,12 @@ def test_worker_blocks_repair_when_authorized_absent_path_is_dangling_symlink(tm
     assert target.is_symlink()
     assert not target.exists()
 
-    request["prompt"] = "\n".join(
-        [
-            "task_id=task-1",
-            "unit_id=u1",
-            f'authorized_mutation_paths=["{target_rel}"]',
-            "bounded repair dangling symlink",
-        ]
-    )
+    request["prompt"] = "\n".join([
+        "task_id=task-1",
+        "unit_id=u1",
+        f'authorized_mutation_paths=["{target_rel}"]',
+        "bounded repair dangling symlink",
+    ])
 
     diagnosis = FakeGraph(
         cli.DIAGNOSIS_TOOLS,
@@ -2005,37 +2248,33 @@ def test_worker_blocks_repair_when_authorized_absent_path_is_dangling_symlink(tm
 
 def _v2_request(tmp_path: Path, *, status: str = "PROVEN") -> dict:
     request = _worker_request(tmp_path)
-    request.update(
-        {
-            "provider_id": "opencli_chatgpt",
-            "model_id": "advanced",
-            "transport_config": {
-                "executable": "/usr/bin/opencli",
-                "profile": "r16",
-                "site_session": "ephemeral",
-                "timeout_seconds": 30,
-            },
-        }
-    )
+    request.update({
+        "provider_id": "opencli_chatgpt",
+        "model_id": "advanced",
+        "transport_config": {
+            "executable": "/usr/bin/opencli",
+            "profile": "r16",
+            "site_session": "ephemeral",
+            "timeout_seconds": 30,
+        },
+    })
     workspace = Path(request["workspace_path"])
     (workspace / "a.py").unlink()
     card_ref = "tasks/task-card.md"
     card = workspace / card_ref
     card.parent.mkdir(parents=True)
     card.write_text(
-        "\n".join(
-            [
-                "- task_id: `task-1`",
-                "- status: `ACTIVE`",
-                "- worker_may_approve: `false`",
-                "- worker_may_integrate: `false`",
-                "- worker_may_push: `false`",
-                "- AUTO_CHAIN: `false`",
-                "- allow_deletions: `false`",
-                "\n## Allowed files\n",
-                "- `a.py`",
-            ]
-        ),
+        "\n".join([
+            "- task_id: `task-1`",
+            "- status: `ACTIVE`",
+            "- worker_may_approve: `false`",
+            "- worker_may_integrate: `false`",
+            "- worker_may_push: `false`",
+            "- AUTO_CHAIN: `false`",
+            "- allow_deletions: `false`",
+            "\n## Allowed files\n",
+            "- `a.py`",
+        ]),
         encoding="utf-8",
     )
     card_hash = cli._sha256(card.read_bytes())
@@ -2098,12 +2337,10 @@ def _v2_request(tmp_path: Path, *, status: str = "PROVEN") -> dict:
     selected = envelope["selected_worker"]
     request["worker_identity"] = dict(selected)
     request["worker_identity_sha256"] = cli._sha256(cli._canonical_json(selected))
-    request["prompt"] += "\n" + "\n".join(
-        [
-            f"envelope_sha256={cli._sha256(raw)}",
-            "expected_base_sha=" + "b" * 40,
-        ]
-    )
+    request["prompt"] += "\n" + "\n".join([
+        f"envelope_sha256={cli._sha256(raw)}",
+        "expected_base_sha=" + "b" * 40,
+    ])
     return request
 
 
@@ -2167,7 +2404,9 @@ def test_r17_prose_inspect_first_is_admitted_as_advisory(tmp_path, monkeypatch, 
     raw = cli._canonical_json(envelope)
     Path(request["artifact_path"]).write_text(raw, encoding="utf-8")
     request["prompt"] = request["prompt"].replace(
-        next(line for line in request["prompt"].splitlines() if line.startswith("envelope_sha256=")),
+        next(
+            line for line in request["prompt"].splitlines() if line.startswith("envelope_sha256=")
+        ),
         f"envelope_sha256={cli._sha256(raw)}",
     )
     monkeypatch.setattr(
@@ -2266,7 +2505,9 @@ def test_r17_malformed_admission_inputs_reject_without_calls(tmp_path, monkeypat
         lambda _r, e: e["scope_signal"].update(read_only_authorities=[]),
     ],
 )
-def test_r17_strict_evidence_and_authority_negatives_reject_without_calls(tmp_path, monkeypatch, mutate):
+def test_r17_strict_evidence_and_authority_negatives_reject_without_calls(
+    tmp_path, monkeypatch, mutate
+):
     request = _v2_matrix_request(tmp_path, mutate)
     monkeypatch.setattr(
         cli,
@@ -2319,16 +2560,14 @@ def test_worker_admit_r16_opencli_repair_uses_new_without_conversation(tmp_path,
         if args[1:3] == ["chatgpt", "detail"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps(
-                    [
-                        {"Role": "User", "Text": latest_prompt, "Generating": False},
-                        {
-                            "Role": "Assistant",
-                            "Text": '{"type":"final","content":"repair ok"}',
-                            "Generating": False,
-                        },
-                    ]
-                ),
+                stdout=json.dumps([
+                    {"Role": "User", "Text": latest_prompt, "Generating": False},
+                    {
+                        "Role": "Assistant",
+                        "Text": '{"type":"final","content":"repair ok"}',
+                        "Generating": False,
+                    },
+                ]),
                 stderr="",
             )
         raise AssertionError(args)
@@ -2378,7 +2617,9 @@ def test_worker_admit_r16_opencli_repair_uses_new_without_conversation(tmp_path,
 
 def test_worker_invalid_v2_hash_rejects_before_any_model_or_graph(tmp_path):
     request = _v2_request(tmp_path)
-    request["prompt"] = request["prompt"].replace("envelope_sha256=", "envelope_sha256=" + "0" * 64 + "\n#")
+    request["prompt"] = request["prompt"].replace(
+        "envelope_sha256=", "envelope_sha256=" + "0" * 64 + "\n#"
+    )
     model_calls = 0
 
     def model_factory(*_args):
@@ -2394,13 +2635,16 @@ def test_worker_invalid_v2_hash_rejects_before_any_model_or_graph(tmp_path):
         repair_factory=lambda *_args: pytest.fail("invalid v2 repair"),
     )
     assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
-    assert cli._semantic_v2_admission(
-        request,
-        Path(request["workspace_path"]),
-        Path(request["artifact_path"]),
-        request["prompt"],
-        ("a.py",),
-    ).decision == cli.REJECT
+    assert (
+        cli._semantic_v2_admission(
+            request,
+            Path(request["workspace_path"]),
+            Path(request["artifact_path"]),
+            request["prompt"],
+            ("a.py",),
+        ).decision
+        == cli.REJECT
+    )
     assert model_calls == 0
 
 
@@ -2433,25 +2677,31 @@ def test_v2_artifact_symlink_rejects(tmp_path):
     target = artifact.with_name("artifact-target.json")
     artifact.replace(target)
     artifact.symlink_to(target.name)
-    assert cli._semantic_v2_admission(
-        request,
-        Path(request["workspace_path"]),
-        artifact,
-        request["prompt"],
-        ("a.py",),
-    ).decision == cli.REJECT
+    assert (
+        cli._semantic_v2_admission(
+            request,
+            Path(request["workspace_path"]),
+            artifact,
+            request["prompt"],
+            ("a.py",),
+        ).decision
+        == cli.REJECT
+    )
 
 
 def test_v2_missing_full_worker_identity_rejects(tmp_path):
     request = _v2_request(tmp_path)
     request.pop("worker_identity")
-    assert cli._semantic_v2_admission(
-        request,
-        Path(request["workspace_path"]),
-        Path(request["artifact_path"]),
-        request["prompt"],
-        ("a.py",),
-    ).decision == cli.REJECT
+    assert (
+        cli._semantic_v2_admission(
+            request,
+            Path(request["workspace_path"]),
+            Path(request["artifact_path"]),
+            request["prompt"],
+            ("a.py",),
+        ).decision
+        == cli.REJECT
+    )
 
 
 def test_v2_card_symlink_rejects(tmp_path):
@@ -2461,26 +2711,32 @@ def test_v2_card_symlink_rejects(tmp_path):
     target = workspace / "tasks/card-target.md"
     card.replace(target)
     card.symlink_to(target.name)
-    assert cli._semantic_v2_admission(
-        request,
-        workspace,
-        Path(request["artifact_path"]),
-        request["prompt"],
-        ("a.py",),
-    ).decision == cli.REJECT
+    assert (
+        cli._semantic_v2_admission(
+            request,
+            workspace,
+            Path(request["artifact_path"]),
+            request["prompt"],
+            ("a.py",),
+        ).decision
+        == cli.REJECT
+    )
 
 
 def test_v2_target_symlink_rejects(tmp_path):
     request = _v2_request(tmp_path)
     workspace = Path(request["workspace_path"])
     (workspace / "a.py").symlink_to("tasks/task-card.md")
-    assert cli._semantic_v2_admission(
-        request,
-        workspace,
-        Path(request["artifact_path"]),
-        request["prompt"],
-        ("a.py",),
-    ).decision == cli.REJECT
+    assert (
+        cli._semantic_v2_admission(
+            request,
+            workspace,
+            Path(request["artifact_path"]),
+            request["prompt"],
+            ("a.py",),
+        ).decision
+        == cli.REJECT
+    )
 
 
 def test_v2_intermediate_parent_symlink_rejects_without_model_or_graph(tmp_path, monkeypatch):
@@ -2563,22 +2819,60 @@ def _mutate_card(request: dict, envelope: dict, old: str, new: str) -> None:
         ("card_hash", lambda _r, e: e["binding"].update(task_card_hash="a" * 64)),
         ("card_backtick", lambda r, e: _mutate_card(r, e, "- `a.py`", "- `a.py")),
         ("card_status", lambda r, e: _mutate_card(r, e, "`ACTIVE`", "`PAUSED`")),
-        ("card_auto_chain", lambda r, e: _mutate_card(r, e, "- AUTO_CHAIN: `false`", "- AUTO_CHAIN: `true`")),
-        ("card_deletions", lambda r, e: _mutate_card(r, e, "- allow_deletions: `false`", "- allow_deletions: `true`")),
-        ("card_approve", lambda r, e: _mutate_card(r, e, "- worker_may_approve: `false`", "- worker_may_approve: `true`")),
-        ("card_integrate", lambda r, e: _mutate_card(r, e, "- worker_may_integrate: `false`", "- worker_may_integrate: `true`")),
-        ("card_push", lambda r, e: _mutate_card(r, e, "- worker_may_push: `false`", "- worker_may_push: `true`")),
+        (
+            "card_auto_chain",
+            lambda r, e: _mutate_card(r, e, "- AUTO_CHAIN: `false`", "- AUTO_CHAIN: `true`"),
+        ),
+        (
+            "card_deletions",
+            lambda r, e: _mutate_card(
+                r, e, "- allow_deletions: `false`", "- allow_deletions: `true`"
+            ),
+        ),
+        (
+            "card_approve",
+            lambda r, e: _mutate_card(
+                r, e, "- worker_may_approve: `false`", "- worker_may_approve: `true`"
+            ),
+        ),
+        (
+            "card_integrate",
+            lambda r, e: _mutate_card(
+                r, e, "- worker_may_integrate: `false`", "- worker_may_integrate: `true`"
+            ),
+        ),
+        (
+            "card_push",
+            lambda r, e: _mutate_card(
+                r, e, "- worker_may_push: `false`", "- worker_may_push: `true`"
+            ),
+        ),
         ("scope_paths", lambda _r, e: e["scope_signal"].update(required_test_edit_paths=["b.py"])),
         ("scope_max_files", lambda _r, e: e["scope_signal"].update(max_files=2)),
         ("scope_read_only", lambda _r, e: e["scope_signal"].update(read_only_authorities=[])),
-        ("scope_production", lambda _r, e: e["scope_signal"].update(production_edit_paths=["a.py"])),
-        ("scope_migration", lambda _r, e: e["scope_signal"].update(conditional_migration_paths=["a.py"])),
-        ("task_evidence", lambda _r, e: e["evidence_refs"].__setitem__(0, "source_absence:a.py@" + "a" * 16)),
-        ("source_evidence", lambda _r, e: e["evidence_refs"].__setitem__(1, "source_absence:b.py@" + "b" * 16)),
+        (
+            "scope_production",
+            lambda _r, e: e["scope_signal"].update(production_edit_paths=["a.py"]),
+        ),
+        (
+            "scope_migration",
+            lambda _r, e: e["scope_signal"].update(conditional_migration_paths=["a.py"]),
+        ),
+        (
+            "task_evidence",
+            lambda _r, e: e["evidence_refs"].__setitem__(0, "source_absence:a.py@" + "a" * 16),
+        ),
+        (
+            "source_evidence",
+            lambda _r, e: e["evidence_refs"].__setitem__(1, "source_absence:b.py@" + "b" * 16),
+        ),
         ("worker_mapping", lambda _r, _e: _r["worker_identity"].update(worker_id="other")),
         ("worker_hash", lambda _r, _e: _r.update(worker_identity_sha256="0" * 64)),
         ("context_digest_length", lambda _r, e: e["binding"].update(context_pack_sha256="c" * 16)),
-        ("selected_digest_length", lambda _r, e: e["selected_worker"].update(admission_evidence_hash="a" * 16)),
+        (
+            "selected_digest_length",
+            lambda _r, e: e["selected_worker"].update(admission_evidence_hash="a" * 16),
+        ),
         ("top_keyset", lambda _r, e: e.update(extra=True)),
         ("nested_keyset", lambda _r, e: e["scope_signal"].update(extra=True)),
         ("unknown_schema", lambda _r, e: e.update(schema="external_execution_envelope.unknown")),
@@ -2588,6 +2882,7 @@ def test_v2_hostile_single_fault_rejects_without_model_or_graph(
     tmp_path, monkeypatch, name, mutate
 ):
     request = _v2_matrix_request(tmp_path, mutate)
+
     def fake_git(_workspace, *args):
         if name == "physical_head" and args == ("rev-parse", "HEAD"):
             return "a" * 40
@@ -2659,20 +2954,26 @@ def test_v2_bare_binding_and_strict_origin_are_distinct(tmp_path, monkeypatch):
             ("remote", "get-url", "origin"): "James3014/Nexus-new",
         }[args],
     )
-    assert cli._semantic_v2_admission(
-        request,
-        Path(request["workspace_path"]),
-        Path(request["artifact_path"]),
-        request["prompt"],
-        ("a.py",),
-    ).decision == cli.REJECT
+    assert (
+        cli._semantic_v2_admission(
+            request,
+            Path(request["workspace_path"]),
+            Path(request["artifact_path"]),
+            request["prompt"],
+            ("a.py",),
+        ).decision
+        == cli.REJECT
+    )
 
 
 def test_worker_well_formed_inconclusive_v2_falls_back_to_diagnosis(tmp_path, monkeypatch):
     request = _v2_request(tmp_path, status="INCONCLUSIVE")
     diagnosis = FakeGraph(
         cli.DIAGNOSIS_TOOLS,
-        _record("record_diagnosis", {"status": "INCONCLUSIVE", "summary": "unclear", "evidence_paths": []}),
+        _record(
+            "record_diagnosis",
+            {"status": "INCONCLUSIVE", "summary": "unclear", "evidence_paths": []},
+        ),
     )
     model_calls = 0
 
@@ -2689,13 +2990,16 @@ def test_worker_well_formed_inconclusive_v2_falls_back_to_diagnosis(tmp_path, mo
         repair_factory=lambda *_args: pytest.fail("fallback must not repair"),
     )
     assert result["status"] == "COMPLETED"
-    assert cli._semantic_v2_admission(
-        request,
-        Path(request["workspace_path"]),
-        Path(request["artifact_path"]),
-        request["prompt"],
-        ("a.py",),
-    ).decision == cli.FALLBACK
+    assert (
+        cli._semantic_v2_admission(
+            request,
+            Path(request["workspace_path"]),
+            Path(request["artifact_path"]),
+            request["prompt"],
+            ("a.py",),
+        ).decision
+        == cli.FALLBACK
+    )
     assert model_calls == 1
     assert diagnosis.calls == 1
 
@@ -2703,11 +3007,16 @@ def test_worker_well_formed_inconclusive_v2_falls_back_to_diagnosis(tmp_path, mo
 def test_composite_projector_has_strict_literal_inverse():
     from nexus_open_swe_runtime.opencli_web_model import OpenCLIWebChatModel
 
-    raw = '{"type":"tool_call","name":"write_file_and_record_worker_result","arguments":{"file_path":"a.py","content":"hello \\\"world\\\"","envelope":{"summary":"done"}}}'
+    raw = '{"type":"tool_call","name":"write_file_and_record_worker_result","arguments":{"file_path":"a.py","content":"hello \\"world\\"","envelope":{"summary":"done"}}}'
     projected = OpenCLIWebChatModel._project_unescaped_composite_response(raw)
     assert projected == raw
     assert OpenCLIWebChatModel._inverse_repaired_composite_response(projected) == raw
-    assert OpenCLIWebChatModel._project_unescaped_composite_response(raw.replace('"name":"write_file_and_record_worker_result"', '"name":"write_file"')) is None
+    assert (
+        OpenCLIWebChatModel._project_unescaped_composite_response(
+            raw.replace('"name":"write_file_and_record_worker_result"', '"name":"write_file"')
+        )
+        is None
+    )
 
 
 def _composite_worker_model(
@@ -2717,6 +3026,7 @@ def _composite_worker_model(
     response_override: str | None = None,
 ) -> None:
     """Make the real web model return one valid composite tool call."""
+
     def one_model_send(prompt, **_kwargs):
         sends.append(prompt)
         turn_id = json.loads(prompt)["turn_id"]
@@ -2740,7 +3050,9 @@ def _composite_worker_model(
     model._send_and_reconcile = one_model_send
 
 
-def _composite_recovery_fixture(tmp_path: Path) -> tuple[dict, DurableOperationJournal, DurableEffectJournal]:
+def _composite_recovery_fixture(
+    tmp_path: Path,
+) -> tuple[dict, DurableOperationJournal, DurableEffectJournal]:
     request = _worker_request(tmp_path)
     request.update(
         operation="worker_reconcile",
@@ -2756,19 +3068,27 @@ def _composite_recovery_fixture(tmp_path: Path) -> tuple[dict, DurableOperationJ
     workspace = Path(request["workspace_path"])
     target = workspace / "a.py"
     target.write_text("VALUE = 1\n", encoding="utf-8")
-    runtime_identity = cli._sha256(cli._canonical_json({
-        "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
-        "deepagents": cli._deepagents_version(),
-        "checkpoint_namespace": "open-swe-repair-v1",
-    }))
+    runtime_identity = cli._sha256(
+        cli._canonical_json({
+            "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
+            "deepagents": cli._deepagents_version(),
+            "checkpoint_namespace": "open-swe-repair-v1",
+        })
+    )
     identity = RecoveryIdentity(
-        operation_id=request["operation_id"], execution_material_sha256="b" * 64,
-        workspace=str(workspace.resolve()), task_id="task-1", unit_id="u1",
-        session_id="session-1", allowed_paths=("a.py",),
-        provider_id=request["provider_id"], model_id=request["model_id"],
+        operation_id=request["operation_id"],
+        execution_material_sha256="b" * 64,
+        workspace=str(workspace.resolve()),
+        task_id="task-1",
+        unit_id="u1",
+        session_id="session-1",
+        allowed_paths=("a.py",),
+        provider_id=request["provider_id"],
+        model_id=request["model_id"],
         worker_identity_sha256=request["worker_identity_sha256"],
         transport_config_sha256=cli._sha256(cli._canonical_json(request["transport_config"])),
-        runtime_identity_sha256=runtime_identity, composite_admitted=True,
+        runtime_identity_sha256=runtime_identity,
+        composite_admitted=True,
     )
     journal = DurableOperationJournal(request["runtime_state_root"], identity)
     journal.prepare()
@@ -2795,26 +3115,36 @@ def _composite_recovery_fixture(tmp_path: Path) -> tuple[dict, DurableOperationJ
     )
     effects.bind_turn("turn-1", tool_call_id)
     effect = effects.intent(
-        turn_id="turn-1", tool_call_id=tool_call_id,
+        turn_id="turn-1",
+        tool_call_id=tool_call_id,
         tool_name="write_file_and_record_worker_result",
         arguments=recovered_arguments,
-        path=target, preimage="VALUE = 1\n", postimage="VALUE = 2\n",
+        path=target,
+        preimage="VALUE = 1\n",
+        postimage="VALUE = 2\n",
     )
     effects.recover_write(effect)
     effects.record_worker_result(effect, {"summary": "repaired a.py"})
-    cli._atomic_json(cli._operation_path(request), {
-        **cli._write_started(request, "worker"),
-        "status": "OPEN_SWE_OUTCOME_UNKNOWN", "outcome_unknown": True,
-        "retry_safe": False, "execution_material_sha256": identity.execution_material_sha256,
-        "session_id": identity.session_id,
-    })
+    cli._atomic_json(
+        cli._operation_path(request),
+        {
+            **cli._write_started(request, "worker"),
+            "status": "OPEN_SWE_OUTCOME_UNKNOWN",
+            "outcome_unknown": True,
+            "retry_safe": False,
+            "execution_material_sha256": identity.execution_material_sha256,
+            "session_id": identity.session_id,
+        },
+    )
     return request, journal, effects
 
 
 def test_worker_run_admitted_v2_executes_real_composite_graph_once(tmp_path, monkeypatch):
     request = _v2_request(tmp_path)
     monkeypatch.setattr(
-        cli, "_git_output", lambda _workspace, *args: {
+        cli,
+        "_git_output",
+        lambda _workspace, *args: {
             ("rev-parse", "HEAD"): "b" * 40,
             ("status", "--porcelain"): "",
             ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
@@ -2855,14 +3185,21 @@ def test_worker_run_admitted_v2_executes_real_composite_graph_once(tmp_path, mon
     )
     assert "Never use write_file_and_record_worker_result" not in sends[0]
     assert (Path(request["workspace_path"]) / "a.py").read_text(encoding="utf-8") == "VALUE = 2\n"
-    effects = list((Path(request["runtime_state_root"]) / "recovery" / "effects").glob("effect_*.json"))
+    effects = list(
+        (Path(request["runtime_state_root"]) / "recovery" / "effects").glob("effect_*.json")
+    )
     assert len(effects) == 1
-    assert json.loads(effects[0].read_text(encoding="utf-8"))["worker_result"]["summary"] == "repaired a.py"
+    assert (
+        json.loads(effects[0].read_text(encoding="utf-8"))["worker_result"]["summary"]
+        == "repaired a.py"
+    )
 
 
 def test_worker_run_fallback_and_multipath_do_not_admit_composite(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        cli, "_git_output", lambda _workspace, *args: {
+        cli,
+        "_git_output",
+        lambda _workspace, *args: {
             ("rev-parse", "HEAD"): "b" * 40,
             ("status", "--porcelain"): "",
             ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
@@ -2879,11 +3216,15 @@ def test_worker_run_fallback_and_multipath_do_not_admit_composite(tmp_path, monk
     request = _v2_request(multipath_root)
     workspace = Path(request["workspace_path"])
     card = workspace / "tasks/task-card.md"
-    card.write_text(card.read_text(encoding="utf-8").replace("- `a.py`", "- `a.py`\n- `b.py`"), encoding="utf-8")
+    card.write_text(
+        card.read_text(encoding="utf-8").replace("- `a.py`", "- `a.py`\n- `b.py`"), encoding="utf-8"
+    )
     envelope = json.loads(Path(request["artifact_path"]).read_text(encoding="utf-8"))
     envelope["binding"]["task_card_hash"] = cli._sha256(card.read_bytes())
     envelope["scope_signal"].update(
-        required_test_edit_paths=["a.py", "b.py"], verification_only_paths=["a.py", "b.py"], max_files=2
+        required_test_edit_paths=["a.py", "b.py"],
+        verification_only_paths=["a.py", "b.py"],
+        max_files=2,
     )
     envelope["evidence_refs"].append("source_absence:b.py@" + "b" * 16)
     envelope["inspect_first"].append(envelope["evidence_refs"][-1])
@@ -2893,12 +3234,20 @@ def test_worker_run_fallback_and_multipath_do_not_admit_composite(tmp_path, monk
     )
     request["prompt"] = "\n".join(
         f"envelope_sha256={cli._sha256(Path(request['artifact_path']).read_bytes())}"
-        if line.startswith("envelope_sha256=") else line
+        if line.startswith("envelope_sha256=")
+        else line
         for line in request["prompt"].splitlines()
     )
-    assert cli._semantic_v2_admission(
-        request, workspace.resolve(), Path(request["artifact_path"]), request["prompt"], ("a.py", "b.py")
-    ).decision == cli.ADMIT
+    assert (
+        cli._semantic_v2_admission(
+            request,
+            workspace.resolve(),
+            Path(request["artifact_path"]),
+            request["prompt"],
+            ("a.py", "b.py"),
+        ).decision
+        == cli.ADMIT
+    )
     cases.append({"request": request})
     admitted_flags: list[bool] = []
 
@@ -2906,9 +3255,14 @@ def test_worker_run_fallback_and_multipath_do_not_admit_composite(tmp_path, monk
         current = case["request"]
         diagnosis = FakeGraph(
             cli.DIAGNOSIS_TOOLS,
-            _record("record_diagnosis", {
-                "status": "ROOT_CAUSE_SUPPORTED", "summary": "supported", "evidence_paths": ["a.py"],
-            }),
+            _record(
+                "record_diagnosis",
+                {
+                    "status": "ROOT_CAUSE_SUPPORTED",
+                    "summary": "supported",
+                    "evidence_paths": ["a.py"],
+                },
+            ),
         )
         repair = FakeGraph(cli.REPAIR_TOOLS, _record("record_worker_result", {"summary": "done"}))
 
@@ -2936,10 +3290,16 @@ def test_worker_reconcile_terminalizes_valid_durable_composite_without_model_or_
     other_target = other_workspace / "a.py"
     other_target.write_text("VALUE = 1\n", encoding="utf-8")
     other_identity = RecoveryIdentity(
-        operation_id="c" * 64, execution_material_sha256="d" * 64,
-        workspace=str(other_workspace.resolve()), task_id="task-2", unit_id="u2",
-        session_id="session-2", allowed_paths=("a.py",),
-        provider_id="opencli_chatgpt", model_id="advanced", worker_identity_sha256="e" * 64,
+        operation_id="c" * 64,
+        execution_material_sha256="d" * 64,
+        workspace=str(other_workspace.resolve()),
+        task_id="task-2",
+        unit_id="u2",
+        session_id="session-2",
+        allowed_paths=("a.py",),
+        provider_id="opencli_chatgpt",
+        model_id="advanced",
+        worker_identity_sha256="e" * 64,
         transport_config_sha256=effects.identity.transport_config_sha256,
         runtime_identity_sha256=effects.identity.runtime_identity_sha256,
         composite_admitted=True,
@@ -2947,13 +3307,17 @@ def test_worker_reconcile_terminalizes_valid_durable_composite_without_model_or_
     other_effects = DurableEffectJournal(request["runtime_state_root"], other_identity)
     other_effects.bind_turn("turn-2", "call-2")
     other_effect = other_effects.intent(
-        turn_id="turn-2", tool_call_id="call-2",
+        turn_id="turn-2",
+        tool_call_id="call-2",
         tool_name="write_file_and_record_worker_result",
         arguments={
-            "file_path": "a.py", "content": "VALUE = other\n",
+            "file_path": "a.py",
+            "content": "VALUE = other\n",
             "envelope": {"summary": "other operation"},
         },
-        path=other_target, preimage="VALUE = 1\n", postimage="VALUE = other\n",
+        path=other_target,
+        preimage="VALUE = 1\n",
+        postimage="VALUE = other\n",
     )
     other_effects.recover_write(other_effect)
     other_effects.record_worker_result(other_effect, {"summary": "other operation"})
@@ -2968,7 +3332,10 @@ def test_worker_reconcile_terminalizes_valid_durable_composite_without_model_or_
         raise AssertionError("durable composite receipt must terminalize locally")
 
     result = cli._worker_reconcile(
-        request, runtime_loader=_runtime, model_builder=forbidden_model, graph_builder=forbidden_graph
+        request,
+        runtime_loader=_runtime,
+        model_builder=forbidden_model,
+        graph_builder=forbidden_graph,
     )
 
     assert result["status"] == "COMPLETED"
@@ -2993,18 +3360,24 @@ def test_composite_terminal_predicate_rejects_error_tool_message_without_effect_
     messages = [
         AIMessage(
             content="",
-            tool_calls=[{
-                "name": "write_file_and_record_worker_result",
-                "args": {
-                    "file_path": "a.py", "content": "VALUE = 2\n",
-                    "envelope": {"summary": "repaired a.py"},
-                },
-                "id": "call-1", "type": "tool_call",
-            }],
+            tool_calls=[
+                {
+                    "name": "write_file_and_record_worker_result",
+                    "args": {
+                        "file_path": "a.py",
+                        "content": "VALUE = 2\n",
+                        "envelope": {"summary": "repaired a.py"},
+                    },
+                    "id": "call-1",
+                    "type": "tool_call",
+                }
+            ],
         ),
         ToolMessage(
-            content=json.dumps(receipt), tool_call_id="call-1",
-            name="write_file_and_record_worker_result", status="error",
+            content=json.dumps(receipt),
+            tool_call_id="call-1",
+            name="write_file_and_record_worker_result",
+            status="error",
         ),
     ]
     tools = [{"type": "function", "function": {"name": "write_file_and_record_worker_result"}}]
@@ -3162,7 +3535,9 @@ def test_worker_run_malformed_r23_composite_completes_once_then_reconcile_is_loc
         request,
         runtime_loader=_runtime,
         model_builder=forbidden_model,
-        graph_builder=lambda *_args: pytest.fail("completed malformed composite must not build graph"),
+        graph_builder=lambda *_args: pytest.fail(
+            "completed malformed composite must not build graph"
+        ),
     )
     assert reconciled["status"] == "COMPLETED"
     assert model_calls == 0

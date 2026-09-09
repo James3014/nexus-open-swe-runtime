@@ -557,9 +557,19 @@ def _composite_terminal_completed(
     except (json.JSONDecodeError, ValueError):
         return False
     required = {
-        "schema", "status", "operation_id", "turn_id", "tool_call_id", "effect_id",
-        "tool_name", "path", "postimage_sha256", "summary", "content_sha256",
-        "summary_sha256", "receipt_sha256",
+        "schema",
+        "status",
+        "operation_id",
+        "turn_id",
+        "tool_call_id",
+        "effect_id",
+        "tool_name",
+        "path",
+        "postimage_sha256",
+        "summary",
+        "content_sha256",
+        "summary_sha256",
+        "receipt_sha256",
     }
     if (
         not isinstance(receipt, Mapping)
@@ -572,7 +582,9 @@ def _composite_terminal_completed(
     if not isinstance(request, AIMessage) or len(request.tool_calls) != 1:
         return False
     call = request.tool_calls[0]
-    if call.get("name") != "write_file_and_record_worker_result" or str(call.get("id") or "") != str(result.tool_call_id or ""):
+    if call.get("name") != "write_file_and_record_worker_result" or str(
+        call.get("id") or ""
+    ) != str(result.tool_call_id or ""):
         return False
     declared = {_tool_name(tool) for tool in tools}
     if call.get("name") not in declared:
@@ -609,10 +621,18 @@ def _composite_terminal_completed(
     if not operation_id or not turn_id or len(allowed) != 1:
         return False
     try:
-        normalized_path = Path(file_path).relative_to(Path(workspace)).as_posix() if Path(file_path).is_absolute() else file_path.lstrip("/")
+        normalized_path = (
+            Path(file_path).relative_to(Path(workspace)).as_posix()
+            if Path(file_path).is_absolute()
+            else file_path.lstrip("/")
+        )
     except ValueError:
         return False
-    if normalized_path != allowed[0] or receipt.get("operation_id") != operation_id or receipt.get("turn_id") != turn_id:
+    if (
+        normalized_path != allowed[0]
+        or receipt.get("operation_id") != operation_id
+        or receipt.get("turn_id") != turn_id
+    ):
         return False
     try:
         expected_physical = str((Path(workspace) / allowed[0]).resolve())
@@ -620,10 +640,30 @@ def _composite_terminal_completed(
             return False
     except (OSError, ValueError):
         return False
-    if receipt.get("tool_call_id") != call.get("id") or receipt.get("tool_call_id") != result.tool_call_id:
+    if (
+        receipt.get("tool_call_id") != call.get("id")
+        or receipt.get("tool_call_id") != result.tool_call_id
+    ):
         return False
-    effect_material = {"operation_id": operation_id, "turn_id": turn_id, "tool_call_id": call.get("id"), "tool_name": call.get("name"), "arguments": {"file_path": normalized_path, "content": content, "envelope": {"summary": summary}}}
-    expected_effect = "effect_" + hashlib.sha256(json.dumps(effect_material, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    effect_material = {
+        "operation_id": operation_id,
+        "turn_id": turn_id,
+        "tool_call_id": call.get("id"),
+        "tool_name": call.get("name"),
+        "arguments": {
+            "file_path": normalized_path,
+            "content": content,
+            "envelope": {"summary": summary},
+        },
+    }
+    expected_effect = (
+        "effect_"
+        + hashlib.sha256(
+            json.dumps(
+                effect_material, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode()
+        ).hexdigest()
+    )
     if receipt.get("effect_id") != expected_effect:
         return False
     try:
@@ -636,7 +676,8 @@ def _composite_terminal_completed(
         or persisted.get("turn_id") != turn_id
         or persisted.get("tool_call_id") != call.get("id")
         or persisted.get("tool_name") != call.get("name")
-        or persisted.get("arguments") != {
+        or persisted.get("arguments")
+        != {
             "file_path": normalized_path,
             "content": content,
             "envelope": {"summary": summary},
@@ -645,15 +686,21 @@ def _composite_terminal_completed(
         or persisted.get("postimage_sha256") != hashlib.sha256(content.encode()).hexdigest()
         or persisted.get("worker_result") != dict(receipt)
         or persisted.get("worker_result_sha256")
-        != hashlib.sha256(json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+        != hashlib.sha256(
+            json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
     ):
         return False
     receipt_hash = receipt.get("receipt_sha256")
     material = dict(receipt)
     material.pop("receipt_sha256", None)
-    return isinstance(receipt_hash, str) and receipt_hash == hashlib.sha256(
-        json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-    ).hexdigest()
+    return (
+        isinstance(receipt_hash, str)
+        and receipt_hash
+        == hashlib.sha256(
+            json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+    )
 
 
 def _tool_call_id(name: str, arguments: Mapping[str, Any], raw: str) -> str:
@@ -767,9 +814,7 @@ class OpenCLIWebChatModel(BaseChatModel):
             if turn_id.startswith("turn_repair_"):
                 self._recovery_journal.protocol_repair_recovered(response)
 
-    def _journal_protocol_repair(
-        self, *, origin: str, origin_sha256: str, turn_id: str
-    ) -> None:
+    def _journal_protocol_repair(self, *, origin: str, origin_sha256: str, turn_id: str) -> None:
         if self._recovery_journal is not None:
             method = getattr(self._recovery_journal, "protocol_repair_started", None)
             if method is not None:
@@ -814,7 +859,13 @@ class OpenCLIWebChatModel(BaseChatModel):
         env = {
             k: v
             for k, v in os.environ.items()
-            if not (k.startswith("GITHUB_") or k.startswith("GH_") or "TOKEN" in k and "PROVIDER" not in k and "OPENCLI" not in k)
+            if not (
+                k.startswith("GITHUB_")
+                or k.startswith("GH_")
+                or "TOKEN" in k
+                and "PROVIDER" not in k
+                and "OPENCLI" not in k
+            )
         }
         if self.opencli_profile:
             env["OPENCLI_PROFILE"] = self.opencli_profile
@@ -828,9 +879,7 @@ class OpenCLIWebChatModel(BaseChatModel):
                 capture_output=True,
                 text=True,
                 timeout=(
-                    timeout_seconds
-                    if timeout_seconds is not None
-                    else self.timeout_seconds + 60
+                    timeout_seconds if timeout_seconds is not None else self.timeout_seconds + 60
                 ),
                 shell=False,
                 env=self._environment(),
@@ -1066,9 +1115,9 @@ class OpenCLIWebChatModel(BaseChatModel):
         resume = {
             "protocol": envelope.get("protocol", OPENCLI_WEB_PROTOCOL),
             "turn_id": "turn_resume_"
-            + hashlib.sha256(
-                f"{conversation_id}\0{expected_turn_id}".encode("utf-8")
-            ).hexdigest()[:20],
+            + hashlib.sha256(f"{conversation_id}\0{expected_turn_id}".encode("utf-8")).hexdigest()[
+                :20
+            ],
             "rules": envelope.get("rules", []),
             "tools": envelope.get("tools", []),
             "tool_choice": envelope.get("tool_choice", "none"),
@@ -1083,11 +1132,7 @@ class OpenCLIWebChatModel(BaseChatModel):
         try:
             return self._detail_response_once(conversation_id, wait=wait, turn_id=turn_id)
         except OpenCLIWebModelError as exc:
-            if (
-                not wait
-                or str(exc) != "OPENCLI_WEB_TIMEOUT"
-                or self._late_readback_used
-            ):
+            if not wait or str(exc) != "OPENCLI_WEB_TIMEOUT" or self._late_readback_used:
                 raise
             self._late_readback_used = True
             deadline = self._late_clock() + _LATE_READBACK_WINDOW_SECONDS
@@ -1131,27 +1176,28 @@ class OpenCLIWebChatModel(BaseChatModel):
             max(self.timeout_seconds, 30)
             if wait
             else (
-                math.ceil(timeout_seconds)
-                if timeout_seconds is not None
-                else self.timeout_seconds
+                math.ceil(timeout_seconds) if timeout_seconds is not None else self.timeout_seconds
             )
         )
-        detail = self._run([
-            self.executable,
-            "chatgpt",
-            "detail",
-            conversation_id,
-            "--wait",
-            "true" if wait else "false",
-            "--timeout",
-            str(readback_timeout),
-            "--stable",
-            str(int(_POST_RESPONSE_SETTLE_SECONDS)),
-            "--site-session",
-            self.site_session,
-            "-f",
-            "json",
-        ], timeout_seconds=timeout_seconds)
+        detail = self._run(
+            [
+                self.executable,
+                "chatgpt",
+                "detail",
+                conversation_id,
+                "--wait",
+                "true" if wait else "false",
+                "--timeout",
+                str(readback_timeout),
+                "--stable",
+                str(int(_POST_RESPONSE_SETTLE_SECONDS)),
+                "--site-session",
+                self.site_session,
+                "-f",
+                "json",
+            ],
+            timeout_seconds=timeout_seconds,
+        )
         try:
             return self._extract_detail_response(detail, turn_id)
         except OpenCLIWebModelError as exc:
@@ -1573,7 +1619,9 @@ class OpenCLIWebChatModel(BaseChatModel):
         if match is None:
             return None
         try:
-            file_path = json.loads(match.group("path"), object_pairs_hook=_reject_duplicate_json_keys)
+            file_path = json.loads(
+                match.group("path"), object_pairs_hook=_reject_duplicate_json_keys
+            )
             raw_content = match.group("content")
             escaped_content: list[str] = []
             index = 0
@@ -1630,9 +1678,7 @@ class OpenCLIWebChatModel(BaseChatModel):
         try:
             canonical_value = json.loads(response, object_pairs_hook=_reject_duplicate_json_keys)
             canonical_arguments = (
-                canonical_value.get("arguments")
-                if isinstance(canonical_value, Mapping)
-                else None
+                canonical_value.get("arguments") if isinstance(canonical_value, Mapping) else None
             )
             canonical_envelope = (
                 canonical_arguments.get("envelope")
@@ -1830,7 +1876,9 @@ class OpenCLIWebChatModel(BaseChatModel):
         except (json.JSONDecodeError, ValueError):
             if projected_invalid is None:
                 return False
-            invalid_envelope = json.loads(projected_invalid, object_pairs_hook=_reject_duplicate_json_keys)
+            invalid_envelope = json.loads(
+                projected_invalid, object_pairs_hook=_reject_duplicate_json_keys
+            )
             invalid_tail = "malformed-write-projection"
         if not isinstance(invalid_envelope, Mapping):
             return False
@@ -1847,6 +1895,7 @@ class OpenCLIWebChatModel(BaseChatModel):
                 separators=(",", ":"),
                 ensure_ascii=False,
             )
+
         return canonical(repaired_envelope) == canonical(invalid_envelope)
 
     def _refresh_protocol_response(self, response: str, *, turn_id: str) -> str:
@@ -1927,10 +1976,9 @@ class OpenCLIWebChatModel(BaseChatModel):
             repair_prompt,
             new_conversation=True,
         )
-        if (
-            not self._is_complete_protocol_response(response)
-            or not self._repair_matches_invalid_response(invalid_response, response)
-        ):
+        if not self._is_complete_protocol_response(
+            response
+        ) or not self._repair_matches_invalid_response(invalid_response, response):
             raise OpenCLIWebModelError("OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID")
         return response
 
@@ -1997,7 +2045,9 @@ class OpenCLIWebChatModel(BaseChatModel):
         if tool_choice is not None and not isinstance(tool_choice, str):
             raise OpenCLIWebModelError("OPENCLI_WEB_TOOL_CHOICE_INVALID")
 
-        if _terminal_recorder_completed(messages, normalized_tools) or _composite_terminal_completed(messages, normalized_tools, self._recovery_journal):
+        if _terminal_recorder_completed(
+            messages, normalized_tools
+        ) or _composite_terminal_completed(messages, normalized_tools, self._recovery_journal):
             message = AIMessage(content="Terminal recorder completed.")
             return ChatResult(generations=[ChatGeneration(message=message)])
 
