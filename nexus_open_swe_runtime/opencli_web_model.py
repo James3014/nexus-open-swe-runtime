@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import stat
 import subprocess
 import tempfile
@@ -639,6 +640,16 @@ class OpenCLIWebChatModel(BaseChatModel):
                 except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
                     pass
             self._recovery_journal.response_recovered(turn_id, response)
+            if turn_id.startswith("turn_repair_"):
+                self._recovery_journal.protocol_repair_recovered(response)
+
+    def _journal_protocol_repair(
+        self, *, origin: str, origin_sha256: str, turn_id: str
+    ) -> None:
+        if self._recovery_journal is not None:
+            method = getattr(self._recovery_journal, "protocol_repair_started", None)
+            if method is not None:
+                method(origin=origin, origin_sha256=origin_sha256, turn_id=turn_id)
 
     @property
     def model_name(self) -> str:
@@ -1386,6 +1397,59 @@ class OpenCLIWebChatModel(BaseChatModel):
         return response
 
     @staticmethod
+    def _project_unescaped_write_response(response: str) -> str | None:
+        """Project the one known malformed write response into strict JSON.
+
+        The projection deliberately accepts only the canonical write_file
+        envelope.  Its content is treated as opaque text up to the final
+        envelope terminator, so quotes emitted without JSON escaping retain
+        their exact byte sequence.
+        """
+        match = re.fullmatch(
+            r'\{\s*"type"\s*:\s*"tool_call"\s*,\s*'
+            r'"name"\s*:\s*"write_file"\s*,\s*"arguments"\s*:\s*\{\s*'
+            r'"file_path"\s*:\s*(?P<path>"(?:\\.|[^"\\])*")\s*,\s*'
+            r'"content"\s*:\s*"(?P<content>.*)"\s*\}\s*\}\s*',
+            response,
+            re.DOTALL,
+        )
+        if match is None:
+            return None
+        try:
+            file_path = json.loads(match.group("path"), object_pairs_hook=_reject_duplicate_json_keys)
+            raw_content = match.group("content")
+            escaped_content: list[str] = []
+            index = 0
+            while index < len(raw_content):
+                character = raw_content[index]
+                if character == "\\" and index + 1 < len(raw_content):
+                    escaped_content.append(raw_content[index : index + 2])
+                    index += 2
+                elif character == '"':
+                    if re.match(r"\s*:", raw_content[index + 1 :]):
+                        return None
+                    escaped_content.append('\\"')
+                    index += 1
+                else:
+                    escaped_content.append(character)
+                    index += 1
+            content = json.loads('"' + "".join(escaped_content) + '"')
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if not isinstance(file_path, str) or not isinstance(content, str):
+            return None
+        return json.dumps(
+            {
+                "type": "tool_call",
+                "name": "write_file",
+                "arguments": {"file_path": file_path, "content": content},
+            },
+            sort_keys=False,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+
+    @staticmethod
     def _is_complete_protocol_response(response: str) -> bool:
         try:
             envelope = json.loads(response, object_pairs_hook=_reject_duplicate_json_keys)
@@ -1403,6 +1467,60 @@ class OpenCLIWebChatModel(BaseChatModel):
         return _direct_terminal_recorder(envelope) is not None
 
     @staticmethod
+    def _inverse_repaired_write_response(response: str) -> str | None:
+        """Undo only JSON quote escapes inside an exact write response."""
+        try:
+            decoder = json.JSONDecoder(object_pairs_hook=_reject_duplicate_json_keys)
+            envelope, end = decoder.raw_decode(response)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if response[end:].strip() or not isinstance(envelope, Mapping):
+            return None
+        arguments = envelope.get("arguments")
+        if (
+            list(envelope) != ["type", "name", "arguments"]
+            or envelope.get("type") != "tool_call"
+            or envelope.get("name") != "write_file"
+            or not isinstance(arguments, Mapping)
+            or list(arguments) != ["file_path", "content"]
+            or not isinstance(arguments.get("file_path"), str)
+            or not isinstance(arguments.get("content"), str)
+        ):
+            return None
+        match = re.search(r'"content"\s*:\s*"', response)
+        if match is None:
+            return None
+        start = match.end()
+        index = start
+        while index < len(response):
+            if response[index] == "\\":
+                index += 2
+                continue
+            if response[index] == '"':
+                break
+            index += 1
+        if index >= len(response):
+            return None
+        body = response[start:index]
+        inverse: list[str] = []
+        cursor = 0
+        while cursor < len(body):
+            if body[cursor] == "\\":
+                run_start = cursor
+                while cursor < len(body) and body[cursor] == "\\":
+                    cursor += 1
+                if cursor < len(body) and body[cursor] == '"':
+                    inverse.append("\\" * (cursor - run_start - 1))
+                    inverse.append('"')
+                    cursor += 1
+                else:
+                    inverse.append(body[run_start:cursor])
+                continue
+            inverse.append(body[cursor])
+            cursor += 1
+        return response[:start] + "".join(inverse) + response[index:]
+
+    @staticmethod
     def _repair_matches_invalid_response(invalid_response: str, repaired_response: str) -> bool:
         try:
             repaired_envelope = json.loads(
@@ -1411,16 +1529,25 @@ class OpenCLIWebChatModel(BaseChatModel):
             )
         except (json.JSONDecodeError, ValueError):
             return False
+        projected_invalid = OpenCLIWebChatModel._project_unescaped_write_response(invalid_response)
         try:
             invalid_envelope, prefix_end = json.JSONDecoder(
                 object_pairs_hook=_reject_duplicate_json_keys,
             ).raw_decode(invalid_response)
+            invalid_tail = invalid_response[prefix_end:]
         except (json.JSONDecodeError, ValueError):
-            return False
+            if projected_invalid is None:
+                return False
+            invalid_envelope = json.loads(projected_invalid, object_pairs_hook=_reject_duplicate_json_keys)
+            invalid_tail = "malformed-write-projection"
         if not isinstance(invalid_envelope, Mapping):
             return False
-        if not invalid_response[prefix_end:].strip():
+        if not invalid_tail.strip():
             return False
+        if projected_invalid is not None:
+            inverse = OpenCLIWebChatModel._inverse_repaired_write_response(repaired_response)
+            return inverse == invalid_response
+
         def canonical(value: Any) -> str:
             return json.dumps(
                 value,
@@ -1451,9 +1578,14 @@ class OpenCLIWebChatModel(BaseChatModel):
             invalid_envelope, prefix_end = json.JSONDecoder(
                 object_pairs_hook=_reject_duplicate_json_keys,
             ).raw_decode(invalid_response)
+            malformed = bool(invalid_response[prefix_end:].strip())
         except (json.JSONDecodeError, ValueError):
-            raise OpenCLIWebModelError("OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID")
-        if not isinstance(invalid_envelope, Mapping) or not invalid_response[prefix_end:].strip():
+            projected = self._project_unescaped_write_response(invalid_response)
+            if projected is None:
+                raise OpenCLIWebModelError("OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID")
+            invalid_envelope = json.loads(projected, object_pairs_hook=_reject_duplicate_json_keys)
+            malformed = True
+        if not isinstance(invalid_envelope, Mapping) or not malformed:
             raise OpenCLIWebModelError("OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID")
         repair_turn_id = (
             "turn_repair_"
@@ -1477,6 +1609,11 @@ class OpenCLIWebChatModel(BaseChatModel):
             },
             sort_keys=True,
             separators=(",", ":"),
+        )
+        self._journal_protocol_repair(
+            origin=invalid_response,
+            origin_sha256=hashlib.sha256(invalid_response.encode("utf-8")).hexdigest(),
+            turn_id=repair_turn_id,
         )
         response = self._send_and_reconcile(
             repair_prompt,

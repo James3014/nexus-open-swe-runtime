@@ -1383,6 +1383,115 @@ def test_opencli_web_model_rejects_non_exact_repair_json_equivalence(
     )
 
 
+def test_unescaped_write_response_projects_exact_content_for_repair():
+    invalid = (
+        '{"type":"tool_call","name":"write_file","arguments":'
+        '{"file_path":"src/example.py","content":"return "quoted" + value\\n"}}'
+    )
+    projected = OpenCLIWebChatModel._project_unescaped_write_response(invalid)
+
+    assert projected == (
+        '{"type":"tool_call","name":"write_file","arguments":{"file_path":"'
+        'src/example.py","content":"return \\\"quoted\\\" + value\\n"}}'
+    )
+    assert OpenCLIWebChatModel._repair_matches_invalid_response(invalid, projected)
+
+
+def test_r21_malformed_write_fixture_preserves_every_content_byte():
+    invalid = (
+        '{"type":"tool_call","name":"write_file","arguments":{"file_path":"'
+        '/tests/ops/test_open_swe_resident_five_repo_canary_20260908.py","content":"'
+        'def test_open_swe_resident_five_repo_canary_20260908():\\n mounted_repository_ids = (\\n '
+        '"James3014/Nexus-new",\\n "James3014/devspace",\\n "James3014/nexus-core",\\n '
+        '"James3014/nexus-learning",\\n "James3014/nexus-open-swe-runtime",\\n )\\n\\n '
+        'assert mounted_repository_ids == (\\n "James3014/Nexus-new",\\n '
+        '"James3014/devspace",\\n "James3014/nexus-core",\\n "James3014/nexus-learning",\\n '
+        '"James3014/nexus-open-swe-runtime",\\n )\\n"}}'
+    )
+    projected = OpenCLIWebChatModel._project_unescaped_write_response(invalid)
+
+    assert projected is not None
+    assert json.loads(projected)["arguments"]["content"] == (
+        "def test_open_swe_resident_five_repo_canary_20260908():\n mounted_repository_ids = (\n "
+        '"James3014/Nexus-new",\n "James3014/devspace",\n "James3014/nexus-core",\n '
+        '"James3014/nexus-learning",\n "James3014/nexus-open-swe-runtime",\n )\n\n '
+        'assert mounted_repository_ids == (\n "James3014/Nexus-new",\n '
+        '"James3014/devspace",\n "James3014/nexus-core",\n "James3014/nexus-learning",\n '
+        '"James3014/nexus-open-swe-runtime",\n )\n'
+    )
+
+
+def test_unescaped_projection_rejects_other_malformed_protocol_objects():
+    invalid = '{"type":"tool_call","name":"read_file","arguments":{"file_path":"x"}}}'
+
+    assert OpenCLIWebChatModel._project_unescaped_write_response(invalid) is None
+
+
+def test_unescaped_projection_rejects_extra_write_argument_after_content():
+    invalid = (
+        '{"type":"tool_call","name":"write_file","arguments":'
+        '{"file_path":"x","content":"safe" "unexpected":"field"}}'
+    )
+
+    assert OpenCLIWebChatModel._project_unescaped_write_response(invalid) is None
+
+
+def test_unescaped_write_repair_rejects_key_reordering():
+    invalid = (
+        '{"type":"tool_call","name":"write_file","arguments":'
+        '{"file_path":"x","content":"safe" "quoted"}}'
+    )
+    reordered = (
+        '{"name":"write_file","type":"tool_call","arguments":'
+        '{"content":"safe \\"quoted\\"","file_path":"x"}}'
+    )
+
+    assert not OpenCLIWebChatModel._repair_matches_invalid_response(invalid, reordered)
+
+
+def test_unescaped_write_repair_rejects_outer_whitespace_and_extra_escape_changes():
+    invalid = (
+        '{"type":"tool_call","name":"write_file","arguments":'
+        '{"file_path":"x","content":"safe "quoted"}}'
+    )
+    whitespace = (
+        ' {"type":"tool_call","name":"write_file","arguments":'
+        '{"file_path":"x","content":"safe \\"quoted\\"}}'
+    )
+    extra_escape = (
+        '{"type":"tool_call","name":"write_file","arguments":'
+        '{"file_path":"x","content":"safe \\\"quoted\\"}}'
+    )
+
+    assert not OpenCLIWebChatModel._repair_matches_invalid_response(invalid, whitespace)
+    assert not OpenCLIWebChatModel._repair_matches_invalid_response(invalid, extra_escape)
+
+
+def test_protocol_repair_records_origin_before_external_repair_turn(monkeypatch):
+    invalid = (
+        '{"type":"tool_call","name":"write_file","arguments":'
+        '{"file_path":"a.py","content":"return "quoted"\\n"}}'
+    )
+    repaired = (
+        '{"type":"tool_call","name":"write_file","arguments":'
+        '{"file_path":"a.py","content":"return \\"quoted\\"\\n"}}'
+    )
+    events = []
+
+    class Journal:
+        def protocol_repair_started(self, **kwargs):
+            events.append(kwargs)
+
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model._conversation_id = "conversation-1"
+    model._recovery_journal = Journal()
+    monkeypatch.setattr(model, "_send_and_reconcile", lambda *_args, **_kwargs: repaired)
+
+    assert model._repair_protocol_response(invalid) == repaired
+    assert events[0]["origin"] == invalid
+    assert events[0]["turn_id"].startswith("turn_repair_")
+
+
 def test_opencli_web_model_rejects_repair_reusing_original_conversation(
     monkeypatch: pytest.MonkeyPatch,
 ):

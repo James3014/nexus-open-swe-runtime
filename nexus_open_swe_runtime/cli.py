@@ -1579,7 +1579,16 @@ def _worker_reconcile(
             if isinstance(terminal, Mapping):
                 return _write_terminal(request, terminal)
             return cached
-        if not raw.get("conversation_id") and not journal.read().get("conversation_id"):
+        recovery_state = journal.read()
+        protocol_repair_pending = (
+            recovery_state.get("protocol_repair_status") == "DISPATCHING"
+            and isinstance(recovery_state.get("protocol_repair_turn_id"), str)
+        )
+        if (
+            not raw.get("conversation_id")
+            and not recovery_state.get("conversation_id")
+            and not protocol_repair_pending
+        ):
             return cached
         checkpoint_file = checkpoint_path(state_root, operation_id)
         try:
@@ -1611,11 +1620,43 @@ def _worker_reconcile(
         graph = graph_builder(model, Path(identity.workspace), runtime, identity.allowed_paths,
                               f"{identity.provider_id}:{identity.model_id}", checkpoint_saver,
                               effect_journal)
-        recovered = reconcile_bound_turn(journal, model)
+        repair_conversation_unbound = protocol_repair_pending and (
+            recovery_state.get("conversation_id", "")
+            == recovery_state.get("protocol_repair_original_conversation_id", "")
+        )
+        if repair_conversation_unbound:
+            repair_turn_id = str(recovery_state.get("protocol_repair_turn_id") or "")
+            if not hasattr(model, "_reconcile_fresh_repair_timeout") or not repair_turn_id:
+                return cached
+            recovered = model._reconcile_fresh_repair_timeout(
+                repair_turn_id,
+                recovery_state.get("protocol_repair_original_conversation_id") or None,
+            )
+        else:
+            recovered = reconcile_bound_turn(journal, model)
         try:
             from langchain_core.utils.function_calling import convert_to_openai_tool
             tool_nodes = graph.get_graph().nodes["tools"].data.tools_by_name
             tool_schemas = [convert_to_openai_tool(tool) for tool in tool_nodes.values()]
+            turn_id = str(journal.read().get("turn_id") or "")
+            if hasattr(model, "_refresh_protocol_response"):
+                recovered = model._refresh_protocol_response(recovered, turn_id=turn_id)
+            repair_state = journal.read()
+            origin = repair_state.get("protocol_repair_origin")
+            if isinstance(origin, str):
+                origin_hash = repair_state.get("protocol_repair_origin_sha256")
+                if (
+                    not isinstance(origin_hash, str)
+                    or _sha256(origin) != origin_hash
+                    or not model._repair_matches_invalid_response(origin, recovered)
+                ):
+                    return cached
+            elif (
+                hasattr(model, "_is_complete_protocol_response")
+                and not model._is_complete_protocol_response(recovered)
+                and hasattr(model, "_repair_protocol_response")
+            ):
+                recovered = model._repair_protocol_response(recovered)
             recovered_message = model._response_message(recovered, tool_schemas)
         except (AttributeError, KeyError, TypeError, RuntimeErrorBounded, ValueError):
             return cached

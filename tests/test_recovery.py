@@ -73,6 +73,32 @@ def test_operation_journal_is_atomic_owner_only_and_round_trips(tmp_path: Path):
     assert journal.path.stat().st_mode & 0o077 == 0
 
 
+def test_operation_journal_persists_protocol_repair_origin_and_response(tmp_path: Path):
+    journal = DurableOperationJournal(tmp_path / "state", _identity(tmp_path))
+    journal.prepare()
+    journal.conversation_bound("conversation-original")
+    origin = '{"type":"tool_call","name":"write_file","arguments":{}}'
+    journal.protocol_repair_started(
+        origin=origin,
+        origin_sha256=cli._sha256(origin),
+        turn_id="turn_repair_1",
+    )
+    journal.ask_dispatching(turn_id="turn_repair_1", prompt="repair", ordinal=1)
+    journal.conversation_bound("conversation-repair")
+    journal.response_recovered("turn_repair_1", '{"type":"final","content":"ok"}')
+    journal.protocol_repair_recovered('{"type":"final","content":"ok"}')
+
+    state = journal.read()
+    assert state["protocol_repair_origin"] == origin
+    assert state["protocol_repair_origin_sha256"] == cli._sha256(origin)
+    assert state["protocol_repair_turn_id"] == "turn_repair_1"
+    assert state["protocol_repair_original_conversation_id"] == "conversation-original"
+    assert state["protocol_repair_status"] == "RECOVERED"
+    assert state["protocol_repair_response_sha256"] == cli._sha256(
+        '{"type":"final","content":"ok"}'
+    )
+
+
 def test_effect_journal_accepts_exact_already_applied_write(tmp_path: Path):
     target = tmp_path / "a.py"
     journal = DurableEffectJournal(tmp_path / "state", _identity(tmp_path))
