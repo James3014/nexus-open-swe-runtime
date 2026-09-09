@@ -1246,7 +1246,7 @@ def _v2_request(tmp_path: Path, *, status: str = "PROVEN") -> dict:
                 "- AUTO_CHAIN: `false`",
                 "- allow_deletions: `false`",
                 "\n## Allowed files\n",
-                "- a.py",
+                "- `a.py`",
             ]
         ),
         encoding="utf-8",
@@ -1562,6 +1562,45 @@ def test_v2_target_symlink_rejects(tmp_path):
     ).decision == cli.REJECT
 
 
+def test_v2_intermediate_parent_symlink_rejects_without_model_or_graph(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path)
+    workspace = Path(request["workspace_path"])
+    card = workspace / "tasks/task-card.md"
+    card_content = card.read_text(encoding="utf-8").replace("- `a.py`", "- `nested/new.py`")
+    card.write_text(card_content, encoding="utf-8")
+    envelope = json.loads(Path(request["artifact_path"]).read_text(encoding="utf-8"))
+    envelope["binding"]["task_card_hash"] = cli._sha256(card.read_bytes())
+    envelope["scope_signal"]["required_test_edit_paths"] = ["nested/new.py"]
+    envelope["scope_signal"]["verification_only_paths"] = ["nested/new.py"]
+    envelope["evidence_refs"][1] = "source_absence:nested/new.py@" + "b" * 16
+    envelope["inspect_first"][1] = envelope["evidence_refs"][1]
+    workspace.joinpath("nested").symlink_to("tasks")
+    request["prompt"] = request["prompt"].replace(
+        'authorized_mutation_paths=["a.py"]',
+        'authorized_mutation_paths=["nested/new.py"]',
+    )
+    _write_v2_mutation(request, envelope)
+    monkeypatch.setattr(
+        cli,
+        "_git_output",
+        lambda _workspace, *args: {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
+        }[args],
+    )
+    calls = {"model": 0, "diagnosis": 0, "repair": 0}
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: calls.__setitem__("model", calls["model"] + 1),
+        diagnosis_factory=lambda *_args: calls.__setitem__("diagnosis", calls["diagnosis"] + 1),
+        repair_factory=lambda *_args: calls.__setitem__("repair", calls["repair"] + 1),
+    )
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert calls == {"model": 0, "diagnosis": 0, "repair": 0}
+
+
 def _write_v2_mutation(request: dict, envelope: dict, *, refresh_hash: bool = True) -> None:
     artifact = Path(request["artifact_path"])
     canonical = cli._canonical_json(envelope)
@@ -1601,7 +1640,7 @@ def _mutate_card(request: dict, envelope: dict, old: str, new: str) -> None:
         ("dirty_workspace", lambda _r, _e: None),
         ("card_ref", lambda _r, e: e["binding"].update(task_card_ref="tasks/other.md")),
         ("card_hash", lambda _r, e: e["binding"].update(task_card_hash="a" * 64)),
-        ("card_backtick", lambda r, e: _mutate_card(r, e, "`task-1`", "`task-1")),
+        ("card_backtick", lambda r, e: _mutate_card(r, e, "- `a.py`", "- `a.py")),
         ("card_status", lambda r, e: _mutate_card(r, e, "`ACTIVE`", "`PAUSED`")),
         ("card_auto_chain", lambda r, e: _mutate_card(r, e, "- AUTO_CHAIN: `false`", "- AUTO_CHAIN: `true`")),
         ("card_deletions", lambda r, e: _mutate_card(r, e, "- allow_deletions: `false`", "- allow_deletions: `true`")),
@@ -1664,16 +1703,29 @@ def test_v2_duplicate_json_key_rejects_without_model_or_graph(tmp_path, monkeypa
         '{"schema":"external_execution_envelope.v2","schema":"external_execution_envelope.v2"}',
         encoding="utf-8",
     )
-    calls = 0
+    calls = {"model": 0, "diagnosis": 0, "repair": 0}
+
+    def model_factory(*_args):
+        calls["model"] += 1
+        return object()
+
+    def diagnosis_factory(*_args):
+        calls["diagnosis"] += 1
+        return None
+
+    def repair_factory(*_args):
+        calls["repair"] += 1
+        return None
+
     result = cli._worker_run(
         request,
         runtime_loader=_runtime,
-        model_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("duplicate key model")),
-        diagnosis_factory=lambda *_args: pytest.fail("duplicate key diagnosis"),
-        repair_factory=lambda *_args: pytest.fail("duplicate key repair"),
+        model_factory=model_factory,
+        diagnosis_factory=diagnosis_factory,
+        repair_factory=repair_factory,
     )
     assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
-    assert calls == 0
+    assert calls == {"model": 0, "diagnosis": 0, "repair": 0}
 
 
 def test_v2_bare_binding_and_strict_origin_are_distinct(tmp_path, monkeypatch):
