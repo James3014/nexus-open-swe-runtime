@@ -2420,6 +2420,65 @@ def test_r24_issue_metadata_authority_is_admitted(tmp_path, monkeypatch):
     assert admission.decision == cli.ADMIT, admission
 
 
+def test_r24_worker_selects_composite_terminal_path(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path)
+    envelope = json.loads(Path(request["artifact_path"]).read_text(encoding="utf-8"))
+    envelope["binding"].update(item_id="853", item_type="issue")
+    envelope["scope_signal"]["read_only_authorities"].append("GitHub Issue 853 binding metadata")
+    envelope["evidence_refs"].append(
+        "github_issue:github://James3014/Nexus-new/issues/853@" + "e" * 16
+    )
+    _write_v2_mutation(request, envelope)
+    monkeypatch.setattr(
+        cli,
+        "_git_output",
+        lambda _workspace, *args: {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
+        }[args],
+    )
+    captured: dict[str, object] = {}
+    original_admission = cli._semantic_v2_admission
+
+    def admission_probe(*args, **kwargs):
+        admission = original_admission(*args, **kwargs)
+        captured["admitted"] = admission.decision == cli.ADMIT
+        captured["scope"] = admission.envelope["scope_signal"]
+        captured["allowed"] = args[4]
+        return admission
+
+    monkeypatch.setattr(cli, "_semantic_v2_admission", admission_probe)
+
+    def repair_factory(
+        _model, _workspace, _runtime, _allowed_paths, _key, *, composite=False, **_kwargs
+    ):
+        return FakeGraph(
+            cli.REPAIR_TOOLS | {"write_file_and_record_worker_result"},
+            error=RuntimeError("terminal-path probe"),
+        )
+
+    original_repair_graph = cli._repair_graph
+
+    def repair_probe(factory, *args, **kwargs):
+        captured["composite"] = kwargs.get("composite")
+        return original_repair_graph(factory, *args, **kwargs)
+
+    monkeypatch.setattr(cli, "_repair_graph", repair_probe)
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: SimpleNamespace(_conversation_id=None),
+        diagnosis_factory=lambda *_args: pytest.fail("admitted r24 must skip diagnosis"),
+        repair_factory=repair_factory,
+    )
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["repair_admitted"] is True
+    assert captured["admitted"] is True
+    assert captured["composite"] is True
+
+
 @pytest.mark.parametrize("variant", ["empty", "prose", "exact_refs"])
 def test_r17_prose_inspect_first_is_admitted_as_advisory(tmp_path, monkeypatch, variant):
     request = _v2_request(tmp_path)
@@ -2957,6 +3016,22 @@ def _mutate_card(request: dict, envelope: dict, old: str, new: str) -> None:
             lambda _r, e: e["scope_signal"]["read_only_authorities"].append(
                 "GitHub Issue 853 binding metadata/tasks/other.md"
             ),
+        ),
+        (
+            "scope_marker_wrong_order",
+            lambda _r, e: e["scope_signal"].update(
+                read_only_authorities=[
+                    "GitHub Issue 853 binding metadata",
+                    e["binding"]["task_card_ref"],
+                ]
+            ),
+        ),
+        (
+            "scope_third_authority",
+            lambda _r, e: e["scope_signal"]["read_only_authorities"].extend([
+                "GitHub Issue 853 binding metadata",
+                "repository contents",
+            ]),
         ),
         (
             "scope_duplicate_marker",
