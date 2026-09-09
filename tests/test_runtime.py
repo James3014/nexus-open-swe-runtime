@@ -1562,6 +1562,101 @@ def test_v2_target_symlink_rejects(tmp_path):
     ).decision == cli.REJECT
 
 
+def _write_v2_mutation(request: dict, envelope: dict, *, refresh_hash: bool = True) -> None:
+    artifact = Path(request["artifact_path"])
+    artifact.write_text(cli._canonical_json(envelope), encoding="utf-8")
+    if refresh_hash:
+        digest = cli._sha256(cli._canonical_json(envelope))
+        request["prompt"] = "\n".join(
+            digest if line.startswith("envelope_sha256=") else line
+            for line in request["prompt"].splitlines()
+        )
+
+
+def _v2_matrix_request(tmp_path: Path, mutate, *, refresh_hash: bool = True) -> dict:
+    request = _v2_request(tmp_path)
+    envelope = json.loads(Path(request["artifact_path"]).read_text(encoding="utf-8"))
+    mutate(request, envelope)
+    _write_v2_mutation(request, envelope, refresh_hash=refresh_hash)
+    return request
+
+
+@pytest.mark.parametrize(
+    "name,mutate",
+    [
+        ("binding_base", lambda _r, e: e["binding"].update(main_sha="a" * 40)),
+        ("physical_head", lambda _r, _e: None),
+        ("dirty_workspace", lambda _r, _e: None),
+        ("card_ref", lambda _r, e: e["binding"].update(task_card_ref="tasks/other.md")),
+        ("card_hash", lambda _r, e: e["binding"].update(task_card_hash="a" * 64)),
+        ("scope_paths", lambda _r, e: e["scope_signal"].update(required_test_edit_paths=["b.py"])),
+        ("scope_max_files", lambda _r, e: e["scope_signal"].update(max_files=2)),
+        ("scope_read_only", lambda _r, e: e["scope_signal"].update(read_only_authorities=[])),
+        ("scope_production", lambda _r, e: e["scope_signal"].update(production_edit_paths=["a.py"])),
+        ("scope_migration", lambda _r, e: e["scope_signal"].update(conditional_migration_paths=["a.py"])),
+        ("task_evidence", lambda _r, e: e["evidence_refs"].__setitem__(0, "task_card:tasks/task-card.md@" + "0" * 16)),
+        ("source_evidence", lambda _r, e: e["evidence_refs"].__setitem__(1, "source_absence:a.py@" + "0" * 16)),
+        ("inspect_first", lambda _r, e: e["inspect_first"].__setitem__(1, "wrong-entry")),
+        ("worker_mapping", lambda _r, _e: _r["worker_identity"].update(worker_id="other")),
+        ("worker_hash", lambda _r, _e: _r.update(worker_identity_sha256="0" * 64)),
+        ("context_digest_length", lambda _r, e: e["binding"].update(context_pack_sha256="c" * 16)),
+        ("selected_digest_length", lambda _r, e: e["selected_worker"].update(admission_evidence_hash="a" * 16)),
+        ("top_keyset", lambda _r, e: e.update(extra=True)),
+        ("nested_keyset", lambda _r, e: e["scope_signal"].update(extra=True)),
+        ("unknown_schema", lambda _r, e: e.update(schema="external_execution_envelope.unknown")),
+    ],
+)
+def test_v2_hostile_single_fault_rejects_without_model_or_graph(
+    tmp_path, monkeypatch, name, mutate
+):
+    request = _v2_matrix_request(tmp_path, mutate)
+    def fake_git(_workspace, *args):
+        if name == "physical_head" and args == ("rev-parse", "HEAD"):
+            return "a" * 40
+        if name == "dirty_workspace" and args == ("status", "--porcelain"):
+            return " M changed.py"
+        return {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
+        }[args]
+
+    monkeypatch.setattr(cli, "_git_output", fake_git)
+    calls = {"model": 0, "diagnosis": 0, "repair": 0}
+
+    def model_factory(*_args):
+        calls["model"] += 1
+        raise AssertionError(f"{name} must reject before model construction")
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=model_factory,
+        diagnosis_factory=lambda *_args: calls.__setitem__("diagnosis", calls["diagnosis"] + 1),
+        repair_factory=lambda *_args: calls.__setitem__("repair", calls["repair"] + 1),
+    )
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert calls == {"model": 0, "diagnosis": 0, "repair": 0}
+
+
+def test_v2_duplicate_json_key_rejects_without_model_or_graph(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path)
+    Path(request["artifact_path"]).write_text(
+        '{"schema":"external_execution_envelope.v2","schema":"external_execution_envelope.v2"}',
+        encoding="utf-8",
+    )
+    calls = 0
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("duplicate key model")),
+        diagnosis_factory=lambda *_args: pytest.fail("duplicate key diagnosis"),
+        repair_factory=lambda *_args: pytest.fail("duplicate key repair"),
+    )
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert calls == 0
+
+
 def test_v2_bare_binding_and_strict_origin_are_distinct(tmp_path, monkeypatch):
     request = _v2_request(tmp_path)
     monkeypatch.setattr(
