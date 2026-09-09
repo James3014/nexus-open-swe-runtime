@@ -1492,6 +1492,64 @@ def test_protocol_repair_records_origin_before_external_repair_turn(monkeypatch)
     assert events[0]["turn_id"].startswith("turn_repair_")
 
 
+def test_fresh_repair_timeout_uses_pending_journal_projection_before_opencli(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    origin = (
+        '{"type":"tool_call","name":"write_file","arguments":'
+        '{"file_path":"a.py","content":"return "quoted"\\n"}}'
+    )
+    projected = OpenCLIWebChatModel._project_unescaped_write_response(origin)
+    assert projected is not None
+
+    class Journal:
+        def __init__(self):
+            self.state = {
+                "protocol_repair_origin": origin,
+                "protocol_repair_origin_sha256": web_model.hashlib.sha256(
+                    origin.encode("utf-8")
+                ).hexdigest(),
+                "protocol_repair_original_conversation_id": "original-conversation",
+                "protocol_repair_status": "DISPATCHING",
+            }
+            self.events = []
+
+        def read(self):
+            return dict(self.state)
+
+        def conversation_bound(self, conversation_id):
+            self.events.append(("conversation_bound", conversation_id))
+            self.state["conversation_id"] = conversation_id
+
+        def response_recovered(self, turn_id, response):
+            self.events.append(("response_recovered", turn_id, response))
+
+        def protocol_repair_recovered(self, response):
+            self.events.append(("protocol_repair_recovered", response))
+
+    journal = Journal()
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model._recovery_journal = journal
+    model._conversation_id = "repair-conversation"
+    commands = []
+    monkeypatch.setattr(model, "_run", lambda argv: commands.append(argv))
+
+    response = model._reconcile_fresh_repair_timeout(
+        "turn_repair_exact",
+        "original-conversation",
+        "resume-prompt",
+    )
+
+    assert response == projected
+    assert commands == []
+    assert model._conversation_id == "original-conversation"
+    assert journal.events == [
+        ("conversation_bound", "original-conversation"),
+        ("response_recovered", "turn_repair_exact", projected),
+        ("protocol_repair_recovered", projected),
+    ]
+
+
 def test_opencli_web_model_rejects_repair_reusing_original_conversation(
     monkeypatch: pytest.MonkeyPatch,
 ):

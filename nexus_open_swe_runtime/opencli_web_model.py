@@ -1176,6 +1176,39 @@ class OpenCLIWebChatModel(BaseChatModel):
         resume_prompt: str | None = None,
     ) -> str:
         """Recover one timed-out fresh repair from bounded read-only history."""
+        journal = self._recovery_journal
+        try:
+            state = journal.read() if journal is not None else {}
+        except (AttributeError, OSError, TypeError, ValueError, RuntimeError):
+            state = {}
+        if not isinstance(state, Mapping):
+            state = {}
+        origin = state.get("protocol_repair_origin")
+        origin_sha256 = state.get("protocol_repair_origin_sha256")
+        original_conversation_id = state.get("protocol_repair_original_conversation_id")
+        local_projection: str | None = None
+        if (
+            state.get("protocol_repair_status") == "DISPATCHING"
+            and isinstance(origin, str)
+            and isinstance(origin_sha256, str)
+            and hashlib.sha256(origin.encode("utf-8")).hexdigest() == origin_sha256
+            and isinstance(original_conversation_id, str)
+            and original_conversation_id
+            and (prior_conversation_id is None or original_conversation_id == prior_conversation_id)
+        ):
+            local_projection = self._project_unescaped_write_response(origin)
+            if (
+                local_projection is None
+                or not self._is_complete_protocol_response(local_projection)
+                or self._inverse_repaired_write_response(local_projection) != origin
+            ):
+                local_projection = None
+        if local_projection is not None:
+            self._conversation_id = original_conversation_id
+            self._journal_bound(original_conversation_id)
+            self._journal_response(turn_id, local_projection)
+            return local_projection
+
         history = self._run([
             self.executable,
             "chatgpt",

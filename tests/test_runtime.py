@@ -918,7 +918,7 @@ def test_worker_reconcile_repairs_malformed_write_before_checkpoint_resume(tmp_p
 
 
 '''REMOVED_PENDING_TEST'''
-def test_worker_reconcile_pending_repair_uses_history_once_then_same_conversation(
+def test_worker_reconcile_pending_repair_projects_locally_then_continues_original_conversation(
     tmp_path, monkeypatch
 ):
     workspace = tmp_path / "workspace"
@@ -1013,7 +1013,7 @@ def test_worker_reconcile_pending_repair_uses_history_once_then_same_conversatio
         args = list(argv)
         if args[1:3] == ["chatgpt", "history"]:
             counters["history"] += 1
-            return SimpleNamespace(returncode=0, stdout=json.dumps([{"Id": "conversation-old"}, {"Id": "conversation-repair"}]), stderr="")
+            raise AssertionError("local projection must not scan history")
         if args[1:3] == ["chatgpt", "detail"]:
             counters["detail"] += 1
             return SimpleNamespace(returncode=0, stdout=json.dumps([
@@ -1024,9 +1024,9 @@ def test_worker_reconcile_pending_repair_uses_history_once_then_same_conversatio
             counters["ask"] += 1
             latest_prompt = args[3]
             assert "--conversation" in args
-            assert args[args.index("--conversation") + 1] == "conversation-repair"
+            assert args[args.index("--conversation") + 1] == "conversation-old"
             assert "--new" not in args
-            return SimpleNamespace(returncode=0, stdout=json.dumps([{"conversationId": "conversation-repair", "response": ""}]), stderr="")
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{"conversationId": "conversation-old", "response": ""}]), stderr="")
         raise AssertionError(args)
 
     monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
@@ -1035,7 +1035,65 @@ def test_worker_reconcile_pending_repair_uses_history_once_then_same_conversatio
         graph_builder=lambda model, *_args: Graph(model),
     )
     assert result["status"] == "COMPLETED"
-    assert counters == {"history": 1, "detail": 3, "repair": 0, "ask": 1}
+    assert counters == {"history": 0, "detail": 1, "repair": 0, "ask": 1}
+
+
+def test_fresh_repair_timeout_with_non_projectable_pending_origin_uses_history_fallback(
+    monkeypatch,
+):
+    origin = (
+        '{"type":"tool_call","name":"write_file","arguments":'
+        '{"file_path":"a.py","content":"new "quoted""}}'
+    )
+
+    class Journal:
+        def __init__(self):
+            self.state = {
+                "protocol_repair_origin": origin,
+                "protocol_repair_origin_sha256": "f" * 64,
+                "protocol_repair_original_conversation_id": "conversation-original",
+                "protocol_repair_status": "DISPATCHING",
+            }
+
+        def read(self):
+            return dict(self.state)
+
+        def conversation_bound(self, conversation_id):
+            self.state["conversation_id"] = conversation_id
+
+        def response_recovered(self, _turn_id, _response):
+            pass
+
+        def protocol_repair_recovered(self, _response):
+            pass
+
+    journal = Journal()
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model._recovery_journal = journal
+    model._conversation_id = "conversation-original"
+    calls = []
+    detail = json.dumps([
+        {"Role": "User", "Text": json.dumps({"turn_id": "turn_repair_fallback"})},
+    ])
+    repaired = '{"type":"final","content":"fallback"}'
+
+    def fake_run(argv):
+        calls.append(list(argv))
+        if argv[1:3] == ["chatgpt", "history"]:
+            return json.dumps([{"Id": "conversation-original"}, {"Id": "conversation-repair"}])
+        if argv[1:3] == ["chatgpt", "detail"] and argv[3] == "conversation-repair":
+            return detail
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(model, "_run", fake_run)
+    monkeypatch.setattr(model, "_detail_response", lambda *_args, **_kwargs: repaired)
+
+    assert model._reconcile_fresh_repair_timeout(
+        "turn_repair_fallback", "conversation-original", "resume"
+    ) == repaired
+    assert [call[2] for call in calls] == ["history", "detail"]
+    assert calls[1][3] == "conversation-repair"
+    assert model._conversation_id == "conversation-repair"
 
 
 def test_worker_run_operation_fence_allows_one_initial_external_execution(tmp_path):
