@@ -1368,12 +1368,15 @@ def test_worker_admits_strict_v2_without_diagnosis_model_or_graph(tmp_path, monk
     assert repair.calls == 1
 
 
-def test_r17_prose_inspect_first_is_admitted_as_advisory(tmp_path, monkeypatch):
+@pytest.mark.parametrize("variant", ["empty", "prose", "exact_refs"])
+def test_r17_prose_inspect_first_is_admitted_as_advisory(tmp_path, monkeypatch, variant):
     request = _v2_request(tmp_path)
     envelope = json.loads(Path(request["artifact_path"]).read_text(encoding="utf-8"))
-    envelope["inspect_first"] = [
-        "Read the Task Card and inspect the missing target before making the repair."
-    ]
+    envelope["inspect_first"] = {
+        "empty": [],
+        "prose": ["Read the Task Card before making the repair."],
+        "exact_refs": list(envelope["evidence_refs"]),
+    }[variant]
     raw = cli._canonical_json(envelope)
     Path(request["artifact_path"]).write_text(raw, encoding="utf-8")
     request["prompt"] = request["prompt"].replace(
@@ -1391,9 +1394,7 @@ def test_r17_prose_inspect_first_is_admitted_as_advisory(tmp_path, monkeypatch):
     )
     repair = FakeGraph(cli.REPAIR_TOOLS, _record("record_worker_result", {"summary": "done"}))
     assert cli._read_regular_artifact(Path(request["artifact_path"])) == raw.encode()
-    assert cli._parse_unique_json(raw.encode())["inspect_first"] == [
-        "Read the Task Card and inspect the missing target before making the repair."
-    ]
+    assert cli._parse_unique_json(raw.encode())["inspect_first"] == envelope["inspect_first"]
     admission = cli._semantic_v2_admission(
         request,
         Path(request["workspace_path"]).resolve(),
@@ -1421,6 +1422,47 @@ def test_r17_prose_inspect_first_is_admitted_as_advisory(tmp_path, monkeypatch):
     assert result["repair_admitted"] is True
     assert model_calls == 1
     assert repair.calls == 1
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda _r, e: e.__setitem__("inspect_first", "read first"), id="non-list"),
+        pytest.param(
+            lambda _r, e: e.__setitem__("inspect_first", ["read first", 1]),
+            id="non-string-item",
+        ),
+        pytest.param(
+            lambda r, e: _mutate_card(r, e, "- `a.py`", "- `a.py"),
+            id="malformed-task-card",
+        ),
+        pytest.param(
+            lambda _r, e: e["evidence_refs"].__setitem__(1, "source_absence:a.py@not-an-anchor"),
+            id="malformed-source-evidence-anchor",
+        ),
+    ],
+)
+def test_r17_malformed_admission_inputs_reject_without_calls(tmp_path, monkeypatch, mutate):
+    request = _v2_matrix_request(tmp_path, mutate)
+    monkeypatch.setattr(
+        cli,
+        "_git_output",
+        lambda _workspace, *args: {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
+        }[args],
+    )
+    calls = {"model": 0, "diagnosis": 0, "repair": 0}
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: calls.__setitem__("model", calls["model"] + 1),
+        diagnosis_factory=lambda *_args: calls.__setitem__("diagnosis", calls["diagnosis"] + 1),
+        repair_factory=lambda *_args: calls.__setitem__("repair", calls["repair"] + 1),
+    )
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert calls == {"model": 0, "diagnosis": 0, "repair": 0}
 
 
 @pytest.mark.parametrize(
