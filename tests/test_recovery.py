@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from nexus_open_swe_runtime import cli
+from nexus_open_swe_runtime import cli, recovery
 from nexus_open_swe_runtime.recovery import (
     DurableEffectJournal,
     DurableOperationJournal,
@@ -128,6 +130,170 @@ def test_effect_journal_persists_one_runtime_worker_receipt(tmp_path: Path):
     receipt = journal.record_worker_result(effect, {"summary": "done"})
     assert receipt["schema"] == "nexus.open_swe_runtime.worker_result.v1"
     assert journal.read(effect.effect_id)["worker_result"]["effect_id"] == effect.effect_id
+
+
+def _composite_effect(tmp_path: Path):
+    target = tmp_path / "a.py"
+    journal = DurableEffectJournal(tmp_path / "state", _identity(tmp_path))
+    arguments = {
+        "file_path": "a.py",
+        "content": "done\n",
+        "envelope": {"summary": "fixed a.py"},
+    }
+    effect = journal.intent(
+        turn_id="turn_composite",
+        tool_call_id="call_composite",
+        tool_name="write_file_and_record_worker_result",
+        arguments=arguments,
+        path=target,
+        preimage=None,
+        postimage=arguments["content"],
+    )
+    return target, journal, effect, arguments
+
+
+def test_composite_recovery_orders_intent_physical_postimage_result_then_receipt(
+    tmp_path: Path,
+):
+    target, journal, effect, arguments = _composite_effect(tmp_path)
+
+    intent = journal.read(effect.effect_id)
+    assert intent["status"] == "INTENT"
+    assert not target.exists()
+    assert "worker_result" not in intent
+
+    assert journal.recover_write(effect) == "RESULT"
+    result = journal.read(effect.effect_id)
+    assert target.read_text(encoding="utf-8") == arguments["content"]
+    assert result["status"] == "RESULT"
+    assert "worker_result" not in result
+
+    receipt = journal.record_worker_result(effect, arguments["envelope"])
+    persisted = journal.read(effect.effect_id)
+    assert persisted["status"] == "RESULT"
+    assert persisted["worker_result"] == receipt
+
+
+def test_composite_recovery_persists_result_only_after_postimage_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    target, journal, effect, _arguments = _composite_effect(tmp_path)
+    real_replace = recovery.os.replace
+    events: list[tuple[str, str, str | None]] = []
+
+    def tracked_replace(source, destination):
+        destination = Path(destination)
+        if destination == target:
+            events.append(("physical", journal.read(effect.effect_id)["status"], None))
+        elif destination == journal._path(effect.effect_id):
+            physical = target.read_text(encoding="utf-8") if target.exists() else None
+            events.append(("journal", journal.read(effect.effect_id)["status"], physical))
+        return real_replace(source, destination)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.recovery.os.replace", tracked_replace)
+    journal.recover_write(effect)
+
+    assert events[0] == ("physical", "INTENT", None)
+    assert events[1] == ("journal", "INTENT", "done\n")
+    assert journal.read(effect.effect_id)["status"] == "RESULT"
+
+
+def test_composite_receipt_replay_is_exact_and_idempotent(tmp_path: Path, monkeypatch):
+    target, journal, effect, arguments = _composite_effect(tmp_path)
+    journal.recover_write(effect)
+    first = journal.record_worker_result(effect, arguments["envelope"])
+    restarted = DurableEffectJournal(tmp_path / "state", _identity(tmp_path))
+
+    writes = 0
+    real_replace = recovery.os.replace
+
+    def count_replace(source, destination):
+        nonlocal writes
+        if Path(destination) == target:
+            writes += 1
+        return real_replace(source, destination)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.recovery.os.replace", count_replace)
+    assert restarted.recover_write(effect) == "RESULT"
+    second = restarted.record_worker_result(effect, arguments["envelope"])
+    assert second == first
+    assert writes == 0
+    assert target.read_text(encoding="utf-8") == arguments["content"]
+
+
+def test_composite_receipt_hash_is_recomputed_from_exact_receipt_material(
+    tmp_path: Path,
+):
+    _target, journal, effect, arguments = _composite_effect(tmp_path)
+    journal.recover_write(effect)
+    receipt = journal.record_worker_result(effect, arguments["envelope"])
+    material = dict(receipt)
+    material.pop("receipt_sha256")
+    expected = hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+    assert receipt["receipt_sha256"] == expected
+    assert journal.read(effect.effect_id)["worker_result_sha256"] == hashlib.sha256(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        pytest.param(lambda effect: replace(effect, postimage="other\n"), id="content"),
+        pytest.param(lambda effect: replace(effect, tool_call_id="call_other"), id="call"),
+        pytest.param(lambda effect: replace(effect, effect_id="effect_" + "f" * 64), id="effect"),
+    ],
+)
+def test_composite_receipt_rejects_changed_effect_identity(
+    tmp_path: Path, mutation,
+):
+    _target, journal, effect, arguments = _composite_effect(tmp_path)
+    journal.recover_write(effect)
+    journal.record_worker_result(effect, arguments["envelope"])
+    with pytest.raises((RuntimeError, FileNotFoundError), match="RECOVERY|effect"):
+        journal.record_worker_result(mutation(effect), arguments["envelope"])
+
+
+def test_composite_receipt_rejects_changed_summary_on_exact_effect(tmp_path: Path):
+    _target, journal, effect, arguments = _composite_effect(tmp_path)
+    journal.recover_write(effect)
+    journal.record_worker_result(effect, arguments["envelope"])
+    with pytest.raises(RuntimeError, match="RECOVERY"):
+        journal.record_worker_result(effect, {"summary": "different"})
+
+
+def test_composite_recovery_rejects_divergent_physical_bytes_without_receipt(
+    tmp_path: Path,
+):
+    target, journal, effect, arguments = _composite_effect(tmp_path)
+    target.write_text("unexpected\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="PREIMAGE_MISMATCH"):
+        journal.recover_write(effect)
+    state = journal.read(effect.effect_id)
+    assert state["status"] == "INTENT"
+    assert "worker_result" not in state
+    assert target.read_text(encoding="utf-8") != arguments["content"]
+
+
+def test_composite_recovery_replays_physical_write_without_duplicate_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    target, journal, effect, _arguments = _composite_effect(tmp_path)
+    replaces = 0
+    real_replace = recovery.os.replace
+
+    def count_physical_replace(source, destination):
+        nonlocal replaces
+        if Path(destination) == target:
+            replaces += 1
+        return real_replace(source, destination)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.recovery.os.replace", count_physical_replace)
+    assert journal.recover_write(effect) == "RESULT"
+    assert journal.recover_write(effect) == "RESULT"
+    assert replaces == 1
 
 
 def test_effect_journal_recovers_edit_from_preimage(tmp_path: Path):
