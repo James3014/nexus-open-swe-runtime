@@ -404,7 +404,13 @@ def _prompt_optional_field(prompt: str, name: str) -> str | None:
     return None
 
 
-def _canonical_repository(value: str) -> str:
+def _canonical_binding_repository(value: str) -> str:
+    text = value.strip()
+    match = re.fullmatch(r"([^/\s]+)/([^/\s]+)", text)
+    return f"{match.group(1)}/{match.group(2)}".lower() if match else ""
+
+
+def _canonical_origin_repository(value: str) -> str:
     text = value.strip()
     patterns = (
         r"^https://github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$",
@@ -451,6 +457,24 @@ def _git_output(workspace: Path, *args: str) -> str:
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise RuntimeErrorBounded("OPEN_SWE_V2_WORKSPACE_BINDING_INVALID") from exc
     return completed.stdout.strip()
+
+
+def _read_regular_artifact(artifact: Path) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(artifact, flags)
+        stat = os.fstat(descriptor)
+        if stat.st_mode & 0o170000 != 0o100000:
+            raise RuntimeErrorBounded("OPEN_SWE_V2_ARTIFACT_INVALID")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            return stream.read()
+    except (OSError, RuntimeErrorBounded) as exc:
+        raise RuntimeErrorBounded("OPEN_SWE_V2_ARTIFACT_INVALID") from exc
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
 
 
 def _contained_regular_card(workspace: Path, card_ref: str) -> tuple[Path, bytes, str]:
@@ -596,10 +620,12 @@ def _string_list(value: Any) -> bool:
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
 
 
-def _hex_digest(value: Any, lengths: tuple[int, ...] = (16, 64)) -> bool:
-    return isinstance(value, str) and any(
-        re.fullmatch(rf"[0-9a-f]{{{length}}}", value) is not None for length in lengths
-    )
+def _hex_digest(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _evidence_anchor(value: str) -> bool:
+    return re.fullmatch(r"(?:[0-9a-f]{16}|[0-9a-f]{64})", value) is not None
 
 
 def _semantic_v2_admission(
@@ -612,9 +638,9 @@ def _semantic_v2_admission(
     """Classify a v2 packet without invoking a model or graph."""
     raw = b""
     try:
-        raw = artifact.read_bytes()
+        raw = _read_regular_artifact(artifact)
         envelope = _parse_unique_json(raw)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, RuntimeErrorBounded):
         return SemanticAdmission(REJECT)
     schema = envelope.get("schema")
     if schema == "external_execution_envelope.v1":
@@ -697,7 +723,7 @@ def _semantic_v2_admission(
         if _git_output(workspace, "status", "--porcelain"):
             return SemanticAdmission(REJECT)
         origin = _git_output(workspace, "remote", "get-url", "origin")
-        if not _canonical_repository(origin) or _canonical_repository(origin) != _canonical_repository(str(binding["repository"])):
+        if not _canonical_origin_repository(origin) or _canonical_origin_repository(origin) != _canonical_binding_repository(str(binding["repository"])):
             return SemanticAdmission(REJECT)
         if _workspace_path_has_symlink(workspace, task_card_ref):
             return SemanticAdmission(REJECT)
@@ -720,9 +746,8 @@ def _semantic_v2_admission(
         task_ref = f"task_card:{task_card_ref}@"
         if not any(
             isinstance(ref, str)
-            and re.fullmatch(
-                re.escape(task_ref) + r"(?:[0-9a-f]{16}|[0-9a-f]{64})", ref
-            )
+            and ref.startswith(task_ref)
+            and _evidence_anchor(ref[len(task_ref) :])
             for ref in refs
         ):
             return SemanticAdmission(REJECT)
@@ -744,19 +769,8 @@ def _semantic_v2_admission(
             if parent.is_symlink() or not parent.resolve().is_relative_to(workspace) or not target.resolve().parent.is_relative_to(workspace):
                 return SemanticAdmission(REJECT)
         identity = request.get("worker_identity")
-        if "worker_identity" in request:
-            if not isinstance(identity, Mapping):
-                return SemanticAdmission(REJECT)
-            if dict(selected) != dict(identity):
-                return SemanticAdmission(REJECT)
-        else:
-            expected_worker = request.get("worker_id") or _prompt_optional_field(prompt, "worker_id")
-            if expected_worker is not None and selected["worker_id"] != expected_worker:
-                return SemanticAdmission(REJECT)
-            expected_provider = request.get("worker_provider") or request.get("provider_id")
-            expected_model = request.get("worker_model") or request.get("model_id")
-            if selected["provider"] != expected_provider or selected["model"] != expected_model:
-                return SemanticAdmission(REJECT)
+        if not isinstance(identity, Mapping) or dict(selected) != dict(identity):
+            return SemanticAdmission(REJECT)
         expected_identity_hash = request.get("worker_identity_sha256")
         if not isinstance(expected_identity_hash, str) or _sha256(_canonical_json(selected)) != expected_identity_hash:
             return SemanticAdmission(REJECT)

@@ -1226,7 +1226,6 @@ def _v2_request(tmp_path: Path, *, status: str = "PROVEN") -> dict:
                 "site_session": "ephemeral",
                 "timeout_seconds": 30,
             },
-            "worker_id": "worker-1",
         }
     )
     workspace = Path(request["workspace_path"])
@@ -1257,7 +1256,7 @@ def _v2_request(tmp_path: Path, *, status: str = "PROVEN") -> dict:
             "item_id": "task-1",
             "item_type": "issue",
             "main_sha": "b" * 40,
-            "repository": "https://github.com/James3014/Nexus-new.git",
+            "repository": "James3014/Nexus-new",
             "revision": "r16",
             "task_card_ref": card_ref,
             "task_card_hash": card_hash,
@@ -1308,12 +1307,12 @@ def _v2_request(tmp_path: Path, *, status: str = "PROVEN") -> dict:
     raw = cli._canonical_json(envelope)
     Path(request["artifact_path"]).write_text(raw, encoding="utf-8")
     selected = envelope["selected_worker"]
+    request["worker_identity"] = dict(selected)
     request["worker_identity_sha256"] = cli._sha256(cli._canonical_json(selected))
     request["prompt"] += "\n" + "\n".join(
         [
             f"envelope_sha256={cli._sha256(raw)}",
             "expected_base_sha=" + "b" * 40,
-            "worker_id=worker-1",
         ]
     )
     return request
@@ -1416,6 +1415,42 @@ def test_malformed_v2_rejects_without_fallback_model(tmp_path):
     )
     assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
     assert model_calls == 0
+
+
+def test_v2_artifact_symlink_and_missing_full_worker_identity_reject(tmp_path):
+    request = _v2_request(tmp_path)
+    artifact = Path(request["artifact_path"])
+    target = artifact.with_name("artifact-target.json")
+    artifact.replace(target)
+    artifact.symlink_to(target.name)
+    request.pop("worker_identity")
+    assert cli._semantic_v2_admission(
+        request,
+        Path(request["workspace_path"]),
+        artifact,
+        request["prompt"],
+        ("a.py",),
+    ).decision == cli.REJECT
+
+
+def test_v2_bare_binding_and_strict_origin_are_distinct(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "_git_output",
+        lambda _workspace, *args: {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "James3014/Nexus-new",
+        }[args],
+    )
+    assert cli._semantic_v2_admission(
+        request,
+        Path(request["workspace_path"]),
+        Path(request["artifact_path"]),
+        request["prompt"],
+        ("a.py",),
+    ).decision == cli.REJECT
 
 
 def test_worker_well_formed_inconclusive_v2_falls_back_to_diagnosis(tmp_path, monkeypatch):
