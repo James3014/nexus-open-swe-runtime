@@ -186,6 +186,24 @@ def test_scoped_backend_replays_edit_result_sync_and_async(tmp_path: Path):
     assert target.read_text(encoding="utf-8") == "final\n"
 
 
+@pytest.mark.parametrize("newline", ["\r\n", "\r"])
+def test_scoped_backend_edit_normalizes_hostile_newlines_once(tmp_path: Path, newline: str):
+    target = tmp_path / "a.py"
+    target.write_bytes(f"old{newline}".encode())
+    journal = DurableEffectJournal(tmp_path / "state", _identity(tmp_path))
+    journal.bind_turn("turn-9", "call-9")
+    backend = cli.ScopedRepairBackend(object(), tmp_path, ("a.py",), journal)
+
+    result = backend.edit("a.py", f"old{newline}", f"new{newline}")
+
+    assert result.path == "a.py"
+    assert result.occurrences == 1
+    assert target.read_bytes() == b"new\n"
+    records = list(journal.root.glob("*.json"))
+    assert len(records) == 1
+    assert json.loads(records[0].read_text(encoding="utf-8"))["status"] == "RESULT"
+
+
 def test_scoped_backend_records_write_effect_and_reads_operation_turn(tmp_path: Path):
     target = tmp_path / "a.py"
     journal = DurableEffectJournal(tmp_path / "state", _identity(tmp_path))

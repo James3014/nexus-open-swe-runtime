@@ -210,6 +210,8 @@ class ScopedRepairBackend:
 
             return EditResult(error=f"Error: File '{file_path}' not found")
         old = target.read_text(encoding="utf-8")
+        old_string = old_string.replace("\r\n", "\n").replace("\r", "\n")
+        new_string = new_string.replace("\r\n", "\n").replace("\r", "\n")
         from deepagents.backends.utils import perform_string_replacement
 
         replacement = perform_string_replacement(old, old_string, new_string, replace_all)
@@ -240,6 +242,8 @@ class ScopedRepairBackend:
 
             return EditResult(error=f"Error: File '{file_path}' not found")
         old = target.read_text(encoding="utf-8")
+        old_string = old_string.replace("\r\n", "\n").replace("\r", "\n")
+        new_string = new_string.replace("\r\n", "\n").replace("\r", "\n")
         from deepagents.backends.utils import perform_string_replacement
 
         replacement = perform_string_replacement(old, old_string, new_string, replace_all)
