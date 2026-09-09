@@ -1945,6 +1945,24 @@ class OpenCLIWebChatModel(BaseChatModel):
     @staticmethod
     def _repair_matches_invalid_response(invalid_response: str, repaired_response: str) -> bool:
         try:
+            direct_value = json.loads(
+                invalid_response, object_pairs_hook=_reject_duplicate_json_keys
+            )
+        except (json.JSONDecodeError, ValueError):
+            direct_value = None
+        direct = _direct_composite(direct_value) if isinstance(direct_value, Mapping) else None
+        if direct is not None:
+            expected = json.dumps(
+                {
+                    "type": "tool_call",
+                    "name": "write_file_and_record_worker_result",
+                    "arguments": direct[0],
+                },
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            return repaired_response == expected
+        try:
             repaired_envelope = json.loads(
                 repaired_response,
                 object_pairs_hook=_reject_duplicate_json_keys,

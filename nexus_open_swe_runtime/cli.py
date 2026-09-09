@@ -2203,6 +2203,7 @@ def _worker_reconcile(
                     )
                     journal.protocol_repair_recovered(canonical_response)
                     journal.response_recovered(recovered_turn_id, canonical_response)
+                    recovery_state = journal.read()
             persisted_composite = _persisted_composite_worker_result(journal, effect_journal)
             if persisted_composite is not None:
                 result = {
