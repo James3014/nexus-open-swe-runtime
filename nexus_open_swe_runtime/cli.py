@@ -2186,6 +2186,23 @@ def _worker_reconcile(
         effect_journal = DurableEffectJournal(state_root, identity)
         journal.effect_journal = effect_journal
         if identity.composite_admitted:
+            recovered_state = journal.read()
+            recovered_response = recovered_state.get("recovered_response")
+            recovered_turn_id = recovered_state.get("turn_id")
+            if isinstance(recovered_response, str) and isinstance(recovered_turn_id, str):
+                from .opencli_web_model import _canonicalize_direct_composite_response
+
+                canonical_response = _canonicalize_direct_composite_response(
+                    recovered_response, journal
+                )
+                if canonical_response != recovered_response:
+                    journal.protocol_repair_started(
+                        origin=recovered_response,
+                        origin_sha256=_sha256(recovered_response),
+                        turn_id=recovered_turn_id,
+                    )
+                    journal.protocol_repair_recovered(canonical_response)
+                    journal.response_recovered(recovered_turn_id, canonical_response)
             persisted_composite = _persisted_composite_worker_result(journal, effect_journal)
             if persisted_composite is not None:
                 result = {

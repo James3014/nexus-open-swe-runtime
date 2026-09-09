@@ -3247,7 +3247,7 @@ def _composite_worker_model(
 
 
 def _composite_recovery_fixture(
-    tmp_path: Path,
+    tmp_path: Path, *, direct: bool = False
 ) -> tuple[dict, DurableOperationJournal, DurableEffectJournal]:
     request = _worker_request(tmp_path)
     request.update(
@@ -3297,6 +3297,19 @@ def _composite_recovery_fixture(
     }
     recovered_response = json.dumps(
         {
+            "type": "write_file_and_record_worker_result",
+            "file_path": "a.py",
+            "content": "VALUE = 2\n",
+            "envelope": {
+                "schema": "external_intelligence_worker_result.v1",
+                "status": "IMPLEMENTATION_COMPLETED",
+                "task_id": "task-1",
+                "unit_id": "u1",
+                "summary": "repaired a.py",
+            },
+        }
+        if direct
+        else {
             "type": "tool_call",
             "name": "write_file_and_record_worker_result",
             "arguments": recovered_arguments,
@@ -3306,8 +3319,16 @@ def _composite_recovery_fixture(
     journal.response_recovered("turn-1", recovered_response)
     effects = DurableEffectJournal(request["runtime_state_root"], identity)
     journal.effect_journal = effects
+    if direct:
+        from nexus_open_swe_runtime.opencli_web_model import _canonicalize_direct_composite_response
+
+        recovered_response_for_effect = _canonicalize_direct_composite_response(
+            recovered_response, journal
+        )
+    else:
+        recovered_response_for_effect = recovered_response
     tool_call_id = _tool_call_id(
-        "write_file_and_record_worker_result", recovered_arguments, recovered_response
+        "write_file_and_record_worker_result", recovered_arguments, recovered_response_for_effect
     )
     effects.bind_turn("turn-1", tool_call_id)
     effect = effects.intent(
@@ -3389,6 +3410,60 @@ def test_worker_run_admitted_v2_executes_real_composite_graph_once(tmp_path, mon
         json.loads(effects[0].read_text(encoding="utf-8"))["worker_result"]["summary"]
         == "repaired a.py"
     )
+
+
+def test_worker_run_admitted_v2_executes_direct_r25_composite_graph_once(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "_git_output",
+        lambda _workspace, *args: {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
+        }[args],
+    )
+    monkeypatch.setattr(
+        cli, "create_checkpoint", lambda _state_root, _operation_id, namespace: (None, namespace)
+    )
+    sends: list[str] = []
+    direct_response = json.dumps(
+        {
+            "type": "write_file_and_record_worker_result",
+            "file_path": "a.py",
+            "content": "VALUE = 2\n",
+            "envelope": {
+                "schema": "external_intelligence_worker_result.v1",
+                "status": "IMPLEMENTATION_COMPLETED",
+                "task_id": "task-1",
+                "unit_id": "u1",
+                "summary": "repaired a.py",
+            },
+        },
+        separators=(",", ":"),
+    )
+
+    def model_factory(_runtime, _provider, _model_id, transport_config, state_root):
+        model = OpenCLIWebChatModel(
+            executable=transport_config["executable"],
+            intelligence_level="advanced",
+            opencli_profile=transport_config["profile"],
+            site_session=transport_config["site_session"],
+            timeout_seconds=transport_config["timeout_seconds"],
+            runtime_state_root=state_root,
+        )
+        _composite_worker_model(model, sends, response_override=direct_response)
+        return model
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=cli._load_runtime,
+        model_factory=model_factory,
+        repair_factory=cli.build_repair_graph,
+    )
+    assert result["status"] == "COMPLETED"
+    assert len(sends) == 1
+    assert (Path(request["workspace_path"]) / "a.py").read_text(encoding="utf-8") == "VALUE = 2\n"
 
 
 def test_worker_run_fallback_and_multipath_do_not_admit_composite(tmp_path, monkeypatch):
@@ -3540,6 +3615,54 @@ def test_worker_reconcile_terminalizes_valid_durable_composite_without_model_or_
     assert (Path(request["workspace_path"]) / "a.py").read_text(encoding="utf-8") == "VALUE = 2\n"
     assert calls == {"model": 0, "graph": 0}
     assert len(list(effects.root.glob("effect_*.json"))) == 2
+
+
+def test_worker_reconcile_terminalizes_direct_r25_composite_without_model_or_write(tmp_path):
+    request, _journal, effects = _composite_recovery_fixture(tmp_path, direct=True)
+    calls = {"model": 0, "graph": 0}
+
+    def forbidden_model(*_args):
+        calls["model"] += 1
+        raise AssertionError("direct r25 recovery must not redispatch or extract model args")
+
+    def forbidden_graph(*_args, **_kwargs):
+        calls["graph"] += 1
+        raise AssertionError("direct r25 recovery must terminalize locally")
+
+    result = cli._worker_reconcile(
+        request,
+        runtime_loader=_runtime,
+        model_builder=forbidden_model,
+        graph_builder=forbidden_graph,
+    )
+    assert result["status"] == "COMPLETED"
+    assert result["outcome_unknown"] is False
+    assert calls == {"model": 0, "graph": 0}
+    assert (Path(request["workspace_path"]) / "a.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert len(list(effects.root.glob("effect_*.json"))) == 1
+
+
+@pytest.mark.parametrize(
+    "field,value", [("task_id", "other"), ("unit_id", "other"), ("file_path", "../a.py")]
+)
+def test_worker_reconcile_rejects_hostile_direct_r25_identity_or_path(tmp_path, field, value):
+    request, journal, _effects = _composite_recovery_fixture(tmp_path, direct=True)
+    state = journal.read()
+    raw = json.loads(state["recovered_response"])
+    if field in {"task_id", "unit_id"}:
+        raw["envelope"][field] = value
+    else:
+        raw[field] = value
+    journal.response_recovered("turn-1", json.dumps(raw, separators=(",", ":")))
+    result = cli._worker_reconcile(
+        request,
+        runtime_loader=lambda: pytest.fail("hostile direct response must not build model"),
+        model_builder=lambda *_args: pytest.fail("hostile direct response must not build model"),
+        graph_builder=lambda *_args, **_kwargs: pytest.fail(
+            "hostile direct response must not build graph"
+        ),
+    )
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
 
 
 def test_composite_terminal_predicate_rejects_error_tool_message_without_effect_file(

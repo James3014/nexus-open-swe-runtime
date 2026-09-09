@@ -592,6 +592,62 @@ def test_opencli_web_model_direct_terminal_form_preserves_recorded_payload():
     }
 
 
+def test_opencli_web_model_rejects_unprojected_direct_composite_form():
+    response = json.dumps(
+        {
+            "type": "write_file_and_record_worker_result",
+            "file_path": "a.py",
+            "content": "done\n",
+            "envelope": {
+                "schema": "external_intelligence_worker_result.v1",
+                "status": "IMPLEMENTATION_COMPLETED",
+                "task_id": "task-1",
+                "unit_id": "unit-1",
+                "summary": "completed",
+            },
+        },
+        separators=(",", ":"),
+    )
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TOOL_CALL_INVALID"):
+        OpenCLIWebChatModel._response_message(
+            response,
+            [{"function": {"name": "write_file_and_record_worker_result"}}],
+        )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value.update(extra=True),
+        lambda value: value.pop("content"),
+        lambda value: value.update(file_path=1),
+        lambda value: value["envelope"].update(status="BLOCKED"),
+        lambda value: value["envelope"].update(task_id=""),
+        lambda value: value["envelope"].update(unit_id=1),
+        lambda value: value["envelope"].update(extra="rejected"),
+    ],
+)
+def test_opencli_web_model_rejects_hostile_direct_composite_shapes(mutate):
+    value = {
+        "type": "write_file_and_record_worker_result",
+        "file_path": "a.py",
+        "content": "done\n",
+        "envelope": {
+            "schema": "external_intelligence_worker_result.v1",
+            "status": "IMPLEMENTATION_COMPLETED",
+            "task_id": "task-1",
+            "unit_id": "unit-1",
+            "summary": "completed",
+        },
+    }
+    mutate(value)
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TOOL_CALL_INVALID"):
+        OpenCLIWebChatModel._response_message(
+            json.dumps(value, separators=(",", ":")),
+            [{"function": {"name": "write_file_and_record_worker_result"}}],
+        )
+
+
 def test_opencli_web_model_prompt_prefers_direct_terminal_recorders():
     declared = [
         {
