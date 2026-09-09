@@ -963,6 +963,53 @@ class SemanticAdmission:
     raw_bytes: bytes = b""
     envelope: Mapping[str, Any] | None = None
     diagnosis: Mapping[str, Any] | None = None
+    reason_code: str | None = None
+
+
+def _semantic_reject(reason: str) -> SemanticAdmission:
+    """Return a stable, non-sensitive discriminator for a fail-closed gate."""
+    return SemanticAdmission(REJECT, reason_code=reason)
+
+
+_SEMANTIC_REJECTION_CODES = frozenset({
+    "artifact_parse", "schema", "workspace_symlink", "envelope_keys", "envelope_hash",
+    "binding_shape", "binding_keys", "scope_worker_keys", "evidence_shape", "binding_types",
+    "context_digest", "task_card_digest", "main_sha", "diagnosis_types", "scope_list_types",
+    "scope_confidence_type", "scope_max_files", "worker_types", "worker_digest",
+    "evidence_types", "envelope_list_types", "objective_type", "diagnosis_incomplete",
+    "diagnosis_status", "base_binding", "workspace_head", "workspace_dirty", "origin",
+    "card_symlink", "card_hash", "card_contract", "scope_confidence", "allowed_paths",
+    "scope_migration", "authority", "scope_paths", "diagnosis_fields", "task_card_evidence",
+    "task_card_evidence_duplicate", "path_symlink", "source_evidence", "source_present",
+    "path_parent", "worker_identity", "worker_identity_hash", "predicate_exception",
+    "workspace_head_read", "workspace_status_read", "origin_read", "card_read",
+})
+_FAILURE_PHASES = frozenset({
+    "WORKER_CONTEXT", "RUNTIME_LOAD", "SEMANTIC_ADMISSION", "RECOVERY_PREPARE",
+    "DIAGNOSIS", "REPAIR", "RESULT_FINALIZATION",
+})
+
+
+def _bounded_error_code(exc: BaseException) -> str:
+    """Expose only stable bounded codes; never persist arbitrary exception text."""
+    if isinstance(exc, RuntimeErrorBounded):
+        code = str(exc)
+        if code in {
+            "OPEN_SWE_RUNTIME_STATE_ROOT_REQUIRED", "OPEN_SWE_OPERATION_ID_INVALID",
+            "OPEN_SWE_WORKSPACE_REQUIRED", "SESSION_BINDING_MISSING", "SESSION_BINDING_MISMATCH",
+            "OPEN_SWE_SEMANTIC_V2_REJECTED",
+            "OPEN_SWE_EXECUTION_INPUT_INVALID", "OPEN_SWE_V2_ARTIFACT_INVALID",
+            "OPEN_SWE_V2_WORKSPACE_BINDING_INVALID", "OPEN_SWE_V2_TASK_CARD_INVALID",
+            "OPENCLI_WEB_TRANSPORT_CONFIG_INVALID", "OPEN_SWE_TRANSPORT_CONFIG_PROVIDER_MISMATCH",
+            "OPEN_SWE_EVIDENCE_INVALID", "OPEN_SWE_TOOL_SURFACE_INVALID",
+            "OPEN_SWE_TOOL_SURFACE_UNAVAILABLE", "OPEN_SWE_DIAGNOSIS_INVALID",
+            "OPEN_SWE_DIAGNOSIS_EVIDENCE_MISSING", "OPEN_SWE_DIAGNOSIS_EVIDENCE_INVALID",
+            "OPEN_SWE_PHASE_MODEL_REUSE", "OPENCLI_WEB_REPAIR_CONVERSATION_REUSE",
+            "OPEN_SWE_REPAIR_RESULT_INVALID", "OPEN_SWE_COMPOSITE_RESULT_INVALID",
+        } or any(code == f"OPEN_SWE_SEMANTIC_V2_REJECTED_{reason.upper()}" for reason in _SEMANTIC_REJECTION_CODES):
+            return code
+        return "OPEN_SWE_BOUNDED_FAILURE_UNCLASSIFIED"
+    return ""
 
 
 def _prompt_optional_field(prompt: str, name: str) -> str | None:
@@ -1274,20 +1321,20 @@ def _semantic_v2_admission(
             raw = _read_regular_artifact(artifact)
         envelope = _parse_unique_json(raw)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, RuntimeErrorBounded):
-        return SemanticAdmission(REJECT)
+        return _semantic_reject("artifact_parse")
     schema = envelope.get("schema")
     if schema == "external_execution_envelope.v1":
         return SemanticAdmission(FALLBACK, raw, envelope)
     if schema != "external_execution_envelope.v2":
-        return SemanticAdmission(REJECT)
+        return _semantic_reject("schema")
     try:
         if _workspace_path_has_symlink(workspace, "") or workspace.is_symlink():
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("workspace_symlink")
         if set(envelope) != _V2_KEYS:
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("envelope_keys")
         supplied_hash = _prompt_field(prompt, "envelope_sha256")
         if _sha256(_canonical_json(envelope)) != supplied_hash:
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("envelope_hash")
         binding = envelope["binding"]
         diagnosis = envelope["diagnosis"]
         scope = envelope["scope_signal"]
@@ -1295,23 +1342,23 @@ def _semantic_v2_admission(
         refs = envelope["evidence_refs"]
         inspect_first = envelope["inspect_first"]
         if not all(isinstance(value, Mapping) for value in (binding, diagnosis, scope, selected)):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("binding_shape")
         if set(binding) != _V2_BINDING_KEYS or set(diagnosis) != _V2_DIAGNOSIS_KEYS:
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("binding_keys")
         if set(scope) != _V2_SCOPE_KEYS or set(selected) != _V2_WORKER_KEYS:
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("scope_worker_keys")
         if not isinstance(refs, list) or not isinstance(inspect_first, list):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("evidence_shape")
         if not all(isinstance(value, str) for value in binding.values()):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("binding_types")
         if not _hex_digest(binding["context_pack_sha256"]):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("context_digest")
         if not _hex_digest(binding["task_card_hash"]):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("task_card_digest")
         if not re.fullmatch(r"[0-9a-f]{40}", binding["main_sha"]):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("main_sha")
         if not all(isinstance(value, str) for value in diagnosis.values()):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("diagnosis_types")
         for key in (
             "conditional_migration_paths",
             "forbidden_paths",
@@ -1322,18 +1369,18 @@ def _semantic_v2_admission(
             "verification_only_paths",
         ):
             if not _string_list(scope[key]):
-                return SemanticAdmission(REJECT)
+                return _semantic_reject("scope_list_types")
         if not isinstance(scope["scope_confidence"], str):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("scope_confidence_type")
         if not isinstance(scope["max_files"], int) or isinstance(scope["max_files"], bool):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("scope_max_files")
         if not all(isinstance(value, str) for value in selected.values()):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("worker_types")
         for key in ("admission_evidence_hash", "selection_evidence_hash"):
             if not _hex_digest(selected[key]):
-                return SemanticAdmission(REJECT)
+                return _semantic_reject("worker_digest")
         if not _string_list(refs) or not _string_list(inspect_first):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("evidence_types")
         for key in (
             "definition_of_done",
             "failure_guards",
@@ -1343,48 +1390,62 @@ def _semantic_v2_admission(
             "verification_focus",
         ):
             if not _string_list(envelope[key]):
-                return SemanticAdmission(REJECT)
+                return _semantic_reject("envelope_list_types")
         if not isinstance(envelope["objective"], str):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("objective_type")
         status = diagnosis.get("status")
         if status in {"LIKELY", "UNKNOWN"}:
             if not diagnosis.get("hypothesis") or not diagnosis.get("next_probe"):
-                return SemanticAdmission(REJECT)
+                return _semantic_reject("diagnosis_incomplete")
             return SemanticAdmission(FALLBACK, raw, envelope, diagnosis)
         if status != "PROVEN":
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("diagnosis_status")
         expected_base = _prompt_field(prompt, "expected_base_sha")
         task_id = _prompt_field(prompt, "task_id")
         task_card_ref = binding["task_card_ref"]
         task_card_hash = binding["task_card_hash"]
         if binding["main_sha"] != expected_base or not isinstance(task_card_hash, str):
-            return SemanticAdmission(REJECT)
-        if _git_output(workspace, "rev-parse", "HEAD") != expected_base:
-            return SemanticAdmission(REJECT)
-        if _git_output(workspace, "status", "--porcelain"):
-            return SemanticAdmission(REJECT)
-        origin = _git_output(workspace, "remote", "get-url", "origin")
+            return _semantic_reject("base_binding")
+        try:
+            workspace_head = _git_output(workspace, "rev-parse", "HEAD")
+        except RuntimeErrorBounded:
+            return _semantic_reject("workspace_head_read")
+        if workspace_head != expected_base:
+            return _semantic_reject("workspace_head")
+        try:
+            workspace_status = _git_output(workspace, "status", "--porcelain")
+        except RuntimeErrorBounded:
+            return _semantic_reject("workspace_status_read")
+        if workspace_status:
+            return _semantic_reject("workspace_dirty")
+        try:
+            origin = _git_output(workspace, "remote", "get-url", "origin")
+        except RuntimeErrorBounded:
+            return _semantic_reject("origin_read")
         if not _canonical_origin_repository(origin) or _canonical_origin_repository(
             origin
         ) != _canonical_binding_repository(str(binding["repository"])):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("origin")
         if _workspace_path_has_symlink(workspace, task_card_ref):
-            return SemanticAdmission(REJECT)
-        _card_path, card_raw, card_content = _contained_regular_card(workspace, task_card_ref)
+            return _semantic_reject("card_symlink")
+        try:
+            _card_path, card_raw, card_content = _contained_regular_card(workspace, task_card_ref)
+        except RuntimeErrorBounded:
+            return _semantic_reject("card_read")
         if _sha256(card_raw) != task_card_hash:
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("card_hash")
         if not _task_card_allows_exact_paths(card_content, task_id, allowed_paths):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("card_contract")
         if scope["scope_confidence"] != "HIGH":
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("scope_confidence")
         if len(set(allowed_paths)) != len(allowed_paths):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("allowed_paths")
         if scope["production_edit_paths"] or scope["conditional_migration_paths"]:
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("scope_migration")
         if not _safe_read_only_authorities(
             scope["read_only_authorities"], task_card_ref, binding, refs
         ):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("authority")
         required = tuple(
             _safe_relative_path(str(path)) for path in scope["required_test_edit_paths"]
         )
@@ -1394,12 +1455,12 @@ def _semantic_v2_admission(
             or isinstance(scope["max_files"], bool)
             or scope["max_files"] != len(allowed_paths)
         ):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("scope_paths")
         if not all(
             isinstance(diagnosis[key], str) and diagnosis[key].strip()
             for key in ("hypothesis", "next_probe")
         ):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("diagnosis_fields")
         task_ref = f"task_card:{task_card_ref}@"
         task_card_evidence = next(
             (
@@ -1412,24 +1473,24 @@ def _semantic_v2_admission(
             None,
         )
         if task_card_evidence is None:
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("task_card_evidence")
         if not any(
             isinstance(ref, str)
             and ref.startswith(task_ref)
             and _evidence_anchor(ref[len(task_ref) :])
             for ref in refs
         ):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("task_card_evidence_duplicate")
         for path in allowed_paths:
             if _workspace_path_has_symlink(workspace, path):
-                return SemanticAdmission(REJECT)
+                return _semantic_reject("path_symlink")
             source_ref = _source_ref_for_path(refs, path)
             if source_ref is None:
-                return SemanticAdmission(REJECT)
+                return _semantic_reject("source_evidence")
             target = workspace / path
             try:
                 target.lstat()
-                return SemanticAdmission(REJECT)
+                return _semantic_reject("source_present")
             except FileNotFoundError:
                 pass
             parent = target.parent
@@ -1440,18 +1501,18 @@ def _semantic_v2_admission(
                 or not parent.resolve().is_relative_to(workspace)
                 or not target.resolve().parent.is_relative_to(workspace)
             ):
-                return SemanticAdmission(REJECT)
+                return _semantic_reject("path_parent")
         identity = request.get("worker_identity")
         if not isinstance(identity, Mapping) or dict(selected) != dict(identity):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("worker_identity")
         expected_identity_hash = request.get("worker_identity_sha256")
         if (
             not isinstance(expected_identity_hash, str)
             or _sha256(_canonical_json(selected)) != expected_identity_hash
         ):
-            return SemanticAdmission(REJECT)
+            return _semantic_reject("worker_identity_hash")
     except (KeyError, TypeError, ValueError, RuntimeErrorBounded):
-        return SemanticAdmission(REJECT)
+        return _semantic_reject("predicate_exception")
     return SemanticAdmission(ADMIT, raw, envelope, diagnosis)
 
 
@@ -1852,21 +1913,26 @@ def _worker_run(
     repair_admitted = False
     repair_phase_count = 0
     session_id = ""
+    failure_phase = ""
     recovery_journal: DurableOperationJournal | None = None
     checkpoint_saver: Any | None = None
     effect_journal: DurableEffectJournal | None = None
     semantic_admission = FALLBACK
     diagnosis_model: Any | None = None
     try:
+        failure_phase = "WORKER_CONTEXT"
         task_id, unit_id, allowed_paths, session_id = _worker_context(request, prompt)
+        failure_phase = "RUNTIME_LOAD"
         runtime = runtime_loader()
         profile_key = f"{provider}:{model_id}"
+        failure_phase = "SEMANTIC_ADMISSION"
         semantic_admission = _semantic_v2_admission(
             request, workspace, artifact, prompt, allowed_paths, artifact_bytes
         )
         semantic_admission_decision = semantic_admission.decision
         if semantic_admission_decision == REJECT:
-            raise RuntimeErrorBounded("OPEN_SWE_SEMANTIC_V2_REJECTED")
+            reason = semantic_admission.reason_code or "predicate_exception"
+            raise RuntimeErrorBounded(f"OPEN_SWE_SEMANTIC_V2_REJECTED_{reason.upper()}")
         packet = semantic_admission.envelope
         scope = packet.get("scope_signal") if isinstance(packet, Mapping) else None
         composite_admitted = bool(
@@ -1876,6 +1942,7 @@ def _worker_run(
             and scope.get("max_files") == 1
             and scope.get("required_test_edit_paths", list(allowed_paths)) == list(allowed_paths)
         )
+        failure_phase = "RECOVERY_PREPARE"
         recovery_identity = RecoveryIdentity(
             operation_id=str(request.get("operation_id") or ""),
             execution_material_sha256=str(started.get("execution_material_sha256") or ""),
@@ -1900,6 +1967,7 @@ def _worker_run(
         recovery_journal = DurableOperationJournal(
             request.get("runtime_state_root") or "", recovery_identity
         )
+        failure_phase = "RECOVERY_PREPARE"
         recovery_journal.prepare()
         effect_journal = DurableEffectJournal(
             request.get("runtime_state_root") or "", recovery_identity
@@ -1918,6 +1986,7 @@ def _worker_run(
             )
         )
         try:
+            failure_phase = "DIAGNOSIS"
             evidence = semantic_admission.raw_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise RuntimeErrorBounded("OPEN_SWE_EVIDENCE_INVALID") from exc
@@ -1984,6 +2053,7 @@ def _worker_run(
                         raise RuntimeErrorBounded("OPEN_SWE_DIAGNOSIS_EVIDENCE_INVALID")
             repair_admitted = True
             repair_phase_count = 1
+            failure_phase = "REPAIR"
             repair_model = model_factory(
                 runtime,
                 provider,
@@ -2049,6 +2119,7 @@ def _worker_run(
             response = _worker_result(task_id, unit_id, "IMPLEMENTATION_COMPLETED", repair_summary)
         else:
             response = _worker_result(task_id, unit_id, "BLOCKED", summary)
+        failure_phase = "RESULT_FINALIZATION"
         result = {
             **started,
             "status": "COMPLETED",
@@ -2083,6 +2154,7 @@ def _worker_run(
             "outcome_unknown": True,
             "retry_safe": False,
             "error": type(exc).__name__,
+            "failure_phase": failure_phase if failure_phase in _FAILURE_PHASES else "WORKER_CONTEXT",
             "diagnosis_status": diagnosis_status,
             "diagnosis_sha256": diagnosis_sha256,
             "diagnosis_evidence_paths": list(diagnosis_evidence_paths),
@@ -2091,6 +2163,9 @@ def _worker_run(
             "worker_identity_sha256": str(request.get("worker_identity_sha256") or ""),
             "finished_at": _now(),
         }
+        error_code = _bounded_error_code(exc)
+        if error_code:
+            result["error_code"] = error_code
     return _write_terminal(request, result)
 
 
