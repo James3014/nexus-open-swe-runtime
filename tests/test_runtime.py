@@ -1440,6 +1440,12 @@ def test_r17_prose_inspect_first_is_admitted_as_advisory(tmp_path, monkeypatch, 
             lambda _r, e: e["evidence_refs"].__setitem__(1, "source_absence:a.py@not-an-anchor"),
             id="malformed-source-evidence-anchor",
         ),
+        pytest.param(
+            lambda _r, e: e["evidence_refs"].__setitem__(
+                0, "task_card:tasks/task-card.md@not-an-anchor"
+            ),
+            id="malformed-task-card-evidence-anchor",
+        ),
     ],
 )
 def test_r17_malformed_admission_inputs_reject_without_calls(tmp_path, monkeypatch, mutate):
