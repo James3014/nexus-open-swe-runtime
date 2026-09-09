@@ -760,8 +760,6 @@ def _semantic_v2_admission(
         )
         if task_card_evidence is None:
             return SemanticAdmission(REJECT)
-        if task_card_evidence not in inspect_first:
-            return SemanticAdmission(REJECT)
         if not any(
             isinstance(ref, str)
             and ref.startswith(task_ref)
@@ -773,7 +771,7 @@ def _semantic_v2_admission(
             if _workspace_path_has_symlink(workspace, path):
                 return SemanticAdmission(REJECT)
             source_ref = _source_ref_for_path(refs, path)
-            if source_ref is None or source_ref not in inspect_first:
+            if source_ref is None:
                 return SemanticAdmission(REJECT)
             target = workspace / path
             try:
