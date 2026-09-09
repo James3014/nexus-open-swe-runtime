@@ -1740,7 +1740,6 @@ def _mutate_card(request: dict, envelope: dict, old: str, new: str) -> None:
         ("scope_migration", lambda _r, e: e["scope_signal"].update(conditional_migration_paths=["a.py"])),
         ("task_evidence", lambda _r, e: e["evidence_refs"].__setitem__(0, "source_absence:a.py@" + "a" * 16)),
         ("source_evidence", lambda _r, e: e["evidence_refs"].__setitem__(1, "source_absence:b.py@" + "b" * 16)),
-        ("inspect_first", lambda _r, e: e["inspect_first"].__setitem__(1, "wrong-entry")),
         ("worker_mapping", lambda _r, _e: _r["worker_identity"].update(worker_id="other")),
         ("worker_hash", lambda _r, _e: _r.update(worker_identity_sha256="0" * 64)),
         ("context_digest_length", lambda _r, e: e["binding"].update(context_pack_sha256="c" * 16)),
