@@ -2280,6 +2280,159 @@ def test_opencli_web_model_r18_late_readback_exhaustion_does_not_resume(
     assert late_now == 15.0
 
 
+def test_opencli_web_model_r18_poll_timeout_caps_remaining_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    detail_waits: list[str] = []
+    subprocess_timeouts: list[float] = []
+    latest_prompt = ""
+    late_now = 0.0
+
+    def fake_run(argv, **kwargs):
+        nonlocal latest_prompt, late_now
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="Browser exec command timed out; it may still complete in the browser.",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            wait = args[args.index("--wait") + 1]
+            detail_waits.append(wait)
+            if wait == "true":
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="Browser exec command timed out; it may still complete in the browser.",
+                )
+            subprocess_timeouts.append(kwargs["timeout"])
+            late_now += 4.0
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Role": "User", "Text": latest_prompt, "Generating": False}
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    model._conversation_id = "bound-conversation"
+    model._late_clock = lambda: late_now
+    model._sleep = lambda delay: None
+
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_TIMEOUT"):
+        model.invoke("deadline cap")
+
+    assert detail_waits == ["true", "false", "false", "false", "false"]
+    assert subprocess_timeouts == [15.0, 11.0, 7.0, 3.0]
+    assert all(timeout <= remaining for timeout, remaining in zip(subprocess_timeouts, (15.0, 11.0, 7.0, 3.0)))
+    assert late_now == 16.0
+
+
+def test_opencli_web_model_r18_durable_lock_covers_late_polling(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    first_poll_started = threading.Event()
+    release_first_poll = threading.Event()
+    second_ask_started = threading.Event()
+    ask_count = 0
+    latest_prompts: list[str] = []
+    errors: list[BaseException] = []
+    clock = _FakeClock()
+
+    def fake_run(argv, **_kwargs):
+        nonlocal ask_count
+        args = list(argv)
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_count += 1
+            latest_prompts.append(args[3])
+            if ask_count == 1:
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="Browser exec command timed out; it may still complete in the browser.",
+                )
+            second_ask_started.set()
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": "bound-conversation", "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            wait = args[args.index("--wait") + 1]
+            if wait == "true" and ask_count == 1:
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="Browser exec command timed out; it may still complete in the browser.",
+                )
+            if ask_count == 1:
+                first_poll_started.set()
+                assert release_first_poll.wait(timeout=2)
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps([
+                        {"Role": "User", "Text": latest_prompts[0], "Generating": False},
+                        {"Role": "Assistant", "Text": '{"type":"final","content":"first"}', "Generating": False},
+                    ]),
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Role": "User", "Text": latest_prompts[1], "Generating": False},
+                    {"Role": "Assistant", "Text": '{"type":"final","content":"second"}', "Generating": False},
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    kwargs = {
+        "executable": "/opt/opencli",
+        "opencli_profile": "r18-durable-lock",
+        "runtime_state_root": str(tmp_path),
+    }
+    first = OpenCLIWebChatModel(**kwargs)
+    second = OpenCLIWebChatModel(**kwargs)
+    for model in (first, second):
+        model._conversation_id = "bound-conversation"
+        model._clock = clock
+        model._late_clock = clock
+        model._sleep = clock.sleep
+        assert model._durable_pacing_backend is not None
+        model._durable_pacing_backend._clock = clock
+
+    def invoke(model: OpenCLIWebChatModel, prompt: str) -> None:
+        try:
+            model.invoke(prompt)
+        except BaseException as exc:
+            errors.append(exc)
+
+    first_thread = threading.Thread(target=invoke, args=(first, "first"))
+    second_thread = threading.Thread(target=invoke, args=(second, "second"))
+    first_thread.start()
+    assert first_poll_started.wait(timeout=1)
+    second_thread.start()
+    assert not second_ask_started.wait(timeout=0.1)
+    release_first_poll.set()
+    first_thread.join(timeout=2)
+    second_thread.join(timeout=2)
+
+    assert not errors
+    assert second_ask_started.is_set()
+    assert ask_count == 2
+
+
 @pytest.mark.parametrize(
     ("outcome", "expected_error"),
     [
