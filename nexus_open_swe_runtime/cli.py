@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -13,6 +14,29 @@ from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping
+
+try:
+    from .recovery import (
+        DurableEffectJournal,
+        DurableOperationJournal,
+        RecoveryIdentity,
+        checkpoint_path,
+        create_checkpoint,
+        operation_flock,
+        reconcile_bound_turn,
+        validate_checkpoint,
+    )
+except ImportError:  # direct ``python path/to/cli.py`` compatibility
+    from nexus_open_swe_runtime.recovery import (  # type: ignore[no-redef]
+        DurableEffectJournal,
+        DurableOperationJournal,
+        RecoveryIdentity,
+        checkpoint_path,
+        create_checkpoint,
+        operation_flock,
+        reconcile_bound_turn,
+        validate_checkpoint,
+    )
 
 REQUEST_SCHEMA = "nexus.open_swe_runtime.request.v1"
 RESULT_SCHEMA = "nexus.open_swe_runtime.result.v1"
@@ -91,10 +115,30 @@ def _path_matches(path: str, boundary: str) -> bool:
 
 
 class ScopedRepairBackend:
-    def __init__(self, delegate: Any, root: Path, allowed_paths: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        delegate: Any,
+        root: Path,
+        allowed_paths: tuple[str, ...],
+        effect_journal: DurableEffectJournal | None = None,
+    ) -> None:
         self._delegate = delegate
         self._root = root.resolve()
         self._allowed = tuple(_safe_relative_path(path) for path in allowed_paths)
+        self._effect_journal = effect_journal
+
+    def _effect(self, tool_name: str, file_path: str, content: str, old: str | None) -> Any:
+        if self._effect_journal is None:
+            return None
+        turn_id = str(self._effect_journal._current_turn_id or "turn_unknown")
+        call_id = str(self._effect_journal._current_tool_call_id or "")
+        if not call_id:
+            raise RuntimeError("RECOVERY_TOOL_CALL_ID_MISSING")
+        return self._effect_journal.intent(
+            turn_id=turn_id, tool_call_id=call_id, tool_name=tool_name,
+            arguments={"file_path": file_path, "content": content},
+            path=self._root / file_path, preimage=old, postimage=content,
+        )
 
     def _authorize(self, file_path: str) -> None:
         relative = _safe_relative_path(file_path)
@@ -130,10 +174,22 @@ class ScopedRepairBackend:
 
     def write(self, file_path: str, content: str) -> Any:
         self._authorize(file_path)
+        target = self._root / _safe_relative_path(file_path)
+        old = target.read_text(encoding="utf-8") if target.exists() else None
+        effect = self._effect("write_file", _safe_relative_path(file_path), content, old)
+        if effect is not None:
+            self._effect_journal.recover_write(effect)
+            return None
         return self._delegate.write(file_path, content)
 
     async def awrite(self, file_path: str, content: str) -> Any:
         self._authorize(file_path)
+        target = self._root / _safe_relative_path(file_path)
+        old = target.read_text(encoding="utf-8") if target.exists() else None
+        effect = self._effect("write_file", _safe_relative_path(file_path), content, old)
+        if effect is not None:
+            self._effect_journal.recover_write(effect)
+            return None
         return await self._delegate.awrite(file_path, content)
 
     def edit(
@@ -144,6 +200,13 @@ class ScopedRepairBackend:
         replace_all: bool = False,
     ) -> Any:
         self._authorize(file_path)
+        target = self._root / _safe_relative_path(file_path)
+        old = target.read_text(encoding="utf-8") if target.exists() else None
+        expected = old.replace(old_string, new_string, -1 if replace_all else 1) if old is not None else new_string
+        effect = self._effect("edit_file", _safe_relative_path(file_path), expected, old)
+        if effect is not None:
+            self._effect_journal.recover_write(effect)
+            return None
         return self._delegate.edit(file_path, old_string, new_string, replace_all)
 
     async def aedit(
@@ -154,6 +217,13 @@ class ScopedRepairBackend:
         replace_all: bool = False,
     ) -> Any:
         self._authorize(file_path)
+        target = self._root / _safe_relative_path(file_path)
+        old = target.read_text(encoding="utf-8") if target.exists() else None
+        expected = old.replace(old_string, new_string, -1 if replace_all else 1) if old is not None else new_string
+        effect = self._effect("edit_file", _safe_relative_path(file_path), expected, old)
+        if effect is not None:
+            self._effect_journal.recover_write(effect)
+            return None
         return await self._delegate.aedit(file_path, old_string, new_string, replace_all)
 
 
@@ -303,6 +373,8 @@ def build_repair_graph(
     runtime: Mapping[str, Any],
     allowed_paths: tuple[str, ...],
     key: str,
+    checkpointer: Any | None = None,
+    effect_journal: DurableEffectJournal | None = None,
 ) -> Any:
     @runtime["tool"]
     def record_worker_result(envelope: dict[str, Any]) -> str:
@@ -311,7 +383,7 @@ def build_repair_graph(
 
     _profile(runtime, key)
     filesystem = runtime["filesystem_backend"](root_dir=root, virtual_mode=True)
-    backend = ScopedRepairBackend(filesystem, root, allowed_paths)
+    backend = ScopedRepairBackend(filesystem, root, allowed_paths, effect_journal)
     return runtime["create_deep_agent"](
         model=model,
         system_prompt=(
@@ -330,7 +402,33 @@ def build_repair_graph(
                 tools=["read_file", "ls", "glob", "grep", "write_file", "edit_file"],
             )
         ],
+        checkpointer=checkpointer,
     )
+
+
+def _repair_graph(
+    factory: Callable[..., Any], model: Any, workspace: Path, runtime: Mapping[str, Any],
+    allowed_paths: tuple[str, ...], key: str, checkpointer: Any | None,
+    effect_journal: DurableEffectJournal | None = None,
+) -> Any:
+    if checkpointer is not None:
+        try:
+            parameters = inspect.signature(factory).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        kwargs: dict[str, Any] = {"checkpointer": checkpointer}
+        if "effect_journal" in parameters:
+            kwargs["effect_journal"] = effect_journal
+        if "checkpointer" in parameters:
+            return factory(model, workspace, runtime, allowed_paths, key, **kwargs)
+    if effect_journal is not None:
+        try:
+            parameters = inspect.signature(factory).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "effect_journal" in parameters:
+            return factory(model, workspace, runtime, allowed_paths, key, effect_journal=effect_journal)
+    return factory(model, workspace, runtime, allowed_paths, key)
 
 
 def executable_tool_surface(graph: Any) -> tuple[str, ...]:
@@ -1149,6 +1247,19 @@ def _worker_context(
     return task_id, unit_id, allowed_paths, session_id
 
 
+def _fenced_worker_run(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, Any]]:
+    def wrapped(request: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
+        operation_id = str(request.get("operation_id") or "")
+        if not operation_id:
+            return function(request, **kwargs)
+        lock = _state_root(request) / "recovery" / "locks" / f"{operation_id}.lock"
+        with operation_flock(lock):
+            return function(request, **kwargs)
+
+    return wrapped
+
+
+@_fenced_worker_run
 def _worker_run(
     request: Mapping[str, Any],
     *,
@@ -1192,6 +1303,9 @@ def _worker_run(
     repair_admitted = False
     repair_phase_count = 0
     session_id = ""
+    recovery_journal: DurableOperationJournal | None = None
+    checkpoint_saver: Any | None = None
+    effect_journal: DurableEffectJournal | None = None
     semantic_admission = FALLBACK
     diagnosis_model: Any | None = None
     try:
@@ -1204,6 +1318,34 @@ def _worker_run(
         semantic_admission_decision = semantic_admission.decision
         if semantic_admission_decision == REJECT:
             raise RuntimeErrorBounded("OPEN_SWE_SEMANTIC_V2_REJECTED")
+        recovery_identity = RecoveryIdentity(
+            operation_id=str(request.get("operation_id") or ""),
+            execution_material_sha256=str(started.get("execution_material_sha256") or ""),
+            workspace=str(workspace), task_id=task_id, unit_id=unit_id, session_id=session_id,
+            allowed_paths=allowed_paths, provider_id=provider, model_id=model_id,
+            worker_identity_sha256=str(request.get("worker_identity_sha256") or ""),
+            transport_config_sha256=_sha256(_canonical_json(request.get("transport_config") or {})),
+            runtime_identity_sha256=_sha256(_canonical_json({
+                "module_sha256": _sha256(Path(__file__).read_bytes()),
+                "deepagents": _deepagents_version(),
+                "checkpoint_namespace": "open-swe-repair-v1",
+            })),
+        )
+        recovery_journal = DurableOperationJournal(
+            request.get("runtime_state_root") or "", recovery_identity
+        )
+        recovery_journal.prepare()
+        effect_journal = DurableEffectJournal(
+            request.get("runtime_state_root") or "", recovery_identity
+        )
+        recovery_journal.effect_journal = effect_journal
+        checkpoint_saver, _checkpoint_namespace = create_checkpoint(
+            request.get("runtime_state_root") or "", str(request.get("operation_id") or ""),
+            recovery_identity.checkpoint_namespace,
+        )
+        recovery_journal.checkpoint_bound(
+            str(checkpoint_path(request.get("runtime_state_root") or "", recovery_identity.operation_id))
+        )
         try:
             evidence = semantic_admission.raw_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -1276,19 +1418,31 @@ def _worker_run(
                 request.get("transport_config"),
                 request.get("runtime_state_root"),
             )
+            if hasattr(repair_model, "configure_recovery_journal"):
+                repair_model.configure_recovery_journal(recovery_journal)
             if diagnosis_model is not None and repair_model is diagnosis_model:
                 raise RuntimeErrorBounded("OPEN_SWE_PHASE_MODEL_REUSE")
             if provider == "opencli_chatgpt" and getattr(repair_model, "_conversation_id", None):
                 raise RuntimeErrorBounded("OPENCLI_WEB_REPAIR_CONVERSATION_REUSE")
-            repair_graph = repair_factory(
+            repair_graph = _repair_graph(
+                repair_factory,
                 repair_model,
                 workspace,
                 runtime,
                 allowed_paths,
                 profile_key,
+                checkpoint_saver,
+                effect_journal,
             )
             if set(executable_tool_surface(repair_graph)) != REPAIR_TOOLS:
                 raise RuntimeErrorBounded("OPEN_SWE_TOOL_SURFACE_INVALID")
+            repair_config = {
+                "configurable": {
+                    "thread_id": str(request.get("operation_id") or ""),
+                    "checkpoint_ns": recovery_identity.checkpoint_namespace,
+                },
+                "recursion_limit": 60,
+            }
             repair_output = repair_graph.invoke(
                 {
                     "messages": [
@@ -1300,7 +1454,7 @@ def _worker_run(
                         )
                     ]
                 },
-                config={"recursion_limit": 60},
+                config=repair_config,
             )
             repair = _recorded_payload(repair_output, "record_worker_result")
             repair_summary = repair.get("summary") if isinstance(repair, Mapping) else None
@@ -1330,6 +1484,8 @@ def _worker_run(
             "worker_identity_sha256": str(request.get("worker_identity_sha256") or ""),
             "finished_at": _now(),
         }
+        if recovery_journal is not None:
+            recovery_journal.terminal(result)
     except Exception as exc:
         result = {
             **started,
@@ -1352,8 +1508,144 @@ def _worker_run(
     return _write_terminal(request, result)
 
 
-def _worker_reconcile(request: Mapping[str, Any]) -> dict[str, Any]:
-    return _reconcile_operation(request, kind="worker")
+def _fenced_worker_reconcile(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, Any]]:
+    def wrapped(request: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
+        operation_id = str(request.get("operation_id") or "")
+        if not operation_id:
+            return function(request, **kwargs)
+        lock = _state_root(request) / "recovery" / "locks" / f"{operation_id}.lock"
+        with operation_flock(lock):
+            return function(request, **kwargs)
+
+    return wrapped
+
+
+@_fenced_worker_reconcile
+def _worker_reconcile(
+    request: Mapping[str, Any],
+    *,
+    runtime_loader: Callable[[], Mapping[str, Any]] = _load_runtime,
+    model_builder: Callable[..., Any] = _build_model,
+    graph_builder: Callable[..., Any] = build_repair_graph,
+) -> dict[str, Any]:
+    cached = _reconcile_operation(request, kind="worker")
+    if cached.get("status") != "OPEN_SWE_OUTCOME_UNKNOWN":
+        return cached
+    operation_id = str(request.get("operation_id") or "")
+    state_root = _state_root(request)
+    recovery_path = state_root / "recovery" / "operations" / f"{operation_id}.json"
+    try:
+        raw = json.loads(recovery_path.read_text(encoding="utf-8"))
+        identity_data = raw.get("identity")
+        if not isinstance(identity_data, Mapping):
+            return cached
+        identity = RecoveryIdentity(
+            operation_id=str(identity_data["operation_id"]),
+            execution_material_sha256=str(identity_data["execution_material_sha256"]),
+            workspace=str(identity_data["workspace"]), task_id=str(identity_data["task_id"]),
+            unit_id=str(identity_data["unit_id"]), session_id=str(identity_data["session_id"]),
+            allowed_paths=tuple(str(value) for value in identity_data["allowed_paths"]),
+            provider_id=str(identity_data["provider_id"]), model_id=str(identity_data["model_id"]),
+            worker_identity_sha256=str(identity_data["worker_identity_sha256"]),
+            transport_config_sha256=str(identity_data["transport_config_sha256"]),
+            runtime_identity_sha256=str(identity_data["runtime_identity_sha256"]),
+            checkpoint_namespace=str(identity_data.get("checkpoint_namespace", "open-swe-repair-v1")),
+        )
+        if identity.operation_id != operation_id:
+            return cached
+        expected_transport = _sha256(_canonical_json(request.get("transport_config") or {}))
+        expected_runtime = _sha256(_canonical_json({
+            "module_sha256": _sha256(Path(__file__).read_bytes()),
+            "deepagents": _deepagents_version(),
+            "checkpoint_namespace": identity.checkpoint_namespace,
+        }))
+        if identity.transport_config_sha256 != expected_transport or identity.runtime_identity_sha256 != expected_runtime:
+            return cached
+        for key, expected in (
+            ("workspace_path", identity.workspace),
+            ("provider_id", identity.provider_id),
+            ("model_id", identity.model_id),
+            ("worker_identity_sha256", identity.worker_identity_sha256),
+        ):
+            supplied = request.get(key)
+            if key not in request:
+                continue
+            actual = str(Path(str(supplied)).expanduser().resolve()) if key == "workspace_path" else str(supplied)
+            if actual != expected:
+                return cached
+        journal = DurableOperationJournal.open(state_root, identity)
+        if raw.get("status") == "COMPLETED":
+            terminal = raw.get("terminal_result")
+            if isinstance(terminal, Mapping):
+                return _write_terminal(request, terminal)
+            return cached
+        if not raw.get("conversation_id") and not journal.read().get("conversation_id"):
+            return cached
+        checkpoint_file = checkpoint_path(state_root, operation_id)
+        try:
+            checkpoint_stat = checkpoint_file.stat()
+            owned = checkpoint_stat.st_uid == os.getuid()
+        except OSError:
+            owned = False
+            checkpoint_stat = None
+        if (
+            not checkpoint_file.is_file()
+            or checkpoint_file.is_symlink()
+            or not owned
+            or checkpoint_stat is None
+            or checkpoint_stat.st_mode & 0o077
+            or checkpoint_stat.st_size == 0
+            or not validate_checkpoint(checkpoint_file)
+        ):
+            return cached
+        runtime = runtime_loader()
+        model = model_builder(runtime, identity.provider_id, identity.model_id,
+                              request.get("transport_config"), request.get("runtime_state_root"))
+        if not hasattr(model, "_detail_response"):
+            return cached
+        checkpoint_saver, _ = create_checkpoint(state_root, operation_id, identity.checkpoint_namespace)
+        effect_journal = DurableEffectJournal(state_root, identity)
+        journal.effect_journal = effect_journal
+        if hasattr(model, "configure_recovery_journal"):
+            model.configure_recovery_journal(journal)
+        graph = graph_builder(model, Path(identity.workspace), runtime, identity.allowed_paths,
+                              f"{identity.provider_id}:{identity.model_id}", checkpoint_saver,
+                              effect_journal)
+        recovered = reconcile_bound_turn(journal, model)
+        try:
+            from langchain_core.utils.function_calling import convert_to_openai_tool
+            tool_nodes = graph.get_graph().nodes["tools"].data.tools_by_name
+            tool_schemas = [convert_to_openai_tool(tool) for tool in tool_nodes.values()]
+            recovered_message = model._response_message(recovered, tool_schemas)
+        except (AttributeError, KeyError, TypeError, RuntimeErrorBounded, ValueError):
+            return cached
+        recovered_calls = getattr(recovered_message, "tool_calls", None) or []
+        if recovered_calls:
+            recovered_call_id = recovered_calls[0].get("id")
+            turn_id = str(journal.read().get("turn_id") or "")
+            if not isinstance(recovered_call_id, str) or not recovered_call_id or not turn_id:
+                return cached
+            effect_journal.bind_turn(turn_id, recovered_call_id)
+        config = {
+            "configurable": {"thread_id": operation_id, "checkpoint_ns": identity.checkpoint_namespace},
+            "recursion_limit": 60,
+        }
+        graph.update_state(config, {"messages": [recovered_message]}, as_node="model")
+        output = graph.invoke(None, config=config)
+        envelope = _recorded_payload(output, "record_worker_result")
+        if envelope is None or not isinstance(envelope.get("summary"), str):
+            return cached
+        result = {
+            **cached, "status": "COMPLETED", "outcome_unknown": False,
+            "response_text": _worker_result(identity.task_id, identity.unit_id,
+                                              "IMPLEMENTATION_COMPLETED", envelope["summary"]),
+            "process_started": True, "directory": identity.workspace,
+            "finished_at": _now(),
+        }
+        journal.terminal(result)
+        return _write_terminal(request, result)
+    except Exception:
+        return cached
 
 
 def _identity_result(request: Mapping[str, Any]) -> dict[str, Any]:

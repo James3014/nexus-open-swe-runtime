@@ -3,14 +3,21 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 
 from nexus_open_swe_runtime import cli
 from nexus_open_swe_runtime.opencli_web_model import OpenCLIWebChatModel
+from nexus_open_swe_runtime.recovery import (
+    DurableOperationJournal,
+    RecoveryIdentity,
+    create_checkpoint,
+)
 
 
 class FakeGraph:
@@ -681,6 +688,238 @@ def test_worker_reconcile_fails_closed_on_same_operation_material_mismatch(tmp_p
     assert result["operation_id"] == operation_id
     assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
     assert result["outcome_unknown"] is True
+
+
+def test_worker_reconcile_direct_restart_trace_has_one_winner_and_zero_call_loser(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "a.py"
+    target.write_text("old\n", encoding="utf-8")
+    state_root = tmp_path / "state"
+    operation_id = "r" * 64
+    runtime_identity = cli._sha256(cli._canonical_json({
+        "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
+        "deepagents": cli._deepagents_version(),
+        "checkpoint_namespace": "open-swe-repair-v1",
+    }))
+    identity = RecoveryIdentity(
+        operation_id=operation_id, execution_material_sha256="b" * 64,
+        workspace=str(workspace.resolve()), task_id="task-1", unit_id="unit-1",
+        session_id="session-1", allowed_paths=("a.py",), provider_id="google_genai",
+        model_id="test-model", worker_identity_sha256="c" * 64,
+        transport_config_sha256=cli._sha256("{}"), runtime_identity_sha256=runtime_identity,
+    )
+    journal = DurableOperationJournal(state_root, identity)
+    journal.prepare()
+    journal.ask_dispatching(turn_id="turn-1", prompt="repair", ordinal=0)
+    journal.conversation_bound("conversation-1")
+    op_state = {
+        "schema": cli.RESULT_SCHEMA, "kind": "worker", "status": "OPEN_SWE_OUTCOME_UNKNOWN",
+        "operation_id": operation_id, "directory": str(workspace.resolve()),
+        "provider_id": "google_genai", "model_id": "test-model",
+        "worker_identity_sha256": "c" * 64, "process_started": True,
+        "outcome_unknown": True, "retry_safe": False,
+    }
+    cli._atomic_json(cli._operation_path({"runtime_state_root": str(state_root), "operation_id": operation_id}), op_state)
+    checkpoint, _ = create_checkpoint(state_root, operation_id, "open-swe-repair-v1")
+    request = {
+        "schema": cli.REQUEST_SCHEMA, "operation": "worker_reconcile", "operation_id": operation_id,
+        "runtime_state_root": str(state_root), "workspace_path": str(workspace),
+        "provider_id": "google_genai", "model_id": "test-model",
+        "worker_identity_sha256": "c" * 64, "transport_config": {},
+    }
+    counters = {"detail": 0, "update": 0, "invoke": 0, "effect": 0, "continuation": 0}
+    barrier = __import__("threading").Barrier(2)
+
+    class Model:
+        _conversation_id = "conversation-1"
+
+        def configure_recovery_journal(self, journal):
+            self.journal = journal
+
+        def _detail_response(self, conversation_id, *, wait, turn_id):
+            counters["detail"] += 1
+            assert (conversation_id, wait, turn_id) == ("conversation-1", False, "turn-1")
+            return '{"type":"tool_call","name":"write_file","arguments":{"file_path":"a.py","content":"done\\n"}}'
+
+        def _response_message(self, response, tools):
+            from langchain_core.messages import AIMessage
+            return AIMessage(content="", tool_calls=[{"name": "write_file", "args": {"file_path": "a.py", "content": "done\n"}, "id": "call-1", "type": "tool_call"}])
+
+        def continue_same_conversation(self):
+            assert self._conversation_id == "conversation-1"
+            counters["continuation"] += 1
+
+    class Delegate:
+        def write(self, file_path, content):
+            target.write_text(content, encoding="utf-8")
+
+    class Graph:
+        def __init__(self, model, effect_journal):
+            self.model = model
+            self.effect_journal = effect_journal
+
+        def get_graph(self):
+            return type("G", (), {"nodes": {"tools": type("T", (), {"data": type("D", (), {"tools_by_name": {}})()})()}})()
+
+        def update_state(self, config, values, *, as_node):
+            counters["update"] += 1
+            assert as_node == "model"
+            assert config["configurable"] == {"thread_id": operation_id, "checkpoint_ns": "open-swe-repair-v1"}
+            assert values["messages"][0].tool_calls[0]["id"] == "call-1"
+
+        def invoke(self, payload, *, config):
+            counters["invoke"] += 1
+            assert payload is None
+            backend = cli.ScopedRepairBackend(
+                Delegate(), workspace, ("a.py",), self.effect_journal
+            )
+            backend.write("a.py", "done\n")
+            counters["effect"] += 1
+            self.model.continue_same_conversation()
+            return _record("record_worker_result", {"summary": "recovered"})
+
+    def run():
+        barrier.wait()
+        return cli._worker_reconcile(
+            request, runtime_loader=lambda: {}, model_builder=lambda *_args: Model(),
+            graph_builder=lambda model, *_args: Graph(model, _args[-1]),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = pool.map(lambda _ignored: run(), range(2))
+    assert first["status"] == second["status"] == "COMPLETED"
+    assert counters == {"detail": 1, "update": 1, "invoke": 1, "effect": 1, "continuation": 1}
+    assert target.read_text(encoding="utf-8") == "done\n"
+
+
+def test_worker_run_operation_fence_allows_one_initial_external_execution(tmp_path):
+    request = _worker_request(tmp_path)
+    workspace = Path(request["workspace_path"])
+    diagnosis = FakeGraph(
+        cli.DIAGNOSIS_TOOLS,
+        _record(
+            "record_diagnosis",
+            {
+                "status": "ROOT_CAUSE_SUPPORTED",
+                "summary": "supported",
+                "evidence_paths": ["a.py"],
+            },
+        ),
+    )
+    calls = {"models": 0, "effects": 0}
+
+    class Model:
+        def configure_recovery_journal(self, journal):
+            self.journal = journal
+
+    class Repair(FakeGraph):
+        def invoke(self, payload, config=None):
+            time.sleep(0.05)
+            calls["effects"] += 1
+            (workspace / "a.py").write_text("VALUE = 2\n", encoding="utf-8")
+            return super().invoke(payload, config)
+
+    repair = Repair(
+        cli.REPAIR_TOOLS,
+        _record("record_worker_result", {"summary": "repaired"}),
+    )
+
+    def model_factory(*_args):
+        calls["models"] += 1
+        return Model()
+
+    def run():
+        return cli._worker_run(
+            request,
+            runtime_loader=_runtime,
+            model_factory=model_factory,
+            diagnosis_factory=lambda *_args: diagnosis,
+            repair_factory=lambda *_args: repair,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = pool.map(lambda _ignored: run(), range(2))
+    assert first["status"] == second["status"] == "COMPLETED"
+    assert calls == {"models": 2, "effects": 1}
+    assert diagnosis.calls == 1
+    assert repair.calls == 1
+    assert workspace.joinpath("a.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+
+
+def test_restart_trace_uses_real_opencli_conversation_for_continuation(tmp_path, monkeypatch):
+    state_root = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    identity = RecoveryIdentity(
+        operation_id="s" * 64,
+        execution_material_sha256="a" * 64,
+        workspace=str(workspace.resolve()),
+        task_id="task-1", unit_id="unit-1", session_id="session-1",
+        allowed_paths=("a.py",), provider_id="opencli_chatgpt", model_id="balanced",
+        worker_identity_sha256="b" * 64, transport_config_sha256=cli._sha256("{}"),
+        runtime_identity_sha256="c" * 64,
+    )
+    journal = DurableOperationJournal(state_root, identity)
+    journal.prepare()
+    calls = []
+    ask_count = 0
+    latest_prompt = ""
+
+    def fake_run(argv, **kwargs):
+        nonlocal ask_count, latest_prompt
+        args = list(argv)
+        calls.append((args, dict(kwargs)))
+        if args[1:3] == ["chatgpt", "model"]:
+            return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
+        if args[1:3] == ["chatgpt", "ask"]:
+            ask_count += 1
+            latest_prompt = args[3]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"conversationId": "conversation-1", "response": ""}]),
+                stderr="",
+            )
+        if args[1:3] == ["chatgpt", "detail"]:
+            response = (
+                '{"type":"tool_call","name":"write_file","arguments":'
+                '{"file_path":"a.py","content":"done\\n"}}'
+                if ask_count == 1 else '{"type":"final","content":"continued"}'
+            )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {"Index": 1, "Role": "User", "Text": latest_prompt, "Generating": False, "StableSeconds": 6},
+                    {"Index": 2, "Role": "Assistant", "Text": response, "Generating": False, "StableSeconds": 6},
+                ]),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", fake_run)
+    first_model = OpenCLIWebChatModel(executable="/opt/opencli", intelligence_level="balanced")
+    first_model.configure_recovery_journal(journal)
+    tools = [{"type": "function", "function": {"name": "write_file", "parameters": {"type": "object"}}}]
+    first = first_model._generate([HumanMessage(content="initial")], tools=tools).generations[0].message
+    assert first.tool_calls[0]["id"]
+    assert journal.read()["conversation_id"] == "conversation-1"
+
+    restarted = OpenCLIWebChatModel(executable="/opt/opencli", intelligence_level="balanced")
+    restarted.configure_recovery_journal(journal)
+    assert restarted._detail_response is not None
+    recovered = cli.reconcile_bound_turn(journal, restarted)
+    assert json.loads(recovered)["type"] == "tool_call"
+    continuation = restarted._generate(
+        [first, ToolMessage(content="written", tool_call_id=first.tool_calls[0]["id"], name="write_file")],
+        tools=tools,
+    ).generations[0].message
+    assert continuation.content == "continued"
+    asks = [argv for argv, _kwargs in calls if argv[1:3] == ["chatgpt", "ask"]]
+    assert len(asks) == 2
+    assert sum("--new" in argv for argv in asks) == 1
+    assert "--conversation" not in asks[0]
+    assert asks[1][asks[1].index("--conversation") + 1] == "conversation-1"
+    assert "--new" not in asks[1]
 
 
 def test_worker_replay_with_changed_material_does_not_return_cached_terminal_or_redispatch(tmp_path):
