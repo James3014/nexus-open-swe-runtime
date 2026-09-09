@@ -971,6 +971,7 @@ def _semantic_reject(reason: str) -> SemanticAdmission:
     return SemanticAdmission(REJECT, reason_code=reason)
 
 
+# fmt: off
 _SEMANTIC_REJECTION_CODES = frozenset({
     "artifact_parse", "schema", "workspace_symlink", "envelope_keys", "envelope_hash",
     "binding_shape", "binding_keys", "scope_worker_keys", "evidence_shape", "binding_types",
@@ -988,6 +989,7 @@ _FAILURE_PHASES = frozenset({
     "WORKER_CONTEXT", "RUNTIME_LOAD", "SEMANTIC_ADMISSION", "RECOVERY_PREPARE",
     "DIAGNOSIS", "REPAIR", "RESULT_FINALIZATION",
 })
+# fmt: on
 
 
 def _bounded_error_code(exc: BaseException) -> str:
@@ -995,18 +997,32 @@ def _bounded_error_code(exc: BaseException) -> str:
     if isinstance(exc, RuntimeErrorBounded):
         code = str(exc)
         if code in {
-            "OPEN_SWE_RUNTIME_STATE_ROOT_REQUIRED", "OPEN_SWE_OPERATION_ID_INVALID",
-            "OPEN_SWE_WORKSPACE_REQUIRED", "SESSION_BINDING_MISSING", "SESSION_BINDING_MISMATCH",
+            "OPEN_SWE_RUNTIME_STATE_ROOT_REQUIRED",
+            "OPEN_SWE_OPERATION_ID_INVALID",
+            "OPEN_SWE_WORKSPACE_REQUIRED",
+            "SESSION_BINDING_MISSING",
+            "SESSION_BINDING_MISMATCH",
             "OPEN_SWE_SEMANTIC_V2_REJECTED",
-            "OPEN_SWE_EXECUTION_INPUT_INVALID", "OPEN_SWE_V2_ARTIFACT_INVALID",
-            "OPEN_SWE_V2_WORKSPACE_BINDING_INVALID", "OPEN_SWE_V2_TASK_CARD_INVALID",
-            "OPENCLI_WEB_TRANSPORT_CONFIG_INVALID", "OPEN_SWE_TRANSPORT_CONFIG_PROVIDER_MISMATCH",
-            "OPEN_SWE_EVIDENCE_INVALID", "OPEN_SWE_TOOL_SURFACE_INVALID",
-            "OPEN_SWE_TOOL_SURFACE_UNAVAILABLE", "OPEN_SWE_DIAGNOSIS_INVALID",
-            "OPEN_SWE_DIAGNOSIS_EVIDENCE_MISSING", "OPEN_SWE_DIAGNOSIS_EVIDENCE_INVALID",
-            "OPEN_SWE_PHASE_MODEL_REUSE", "OPENCLI_WEB_REPAIR_CONVERSATION_REUSE",
-            "OPEN_SWE_REPAIR_RESULT_INVALID", "OPEN_SWE_COMPOSITE_RESULT_INVALID",
-        } or any(code == f"OPEN_SWE_SEMANTIC_V2_REJECTED_{reason.upper()}" for reason in _SEMANTIC_REJECTION_CODES):
+            "OPEN_SWE_EXECUTION_INPUT_INVALID",
+            "OPEN_SWE_V2_ARTIFACT_INVALID",
+            "OPEN_SWE_V2_WORKSPACE_BINDING_INVALID",
+            "OPEN_SWE_V2_TASK_CARD_INVALID",
+            "OPENCLI_WEB_TRANSPORT_CONFIG_INVALID",
+            "OPEN_SWE_TRANSPORT_CONFIG_PROVIDER_MISMATCH",
+            "OPEN_SWE_EVIDENCE_INVALID",
+            "OPEN_SWE_TOOL_SURFACE_INVALID",
+            "OPEN_SWE_TOOL_SURFACE_UNAVAILABLE",
+            "OPEN_SWE_DIAGNOSIS_INVALID",
+            "OPEN_SWE_DIAGNOSIS_EVIDENCE_MISSING",
+            "OPEN_SWE_DIAGNOSIS_EVIDENCE_INVALID",
+            "OPEN_SWE_PHASE_MODEL_REUSE",
+            "OPENCLI_WEB_REPAIR_CONVERSATION_REUSE",
+            "OPEN_SWE_REPAIR_RESULT_INVALID",
+            "OPEN_SWE_COMPOSITE_RESULT_INVALID",
+        } or any(
+            code == f"OPEN_SWE_SEMANTIC_V2_REJECTED_{reason.upper()}"
+            for reason in _SEMANTIC_REJECTION_CODES
+        ):
             return code
         return "OPEN_SWE_BOUNDED_FAILURE_UNCLASSIFIED"
     return ""
@@ -2154,7 +2170,9 @@ def _worker_run(
             "outcome_unknown": True,
             "retry_safe": False,
             "error": type(exc).__name__,
-            "failure_phase": failure_phase if failure_phase in _FAILURE_PHASES else "WORKER_CONTEXT",
+            "failure_phase": failure_phase
+            if failure_phase in _FAILURE_PHASES
+            else "WORKER_CONTEXT",
             "diagnosis_status": diagnosis_status,
             "diagnosis_sha256": diagnosis_sha256,
             "diagnosis_evidence_paths": list(diagnosis_evidence_paths),

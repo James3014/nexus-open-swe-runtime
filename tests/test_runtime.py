@@ -2922,10 +2922,20 @@ def test_v2_positive_admission_has_no_rejection_reason(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     "name,mutate,expected,refresh_hash",
     [
-        ("schema", lambda _r, e: e.__setitem__("schema", "external_execution_envelope.v3"), "schema", True),
+        (
+            "schema",
+            lambda _r, e: e.__setitem__("schema", "external_execution_envelope.v3"),
+            "schema",
+            True,
+        ),
         ("hash", lambda _r, e: e.__setitem__("objective", "changed"), "envelope_hash", True),
         ("base", lambda _r, e: e["binding"].update(main_sha="a" * 40), "base_binding", True),
-        ("source", lambda _r, e: e["evidence_refs"].__setitem__(1, "source_absence:a.py@bad"), "source_evidence", True),
+        (
+            "source",
+            lambda _r, e: e["evidence_refs"].__setitem__(1, "source_absence:a.py@bad"),
+            "source_evidence",
+            True,
+        ),
     ],
 )
 def test_v2_rejection_reason_is_first_fail_closed_predicate(
@@ -2973,9 +2983,11 @@ def test_worker_persists_pre_journal_semantic_reason_without_model_or_journal(
 
 def test_worker_sanitizes_unknown_bounded_exception(tmp_path, monkeypatch):
     request = _worker_request(tmp_path)
-    monkeypatch.setattr(cli, "_worker_context", lambda *_args: (_ for _ in ()).throw(
-        cli.RuntimeErrorBounded("secret=/tmp/private/prompt")
-    ))
+    monkeypatch.setattr(
+        cli,
+        "_worker_context",
+        lambda *_args: (_ for _ in ()).throw(cli.RuntimeErrorBounded("secret=/tmp/private/prompt")),
+    )
     result = cli._worker_run(request, runtime_loader=_runtime)
     assert result["failure_phase"] == "WORKER_CONTEXT"
     assert result["error_code"] == "OPEN_SWE_BOUNDED_FAILURE_UNCLASSIFIED"
