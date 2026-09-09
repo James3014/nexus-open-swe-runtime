@@ -1507,6 +1507,101 @@ def test_real_deepagents_graphs_expose_only_qualified_surfaces(tmp_path):
     assert forbidden.isdisjoint(cli.executable_tool_surface(repair))
 
 
+def test_admitted_composite_graph_writes_receipt_and_terminates_locally(tmp_path, monkeypatch):
+    """The compiled admitted graph performs one composite effect and one web send."""
+    runtime = cli._load_runtime()
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    identity = RecoveryIdentity(
+        operation_id="o" * 64,
+        execution_material_sha256="e" * 64,
+        workspace=str(tmp_path.resolve()),
+        task_id="task-1",
+        unit_id="unit-1",
+        session_id="session-1",
+        allowed_paths=("a.py",),
+        provider_id="opencli_chatgpt",
+        model_id="advanced",
+        worker_identity_sha256="w" * 64,
+        transport_config_sha256="t" * 64,
+        runtime_identity_sha256="r" * 64,
+        composite_admitted=True,
+    )
+    journal = cli.DurableOperationJournal(tmp_path, identity)
+    journal.prepare()
+    effect_journal = cli.DurableEffectJournal(tmp_path, identity)
+    journal.effect_journal = effect_journal
+    model.configure_recovery_journal(journal)
+    sends: list[str] = []
+
+    def one_model_send(prompt, **_kwargs):
+        sends.append(prompt)
+        turn_id = json.loads(prompt)["turn_id"]
+        model._journal_ask(turn_id, prompt)
+        model._journal_bound("conversation-1")
+        args = {
+            "file_path": "a.py",
+            "content": "VALUE = 2\n",
+            "envelope": {"summary": "repaired a.py"},
+        }
+        response = json.dumps(
+            {
+                "type": "tool_call",
+                "name": "write_file_and_record_worker_result",
+                "arguments": args,
+            },
+            separators=(",", ":"),
+        )
+        model._journal_response(turn_id, response)
+        return response
+
+    monkeypatch.setattr(model, "_send_and_reconcile", one_model_send)
+    monkeypatch.setattr(model, "_select_intelligence_level", lambda: None)
+    graph = cli.build_repair_graph(
+        model,
+        tmp_path,
+        runtime,
+        ("a.py",),
+        "opencli_chatgpt:advanced",
+        effect_journal=effect_journal,
+        composite=True,
+    )
+    assert "write_file_and_record_worker_result" in cli.executable_tool_surface(graph)
+
+    result = graph.invoke(
+        {"messages": [runtime["human_message"]("repair a.py")]},
+        config={"configurable": {"thread_id": identity.operation_id}, "recursion_limit": 60},
+    )
+
+    assert len(sends) == 1
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    effects = list(effect_journal.root.glob("effect_*.json"))
+    assert len(effects) == 1
+    effect = json.loads(effects[0].read_text(encoding="utf-8"))
+    assert effect["status"] == "RESULT"
+    receipt = effect["worker_result"]
+    assert receipt["schema"] == "nexus.open_swe_runtime.worker_result.v1"
+    assert receipt["status"] == "IMPLEMENTATION_EFFECT_COMPLETE"
+    assert result["messages"][-1].content == "Terminal recorder completed."
+
+
+@pytest.mark.parametrize(
+    "allowed_paths, composite",
+    [((), False), (("a.py", "b.py"), False)],
+)
+def test_fallback_and_multipath_graphs_do_not_expose_composite(tmp_path, allowed_paths, composite):
+    runtime = cli._load_runtime()
+    model = OpenCLIWebChatModel(executable="/opt/opencli")
+    graph = cli.build_repair_graph(
+        model,
+        tmp_path,
+        runtime,
+        allowed_paths,
+        "test:unqualified",
+        composite=composite,
+    )
+    assert "write_file_and_record_worker_result" not in cli.executable_tool_surface(graph)
+
+
 def test_runtime_state_files_are_restrictive_and_contain_no_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "sentinel-provider-secret")
     monkeypatch.setenv("GITHUB_TOKEN", "sentinel-github-secret")
