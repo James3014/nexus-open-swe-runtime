@@ -2021,6 +2021,7 @@ class OpenCLIWebChatModel(BaseChatModel):
         projected_composite = self._project_unescaped_composite_response(response)
         if (
             projected_composite is not None
+            and projected_composite != response
             and self._inverse_repaired_composite_response(projected_composite) == response
         ):
             if self._recovery_journal is not None:
