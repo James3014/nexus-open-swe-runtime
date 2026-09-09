@@ -364,9 +364,27 @@ class DurableEffectJournal:
         state = self.read(effect.effect_id)
         if state.get("status") != "RESULT":
             raise RuntimeError("RECOVERY_EFFECT_NOT_RESULT")
+        expected_effect = asdict(effect)
+        persisted_effect = {
+            key: state.get(key)
+            for key in expected_effect
+        }
+        if persisted_effect != expected_effect:
+            raise RuntimeError("RECOVERY_EFFECT_IDENTITY_MISMATCH")
+        if _sha(effect.postimage) != effect.postimage_sha256:
+            raise RuntimeError("RECOVERY_EFFECT_POSTIMAGE_MISMATCH")
+        if not isinstance(envelope, Mapping):
+            raise RuntimeError("RECOVERY_WORKER_RESULT_INVALID")
         summary = envelope.get("summary")
         if not isinstance(summary, str) or not summary.strip():
             raise RuntimeError("RECOVERY_WORKER_RESULT_INVALID")
+        if effect.tool_name == "write_file_and_record_worker_result":
+            effect_envelope = effect.arguments.get("envelope")
+            if (
+                not isinstance(effect_envelope, Mapping)
+                or effect_envelope.get("summary") != summary
+            ):
+                raise RuntimeError("RECOVERY_WORKER_RESULT_SUMMARY_MISMATCH")
         receipt = {
             "schema": "nexus.open_swe_runtime.worker_result.v1",
             "status": "IMPLEMENTATION_EFFECT_COMPLETE",
@@ -382,6 +400,23 @@ class DurableEffectJournal:
         receipt["content_sha256"] = _sha(effect.postimage)
         receipt["summary_sha256"] = _sha(summary)
         receipt["receipt_sha256"] = _sha(_canonical(receipt))
+        existing_receipt = state.get("worker_result")
+        existing_hash = state.get("worker_result_sha256")
+        if existing_receipt is not None or existing_hash is not None:
+            if (
+                not isinstance(existing_receipt, Mapping)
+                or not isinstance(existing_hash, str)
+                or existing_receipt != receipt
+                or existing_hash != _sha(_canonical(existing_receipt))
+                or existing_receipt.get("receipt_sha256")
+                != _sha(_canonical({
+                    key: value
+                    for key, value in existing_receipt.items()
+                    if key != "receipt_sha256"
+                }))
+            ):
+                raise RuntimeError("RECOVERY_WORKER_RESULT_MISMATCH")
+            return dict(existing_receipt)
         updated = {**state, "worker_result": receipt, "worker_result_sha256": _sha(_canonical(receipt))}
         _fsync_replace(self._path(effect.effect_id), updated)
         return receipt
