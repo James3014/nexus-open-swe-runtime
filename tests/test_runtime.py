@@ -3750,6 +3750,33 @@ def test_worker_run_fallback_and_multipath_do_not_admit_composite(tmp_path, monk
     )
     envelope["evidence_refs"].append("source_absence:b.py@" + "b" * 16)
     envelope["inspect_first"].append(envelope["evidence_refs"][-1])
+
+    # The Task Card is authority input, not a worker mutation. Freeze its
+    # multipath form into a new physical base before exercising the worker.
+    subprocess.run(["git", "-C", str(workspace), "add", "tasks/task-card.md"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Nexus Open SWE Test",
+            "-c",
+            "user.email=nexus-open-swe@example.test",
+            "-C",
+            str(workspace),
+            "commit",
+            "-q",
+            "-m",
+            "fixture multipath authority",
+        ],
+        check=True,
+    )
+    base_sha = subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"], text=True
+    ).strip()
+    base_tree = subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD^{tree}"], text=True
+    ).strip()
+    envelope["binding"]["main_sha"] = base_sha
     Path(request["artifact_path"]).write_text(cli._canonical_json(envelope), encoding="utf-8")
     request["prompt"] = request["prompt"].replace(
         'authorized_mutation_paths=["a.py"]', 'authorized_mutation_paths=["a.py","b.py"]'
@@ -3757,9 +3784,20 @@ def test_worker_run_fallback_and_multipath_do_not_admit_composite(tmp_path, monk
     request["prompt"] = "\n".join(
         f"envelope_sha256={cli._sha256(Path(request['artifact_path']).read_bytes())}"
         if line.startswith("envelope_sha256=")
+        else f"expected_base_sha={base_sha}"
+        if line.startswith("expected_base_sha=")
         else line
         for line in request["prompt"].splitlines()
     )
+    core_binding = json.loads(json.dumps(request["core_binding"]))
+    core_binding["repository"]["source_revision"] = f"git-commit:{base_sha}"
+    core_binding["repository"]["source_tree"] = f"git-tree:{base_tree}"
+    contract = core_binding["core"]["acceptance_contract"]
+    contract["allowed_paths"] = ["a.py", "b.py"]
+    core_binding["core"]["acceptance_contract_hash"] = acceptance_contract_hash(contract)
+    core_binding.pop("binding_hash")
+    core_binding["binding_hash"] = repository_mutation_binding_hash(core_binding)
+    request["core_binding"] = core_binding
     assert (
         cli._semantic_v2_admission(
             request,
