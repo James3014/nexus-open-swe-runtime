@@ -6,7 +6,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 MODULE_PATH = Path(__file__).resolve().parents[1] / "nexus_open_swe_runtime" / "core_binding.py"
 SPEC = importlib.util.spec_from_file_location("open_swe_core_binding_test_target", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
