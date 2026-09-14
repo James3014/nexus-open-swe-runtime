@@ -14,6 +14,11 @@ import pytest
 from langchain_core.messages import HumanMessage, ToolMessage
 
 from nexus_open_swe_runtime import cli
+from nexus_open_swe_runtime.core_binding import (
+    CORE_PROTOCOL_VERSION,
+    acceptance_contract_hash,
+    repository_mutation_binding_hash,
+)
 from nexus_open_swe_runtime.opencli_web_model import OpenCLIWebChatModel, _tool_call_id
 from nexus_open_swe_runtime.recovery import (
     DurableEffectJournal,
@@ -385,6 +390,9 @@ def test_worker_supported_diagnosis_produces_bounded_result_and_workspace_index(
     assert result["repair_admitted"] is True
     assert result["repair_phase_count"] == 1
     assert result["worker_identity_sha256"] == "c" * 64
+    assert result["core_trust"] == "LEGACY_UNBOUND"
+    assert "core_binding_hash" not in result
+    assert "core_verification_status" not in result
     assert (workspace / "a.py").read_text(encoding="utf-8") == "VALUE = 2\n"
     request["operation"] = "worker_reconcile"
     request["prompt"] = ""
@@ -2250,6 +2258,54 @@ def test_worker_blocks_repair_when_authorized_absent_path_is_dangling_symlink(tm
     assert not missing_target.exists()
 
 
+def _attach_core_binding(request: dict) -> None:
+    contract = {
+        "contract_id": "open-swe-v2-test",
+        "requirements_hash": "sha256:" + "1" * 64,
+        "required_verifier_ids": ["pytest"],
+        "allowed_paths": ["a.py"],
+        "deletion_policy": "FORBID",
+    }
+    base = {
+        "schema": "nexus.repository_mutation_binding.v1",
+        "binding_id": "binding-open-swe-test",
+        "operation_id": request["operation_id"],
+        "attempt_id": "attempt-open-swe-test",
+        "repository": {
+            "canonical_id": "James3014/Nexus-new",
+            "origin": "https://github.com/James3014/Nexus-new.git",
+            "source_revision": "git-commit:" + "b" * 40,
+            "source_tree": "git-tree:" + "d" * 40,
+            "workspace_identity": "sha256:" + "2" * 64,
+            "workspace_mode": "target",
+        },
+        "integration_authority": {
+            "execution_lane": "DIRECT_DELEGATED",
+            "authority_ref": "James3014/Nexus-new#957",
+            "authority_hash": "sha256:" + "3" * 64,
+        },
+        "capability_discovery": {
+            "required": True,
+            "receipt_hash": "sha256:" + "4" * 64,
+            "index_revision": "git-commit:" + "e" * 40,
+        },
+        "core": {
+            "protocol_version": CORE_PROTOCOL_VERSION,
+            "acceptance_contract": contract,
+            "acceptance_contract_hash": acceptance_contract_hash(contract),
+        },
+        "freshness": {
+            "created_at": "2026-09-14T00:00:00Z",
+            "valid_until": None,
+            "revalidate_before_first_effect": True,
+        },
+    }
+    request["core_binding"] = {
+        **base,
+        "binding_hash": repository_mutation_binding_hash(base),
+    }
+
+
 def _v2_request(tmp_path: Path, *, status: str = "PROVEN") -> dict:
     request = _worker_request(tmp_path)
     request.update({
@@ -2345,20 +2401,13 @@ def _v2_request(tmp_path: Path, *, status: str = "PROVEN") -> dict:
         f"envelope_sha256={cli._sha256(raw)}",
         "expected_base_sha=" + "b" * 40,
     ])
+    _attach_core_binding(request)
     return request
 
 
 def test_worker_admits_strict_v2_without_diagnosis_model_or_graph(tmp_path, monkeypatch):
     request = _v2_request(tmp_path)
-    monkeypatch.setattr(
-        cli,
-        "_git_output",
-        lambda _workspace, *args: {
-            ("rev-parse", "HEAD"): "b" * 40,
-            ("status", "--porcelain"): "",
-            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
-        }[args],
-    )
+    _admission_git(monkeypatch)
     model_calls = 0
     diagnosis_calls = 0
     repair = FakeGraph(cli.REPAIR_TOOLS, _record("record_worker_result", {"summary": "done"}))
@@ -2391,9 +2440,107 @@ def test_worker_admits_strict_v2_without_diagnosis_model_or_graph(tmp_path, monk
     assert result["status"] == "COMPLETED"
     assert result["diagnosis_status"] == "ROOT_CAUSE_SUPPORTED"
     assert result["repair_admitted"] is True
+    assert result["core_trust"] == "CORE_BOUND_V2_UNVERIFIED"
+    assert result["core_binding_hash"] == request["core_binding"]["binding_hash"]
+    assert result["core_changeset_status"] == "UNVERIFIABLE"
+    assert result["core_verification_status"] == "PENDING_DOWNSTREAM_CORE_VERIFY"
+    assert result["core_claim_ceiling"] == "OPEN_SWE_V2_CORE_BINDING_SOURCE_VERIFIED"
+    assert result["core_verifier_observations"] == []
     assert model_calls == 1
     assert diagnosis_calls == 0
     assert repair.calls == 1
+
+    reconcile = {**request, "operation": "worker_reconcile"}
+    assert cli.dispatch(reconcile) == result
+    without_binding = {key: value for key, value in reconcile.items() if key != "core_binding"}
+    missing = cli.dispatch(without_binding)
+    assert missing["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert missing["retry_safe"] is False
+
+    changed = json.loads(json.dumps(request["core_binding"]))
+    changed["attempt_id"] = "attempt-reconcile-other"
+    changed_without_hash = {key: value for key, value in changed.items() if key != "binding_hash"}
+    changed["binding_hash"] = repository_mutation_binding_hash(changed_without_hash)
+    mismatched = cli.dispatch({**reconcile, "core_binding": changed})
+    assert mismatched["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert mismatched["retry_safe"] is False
+
+
+def test_worker_admitted_v2_without_core_binding_fails_before_model_or_repair(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path)
+    request.pop("core_binding")
+    _admission_git(monkeypatch)
+    calls = {"model": 0, "repair": 0}
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: calls.__setitem__("model", calls["model"] + 1),
+        diagnosis_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("diagnosis must not run")),
+        repair_factory=lambda *_args: calls.__setitem__("repair", calls["repair"] + 1),
+    )
+
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["error_code"] == "OPEN_SWE_CORE_BINDING_INVALID"
+    assert calls == {"model": 0, "repair": 0}
+
+
+def test_worker_fallback_v2_still_requires_core_binding_before_diagnosis(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path, status="INCONCLUSIVE")
+    request.pop("core_binding")
+    _admission_git(monkeypatch)
+    calls = {"model": 0, "diagnosis": 0, "repair": 0}
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: calls.__setitem__("model", calls["model"] + 1),
+        diagnosis_factory=lambda *_args: calls.__setitem__("diagnosis", calls["diagnosis"] + 1),
+        repair_factory=lambda *_args: calls.__setitem__("repair", calls["repair"] + 1),
+    )
+
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["error_code"] == "OPEN_SWE_CORE_BINDING_INVALID"
+    assert calls == {"model": 0, "diagnosis": 0, "repair": 0}
+
+
+def test_worker_admitted_v2_rejects_mismatched_source_tree_before_model(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path)
+    changed = json.loads(json.dumps(request["core_binding"]))
+    changed["repository"]["source_tree"] = "git-tree:" + "f" * 40
+    changed_without_hash = {key: value for key, value in changed.items() if key != "binding_hash"}
+    changed["binding_hash"] = repository_mutation_binding_hash(changed_without_hash)
+    request["core_binding"] = changed
+    _admission_git(monkeypatch)
+    calls = {"model": 0, "repair": 0}
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: calls.__setitem__("model", calls["model"] + 1),
+        diagnosis_factory=lambda *_args: pytest.fail("admitted v2 must not rerun diagnosis"),
+        repair_factory=lambda *_args: calls.__setitem__("repair", calls["repair"] + 1),
+    )
+
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["error_code"] == "OPEN_SWE_CORE_BINDING_INVALID"
+    assert calls == {"model": 0, "repair": 0}
+
+
+def test_worker_same_session_rejects_changed_core_binding(tmp_path):
+    request = _v2_request(tmp_path)
+    prompt = request["prompt"]
+    task_id, unit_id, allowed_paths, session_id = cli._worker_context(request, prompt)
+    assert (task_id, unit_id, allowed_paths) == ("task-1", "u1", ("a.py",))
+
+    changed = json.loads(json.dumps(request["core_binding"]))
+    changed["attempt_id"] = "attempt-other"
+    changed_without_hash = {key: value for key, value in changed.items() if key != "binding_hash"}
+    changed["binding_hash"] = repository_mutation_binding_hash(changed_without_hash)
+    resumed = {**request, "session_id": session_id, "core_binding": changed}
+
+    with pytest.raises(cli.RuntimeErrorBounded, match="SESSION_BINDING_MISMATCH"):
+        cli._worker_context(resumed, prompt)
 
 
 def test_r24_issue_metadata_authority_is_admitted(tmp_path, monkeypatch):
@@ -2405,15 +2552,7 @@ def test_r24_issue_metadata_authority_is_admitted(tmp_path, monkeypatch):
         "github_issue:github://James3014/Nexus-new/issues/853@" + "e" * 16
     )
     _write_v2_mutation(request, envelope)
-    monkeypatch.setattr(
-        cli,
-        "_git_output",
-        lambda _workspace, *args: {
-            ("rev-parse", "HEAD"): "b" * 40,
-            ("status", "--porcelain"): "",
-            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
-        }[args],
-    )
+    _admission_git(monkeypatch)
     admission = cli._semantic_v2_admission(
         request,
         Path(request["workspace_path"]),
@@ -2433,15 +2572,7 @@ def test_r24_worker_selects_composite_terminal_path(tmp_path, monkeypatch):
         "github_issue:github://James3014/Nexus-new/issues/853@" + "e" * 16
     )
     _write_v2_mutation(request, envelope)
-    monkeypatch.setattr(
-        cli,
-        "_git_output",
-        lambda _workspace, *args: {
-            ("rev-parse", "HEAD"): "b" * 40,
-            ("status", "--porcelain"): "",
-            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
-        }[args],
-    )
+    _admission_git(monkeypatch)
     captured: dict[str, object] = {}
     original_admission = cli._semantic_v2_admission
 
@@ -2500,15 +2631,7 @@ def test_r17_prose_inspect_first_is_admitted_as_advisory(tmp_path, monkeypatch, 
         ),
         f"envelope_sha256={cli._sha256(raw)}",
     )
-    monkeypatch.setattr(
-        cli,
-        "_git_output",
-        lambda _workspace, *args: {
-            ("rev-parse", "HEAD"): "b" * 40,
-            ("status", "--porcelain"): "",
-            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
-        }[args],
-    )
+    _admission_git(monkeypatch)
     repair = FakeGraph(cli.REPAIR_TOOLS, _record("record_worker_result", {"summary": "done"}))
     assert cli._read_regular_artifact(Path(request["artifact_path"])) == raw.encode()
     assert cli._parse_unique_json(raw.encode())["inspect_first"] == envelope["inspect_first"]
@@ -2623,15 +2746,7 @@ def test_r17_strict_evidence_and_authority_negatives_reject_without_calls(
 
 def test_worker_admit_r16_opencli_repair_uses_new_without_conversation(tmp_path, monkeypatch):
     request = _v2_request(tmp_path)
-    monkeypatch.setattr(
-        cli,
-        "_git_output",
-        lambda _workspace, *args: {
-            ("rev-parse", "HEAD"): "b" * 40,
-            ("status", "--porcelain"): "",
-            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
-        }[args],
-    )
+    _admission_git(monkeypatch)
     ask_commands: list[list[str]] = []
     latest_prompt = ""
 
@@ -2899,6 +3014,7 @@ def _admission_git(monkeypatch):
         "_git_output",
         lambda _workspace, *args: {
             ("rev-parse", "HEAD"): "b" * 40,
+            ("rev-parse", "HEAD^{tree}"): "d" * 40,
             ("status", "--porcelain"): "",
             ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
         }[args],
@@ -3475,15 +3591,7 @@ def _composite_recovery_fixture(
 
 def test_worker_run_admitted_v2_executes_real_composite_graph_once(tmp_path, monkeypatch):
     request = _v2_request(tmp_path)
-    monkeypatch.setattr(
-        cli,
-        "_git_output",
-        lambda _workspace, *args: {
-            ("rev-parse", "HEAD"): "b" * 40,
-            ("status", "--porcelain"): "",
-            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
-        }[args],
-    )
+    _admission_git(monkeypatch)
     monkeypatch.setattr(
         cli, "create_checkpoint", lambda _state_root, _operation_id, namespace: (None, namespace)
     )
@@ -3531,15 +3639,7 @@ def test_worker_run_admitted_v2_executes_real_composite_graph_once(tmp_path, mon
 
 def test_worker_run_admitted_v2_executes_direct_r25_composite_graph_once(tmp_path, monkeypatch):
     request = _v2_request(tmp_path)
-    monkeypatch.setattr(
-        cli,
-        "_git_output",
-        lambda _workspace, *args: {
-            ("rev-parse", "HEAD"): "b" * 40,
-            ("status", "--porcelain"): "",
-            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
-        }[args],
-    )
+    _admission_git(monkeypatch)
     monkeypatch.setattr(
         cli, "create_checkpoint", lambda _state_root, _operation_id, namespace: (None, namespace)
     )
@@ -3584,15 +3684,7 @@ def test_worker_run_admitted_v2_executes_direct_r25_composite_graph_once(tmp_pat
 
 
 def test_worker_run_fallback_and_multipath_do_not_admit_composite(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        cli,
-        "_git_output",
-        lambda _workspace, *args: {
-            ("rev-parse", "HEAD"): "b" * 40,
-            ("status", "--porcelain"): "",
-            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
-        }[args],
-    )
+    _admission_git(monkeypatch)
     monkeypatch.setattr(
         cli, "create_checkpoint", lambda _state_root, _operation_id, namespace: (None, namespace)
     )
@@ -4124,15 +4216,7 @@ def test_worker_run_malformed_r23_composite_completes_once_then_reconcile_is_loc
 ):
     """Malformed r23 free text is repaired once; restart does no second write or web call."""
     request = _v2_request(tmp_path)
-    monkeypatch.setattr(
-        cli,
-        "_git_output",
-        lambda _workspace, *args: {
-            ("rev-parse", "HEAD"): "b" * 40,
-            ("status", "--porcelain"): "",
-            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
-        }[args],
-    )
+    _admission_git(monkeypatch)
     monkeypatch.setattr(
         cli, "create_checkpoint", lambda _state_root, _operation_id, namespace: (None, namespace)
     )

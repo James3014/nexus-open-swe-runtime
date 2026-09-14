@@ -18,6 +18,11 @@ from typing import Any, Callable, Mapping
 from langchain_core.messages import AIMessage, ToolMessage
 
 try:
+    from .core_binding import (
+        binding_transport_hash,
+        physical_changeset,
+        validate_worker_core_binding,
+    )
     from .recovery import (
         DurableEffectJournal,
         DurableOperationJournal,
@@ -29,6 +34,11 @@ try:
         validate_checkpoint,
     )
 except ImportError:  # direct ``python path/to/cli.py`` compatibility
+    from nexus_open_swe_runtime.core_binding import (  # type: ignore[no-redef]
+        binding_transport_hash,
+        physical_changeset,
+        validate_worker_core_binding,
+    )
     from nexus_open_swe_runtime.recovery import (  # type: ignore[no-redef]
         DurableEffectJournal,
         DurableOperationJournal,
@@ -1019,6 +1029,10 @@ def _bounded_error_code(exc: BaseException) -> str:
             "OPENCLI_WEB_REPAIR_CONVERSATION_REUSE",
             "OPEN_SWE_REPAIR_RESULT_INVALID",
             "OPEN_SWE_COMPOSITE_RESULT_INVALID",
+            "OPEN_SWE_CORE_BINDING_PACKET_MISSING",
+            "OPEN_SWE_CORE_BINDING_INVALID",
+            "OPEN_SWE_CORE_CHANGESET_INVALID",
+            "OPEN_SWE_CORE_CHANGESET_SCOPE_VIOLATION",
         } or any(
             code == f"OPEN_SWE_SEMANTIC_V2_REJECTED_{reason.upper()}"
             for reason in _SEMANTIC_REJECTION_CODES
@@ -1542,6 +1556,50 @@ def _worker_result(task_id: str, unit_id: str, status: str, summary: str) -> str
     })
 
 
+def _core_result_projection(
+    core_binding: Mapping[str, Any] | None,
+    workspace: Path,
+    *,
+    successful_terminal: bool,
+) -> dict[str, Any]:
+    if core_binding is None:
+        return {"core_trust": "LEGACY_UNBOUND"}
+    fields: dict[str, Any] = {
+        "core_binding_hash": str(core_binding["binding_hash"]),
+        "core_acceptance_contract_hash": str(
+            core_binding["core"]["acceptance_contract_hash"]
+        ),
+        "core_verification_status": "PENDING_DOWNSTREAM_CORE_VERIFY",
+        "core_claim_ceiling": "OPEN_SWE_V2_CORE_BINDING_SOURCE_VERIFIED",
+        "core_verifier_observations": [],
+    }
+    try:
+        changeset = physical_changeset(workspace, core_binding)
+    except (ValueError, subprocess.CalledProcessError, OSError):
+        fields.update(
+            core_trust=(
+                "CORE_BOUND_V2_UNVERIFIED"
+                if successful_terminal
+                else "CORE_BOUND_V2_UNKNOWN"
+            ),
+            core_changeset_status="UNVERIFIABLE",
+        )
+        return fields
+    violation = bool(changeset["scope_escape_paths"] or changeset["deletion_violation"])
+    fields.update(
+        core_trust=(
+            "CORE_BOUND_V2_SCOPE_VIOLATION"
+            if violation
+            else "CORE_BOUND_V2_PHYSICAL"
+            if successful_terminal
+            else "CORE_BOUND_V2_UNKNOWN"
+        ),
+        core_changeset_status="PHYSICAL_SCOPE_VIOLATION" if violation else "PHYSICAL",
+        core_changeset=changeset,
+    )
+    return fields
+
+
 def _deepagents_version() -> str:
     try:
         return version("deepagents")
@@ -1652,6 +1710,7 @@ def _worker_material_fingerprint(
             "prompt": prompt,
             "artifact_path": str(artifact),
             "artifact_sha256": artifact_sha256,
+            "core_binding": request.get("core_binding"),
         })
     )
 
@@ -1665,6 +1724,9 @@ def _write_started(
         material_fingerprint = _worker_material_fingerprint(request, artifact_bytes)
         if material_fingerprint is not None:
             state["execution_material_sha256"] = material_fingerprint
+        raw_core_binding = request.get("core_binding")
+        if isinstance(raw_core_binding, Mapping):
+            state["core_binding_transport_sha256"] = binding_transport_hash(raw_core_binding)
     state["process_started"] = True
     state["finished_at"] = ""
     _atomic_json(_operation_path(request), state)
@@ -1708,6 +1770,16 @@ def _reconcile_operation(request: Mapping[str, Any], *, kind: str) -> dict[str, 
                     if state.get(field) != expected:
                         state = None
                         break
+            raw_core_binding = request.get("core_binding")
+            persisted_core_binding = state.get("core_binding_transport_sha256") if state is not None else None
+            if state is not None and persisted_core_binding:
+                if (
+                    not isinstance(raw_core_binding, Mapping)
+                    or persisted_core_binding != binding_transport_hash(raw_core_binding)
+                ):
+                    state = None
+            elif state is not None and raw_core_binding is not None:
+                state = None
             if state is not None and request.get("operation") in {
                 "worker_run",
                 "worker_continue",
@@ -1835,11 +1907,17 @@ def _worker_context(
         context = _read_json(_session_path(request, session_id))
         if context is None:
             raise RuntimeErrorBounded("SESSION_BINDING_MISSING")
+        raw_core_binding = request.get("core_binding")
         expected = {
             "workspace": str(Path(str(request.get("workspace_path") or "")).expanduser().resolve()),
             "provider_id": str(request.get("provider_id") or ""),
             "model_id": str(request.get("model_id") or ""),
             "worker_identity_sha256": str(request.get("worker_identity_sha256") or ""),
+            "core_binding_transport_sha256": (
+                binding_transport_hash(raw_core_binding)
+                if isinstance(raw_core_binding, Mapping)
+                else ""
+            ),
             **_opencli_session_namespace(request),
         }
         if any(str(context.get(key) or "") != value for key, value in expected.items()):
@@ -1867,6 +1945,11 @@ def _worker_context(
         "provider_id": str(request.get("provider_id") or ""),
         "model_id": str(request.get("model_id") or ""),
         "worker_identity_sha256": str(request.get("worker_identity_sha256") or ""),
+        "core_binding_transport_sha256": (
+            binding_transport_hash(request["core_binding"])
+            if isinstance(request.get("core_binding"), Mapping)
+            else ""
+        ),
         **_opencli_session_namespace(request),
     }
     _atomic_json(_session_path(request, session_id), context)
@@ -1935,6 +2018,7 @@ def _worker_run(
     effect_journal: DurableEffectJournal | None = None
     semantic_admission = FALLBACK
     diagnosis_model: Any | None = None
+    core_binding: Mapping[str, Any] | None = None
     try:
         failure_phase = "WORKER_CONTEXT"
         task_id, unit_id, allowed_paths, session_id = _worker_context(request, prompt)
@@ -1950,6 +2034,23 @@ def _worker_run(
             reason = semantic_admission.reason_code or "predicate_exception"
             raise RuntimeErrorBounded(f"OPEN_SWE_SEMANTIC_V2_REJECTED_{reason.upper()}")
         packet = semantic_admission.envelope
+        is_v2_packet = isinstance(packet, Mapping) and packet.get("schema") == "external_execution_envelope.v2"
+        if is_v2_packet:
+            packet_binding = packet.get("binding")
+            if not isinstance(packet_binding, Mapping):
+                raise RuntimeErrorBounded("OPEN_SWE_CORE_BINDING_PACKET_MISSING")
+            try:
+                core_binding = validate_worker_core_binding(
+                    request.get("core_binding"),
+                    operation_id=str(request.get("operation_id") or ""),
+                    workspace=workspace,
+                    envelope_repository=str(packet_binding.get("repository") or ""),
+                    expected_base_sha=_prompt_field(prompt, "expected_base_sha"),
+                    observed_source_tree=_git_output(workspace, "rev-parse", "HEAD^{tree}"),
+                    allowed_paths=allowed_paths,
+                )
+            except (ValueError, subprocess.CalledProcessError, KeyError) as exc:
+                raise RuntimeErrorBounded("OPEN_SWE_CORE_BINDING_INVALID") from exc
         scope = packet.get("scope_signal") if isinstance(packet, Mapping) else None
         composite_admitted = bool(
             semantic_admission_decision == ADMIT
@@ -1977,6 +2078,12 @@ def _worker_run(
                     "deepagents": _deepagents_version(),
                     "checkpoint_namespace": "open-swe-repair-v1",
                 })
+            ),
+            core_binding_hash=(
+                str(core_binding["binding_hash"]) if isinstance(core_binding, Mapping) else ""
+            ),
+            core_binding_json=(
+                _canonical_json(core_binding) if isinstance(core_binding, Mapping) else ""
             ),
             composite_admitted=composite_admitted,
         )
@@ -2136,6 +2243,11 @@ def _worker_run(
         else:
             response = _worker_result(task_id, unit_id, "BLOCKED", summary)
         failure_phase = "RESULT_FINALIZATION"
+        core_projection = _core_result_projection(
+            core_binding, workspace, successful_terminal=True
+        )
+        if core_projection.get("core_changeset_status") == "PHYSICAL_SCOPE_VIOLATION":
+            raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_SCOPE_VIOLATION")
         result = {
             **started,
             "status": "COMPLETED",
@@ -2155,11 +2267,15 @@ def _worker_run(
             "repair_admitted": repair_admitted,
             "repair_phase_count": repair_phase_count,
             "worker_identity_sha256": str(request.get("worker_identity_sha256") or ""),
+            **core_projection,
             "finished_at": _now(),
         }
         if recovery_journal is not None:
             recovery_journal.terminal(result)
     except Exception as exc:
+        core_projection = _core_result_projection(
+            core_binding, workspace, successful_terminal=False
+        )
         result = {
             **started,
             "status": "OPEN_SWE_OUTCOME_UNKNOWN",
@@ -2179,6 +2295,7 @@ def _worker_run(
             "repair_admitted": repair_admitted,
             "repair_phase_count": repair_phase_count,
             "worker_identity_sha256": str(request.get("worker_identity_sha256") or ""),
+            **core_projection,
             "finished_at": _now(),
         }
         error_code = _bounded_error_code(exc)
@@ -2233,6 +2350,8 @@ def _worker_reconcile(
             worker_identity_sha256=str(identity_data["worker_identity_sha256"]),
             transport_config_sha256=str(identity_data["transport_config_sha256"]),
             runtime_identity_sha256=str(identity_data["runtime_identity_sha256"]),
+            core_binding_hash=str(identity_data.get("core_binding_hash", "")),
+            core_binding_json=str(identity_data.get("core_binding_json", "")),
             checkpoint_namespace=str(
                 identity_data.get("checkpoint_namespace", "open-swe-repair-v1")
             ),
@@ -2252,6 +2371,31 @@ def _worker_reconcile(
             identity.transport_config_sha256 != expected_transport
             or identity.runtime_identity_sha256 != expected_runtime
         ):
+            return cached
+        raw_core_binding = request.get("core_binding")
+        reconciled_core_binding: Mapping[str, Any] | None = None
+        if identity.core_binding_hash:
+            if not isinstance(raw_core_binding, Mapping):
+                return cached
+            try:
+                supplied_core = validate_worker_core_binding(
+                    raw_core_binding,
+                    operation_id=operation_id,
+                    workspace=Path(identity.workspace),
+                    envelope_repository=str(json.loads(identity.core_binding_json)["repository"]["canonical_id"]),
+                    expected_base_sha=str(json.loads(identity.core_binding_json)["repository"]["source_revision"]).removeprefix("git-commit:"),
+                    observed_source_tree=_git_output(Path(identity.workspace), "rev-parse", "HEAD^{tree}"),
+                    allowed_paths=identity.allowed_paths,
+                )
+            except (ValueError, subprocess.CalledProcessError, json.JSONDecodeError):
+                return cached
+            if (
+                str(supplied_core.get("binding_hash") or "") != identity.core_binding_hash
+                or _canonical_json(supplied_core) != identity.core_binding_json
+            ):
+                return cached
+            reconciled_core_binding = supplied_core
+        elif raw_core_binding is not None:
             return cached
         for key, expected in (
             ("workspace_path", identity.workspace),
@@ -2307,6 +2451,18 @@ def _worker_reconcile(
                     recovery_state = journal.read()
             persisted_composite = _persisted_composite_worker_result(journal, effect_journal)
             if persisted_composite is not None:
+                core_projection = _core_result_projection(
+                    reconciled_core_binding,
+                    Path(identity.workspace),
+                    successful_terminal=True,
+                )
+                if core_projection.get("core_changeset_status") == "PHYSICAL_SCOPE_VIOLATION":
+                    return {
+                        **cached,
+                        **core_projection,
+                        "error_code": "OPEN_SWE_CORE_CHANGESET_SCOPE_VIOLATION",
+                        "retry_safe": False,
+                    }
                 result = {
                     **cached,
                     "status": "COMPLETED",
@@ -2319,6 +2475,7 @@ def _worker_reconcile(
                     ),
                     "process_started": True,
                     "directory": identity.workspace,
+                    **core_projection,
                     "finished_at": _now(),
                 }
                 journal.terminal(result)
@@ -2441,6 +2598,18 @@ def _worker_reconcile(
         )
         if envelope is None or not isinstance(envelope.get("summary"), str):
             return cached
+        core_projection = _core_result_projection(
+            reconciled_core_binding,
+            Path(identity.workspace),
+            successful_terminal=True,
+        )
+        if core_projection.get("core_changeset_status") == "PHYSICAL_SCOPE_VIOLATION":
+            return {
+                **cached,
+                **core_projection,
+                "error_code": "OPEN_SWE_CORE_CHANGESET_SCOPE_VIOLATION",
+                "retry_safe": False,
+            }
         result = {
             **cached,
             "status": "COMPLETED",
@@ -2450,6 +2619,7 @@ def _worker_reconcile(
             ),
             "process_started": True,
             "directory": identity.workspace,
+            **core_projection,
             "finished_at": _now(),
         }
         journal.terminal(result)

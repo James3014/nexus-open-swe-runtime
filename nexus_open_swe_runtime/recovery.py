@@ -106,6 +106,8 @@ class RecoveryIdentity:
     worker_identity_sha256: str
     transport_config_sha256: str
     runtime_identity_sha256: str
+    core_binding_hash: str = ""
+    core_binding_json: str = ""
     checkpoint_namespace: str = "open-swe-repair-v1"
     composite_admitted: bool = False
 
