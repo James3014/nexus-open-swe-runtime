@@ -2259,6 +2259,13 @@ def test_worker_blocks_repair_when_authorized_absent_path_is_dangling_symlink(tm
 
 
 def _attach_core_binding(request: dict) -> None:
+    workspace = Path(request["workspace_path"])
+    source_revision = subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"], text=True
+    ).strip()
+    source_tree = subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD^{tree}"], text=True
+    ).strip()
     contract = {
         "contract_id": "open-swe-v2-test",
         "requirements_hash": "sha256:" + "1" * 64,
@@ -2274,8 +2281,8 @@ def _attach_core_binding(request: dict) -> None:
         "repository": {
             "canonical_id": "James3014/Nexus-new",
             "origin": "https://github.com/James3014/Nexus-new.git",
-            "source_revision": "git-commit:" + "b" * 40,
-            "source_tree": "git-tree:" + "d" * 40,
+            "source_revision": f"git-commit:{source_revision}",
+            "source_tree": f"git-tree:{source_tree}",
             "workspace_identity": "sha256:" + "2" * 64,
             "workspace_mode": "target",
         },
@@ -2337,13 +2344,34 @@ def _v2_request(tmp_path: Path, *, status: str = "PROVEN") -> dict:
         ]),
         encoding="utf-8",
     )
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+    subprocess.run(["git", "-C", str(workspace), "add", card_ref], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Nexus Open SWE Test",
+            "-c",
+            "user.email=nexus-open-swe@example.test",
+            "-C",
+            str(workspace),
+            "commit",
+            "-q",
+            "-m",
+            "fixture base",
+        ],
+        check=True,
+    )
+    base_sha = subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"], text=True
+    ).strip()
     card_hash = cli._sha256(card.read_bytes())
     envelope = {
         "binding": {
             "context_pack_sha256": "c" * 64,
             "item_id": "task-1",
             "item_type": "issue",
-            "main_sha": "b" * 40,
+            "main_sha": base_sha,
             "repository": "James3014/Nexus-new",
             "revision": "r16",
             "task_card_ref": card_ref,
@@ -2399,7 +2427,7 @@ def _v2_request(tmp_path: Path, *, status: str = "PROVEN") -> dict:
     request["worker_identity_sha256"] = cli._sha256(cli._canonical_json(selected))
     request["prompt"] += "\n" + "\n".join([
         f"envelope_sha256={cli._sha256(raw)}",
-        "expected_base_sha=" + "b" * 40,
+        "expected_base_sha=" + base_sha,
     ])
     _attach_core_binding(request)
     return request
@@ -2749,10 +2777,13 @@ def test_worker_admit_r16_opencli_repair_uses_new_without_conversation(tmp_path,
     _admission_git(monkeypatch)
     ask_commands: list[list[str]] = []
     latest_prompt = ""
+    real_run = subprocess.run
 
     def fake_run(argv, **_kwargs):
         nonlocal latest_prompt
         args = list(argv)
+        if args and args[0] == "git":
+            return real_run(argv, **_kwargs)
         if args[1:3] == ["chatgpt", "model"]:
             return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
         if args[1:3] == ["chatgpt", "ask"]:
@@ -3009,16 +3040,27 @@ def _v2_matrix_request(tmp_path: Path, mutate, *, refresh_hash: bool = True) -> 
 
 
 def _admission_git(monkeypatch):
-    monkeypatch.setattr(
-        cli,
-        "_git_output",
-        lambda _workspace, *args: {
-            ("rev-parse", "HEAD"): "b" * 40,
-            ("rev-parse", "HEAD^{tree}"): "d" * 40,
-            ("status", "--porcelain"): "",
-            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
-        }[args],
-    )
+    def fake_git(workspace, *args):
+        if args == ("status", "--porcelain"):
+            return ""
+        if args == ("remote", "get-url", "origin"):
+            return "git@github.com:James3014/Nexus-new.git"
+        if args in {("rev-parse", "HEAD"), ("rev-parse", "HEAD^{tree}")}:
+            process = subprocess.Popen(
+                ["git", "-C", str(workspace), *args],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            stdout, stderr = process.communicate()
+            if process.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    process.returncode, process.args, output=stdout, stderr=stderr
+                )
+            return stdout.strip()
+        raise AssertionError(args)
+
+    monkeypatch.setattr(cli, "_git_output", fake_git)
 
 
 def test_v2_positive_admission_has_no_rejection_reason(tmp_path, monkeypatch):
@@ -3882,6 +3924,8 @@ def test_worker_reconcile_flat_direct_response_with_checkpoint_has_one_local_eff
                 "checkpoint_namespace": "open-swe-repair-v1",
             })
         ),
+        core_binding_hash=request["core_binding"]["binding_hash"],
+        core_binding_json=cli._canonical_json(request["core_binding"]),
         composite_admitted=True,
     )
     journal = DurableOperationJournal(state_root, identity)
