@@ -2398,6 +2398,7 @@ def test_worker_admits_strict_v2_without_diagnosis_model_or_graph(tmp_path, monk
         "_git_output",
         lambda _workspace, *args: {
             ("rev-parse", "HEAD"): "b" * 40,
+            ("rev-parse", "--verify", "b" * 40 + "^{tree}"): "e" * 40,
             ("status", "--porcelain"): "",
             ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
         }[args],
@@ -2453,6 +2454,7 @@ def test_r24_issue_metadata_authority_is_admitted(tmp_path, monkeypatch):
         "_git_output",
         lambda _workspace, *args: {
             ("rev-parse", "HEAD"): "b" * 40,
+            ("rev-parse", "--verify", "b" * 40 + "^{tree}"): "e" * 40,
             ("status", "--porcelain"): "",
             ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
         }[args],
@@ -2481,6 +2483,7 @@ def test_r24_worker_selects_composite_terminal_path(tmp_path, monkeypatch):
         "_git_output",
         lambda _workspace, *args: {
             ("rev-parse", "HEAD"): "b" * 40,
+            ("rev-parse", "--verify", "b" * 40 + "^{tree}"): "e" * 40,
             ("status", "--porcelain"): "",
             ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
         }[args],
@@ -2548,6 +2551,7 @@ def test_r17_prose_inspect_first_is_admitted_as_advisory(tmp_path, monkeypatch, 
         "_git_output",
         lambda _workspace, *args: {
             ("rev-parse", "HEAD"): "b" * 40,
+            ("rev-parse", "--verify", "b" * 40 + "^{tree}"): "e" * 40,
             ("status", "--porcelain"): "",
             ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
         }[args],
@@ -2615,6 +2619,7 @@ def test_r17_malformed_admission_inputs_reject_without_calls(tmp_path, monkeypat
         "_git_output",
         lambda _workspace, *args: {
             ("rev-parse", "HEAD"): "b" * 40,
+            ("rev-parse", "--verify", "b" * 40 + "^{tree}"): "e" * 40,
             ("status", "--porcelain"): "",
             ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
         }[args],
@@ -2648,6 +2653,7 @@ def test_r17_strict_evidence_and_authority_negatives_reject_without_calls(
         "_git_output",
         lambda _workspace, *args: {
             ("rev-parse", "HEAD"): "b" * 40,
+            ("rev-parse", "--verify", "b" * 40 + "^{tree}"): "e" * 40,
             ("status", "--porcelain"): "",
             ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
         }[args],
@@ -2671,6 +2677,7 @@ def test_worker_admit_r16_opencli_repair_uses_new_without_conversation(tmp_path,
         "_git_output",
         lambda _workspace, *args: {
             ("rev-parse", "HEAD"): "b" * 40,
+            ("rev-parse", "--verify", "b" * 40 + "^{tree}"): "e" * 40,
             ("status", "--porcelain"): "",
             ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
         }[args],
@@ -2896,6 +2903,7 @@ def test_v2_intermediate_parent_symlink_rejects_without_model_or_graph(tmp_path,
         "_git_output",
         lambda _workspace, *args: {
             ("rev-parse", "HEAD"): "b" * 40,
+            ("rev-parse", "--verify", "b" * 40 + "^{tree}"): "e" * 40,
             ("status", "--porcelain"): "",
             ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
         }[args],
@@ -2949,6 +2957,7 @@ def _admission_git(monkeypatch):
         "_git_output",
         lambda _workspace, *args: {
             ("rev-parse", "HEAD"): "b" * 40,
+            ("rev-parse", "--verify", "b" * 40 + "^{tree}"): "e" * 40,
             ("status", "--porcelain"): "",
             ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
         }[args],
@@ -2967,6 +2976,36 @@ def test_v2_positive_admission_has_no_rejection_reason(tmp_path, monkeypatch):
     )
     assert admission.decision == cli.ADMIT
     assert admission.reason_code is None
+
+
+def test_v2_source_tree_must_match_expected_base_tree(tmp_path, monkeypatch):
+    request = _v2_request(tmp_path)
+    envelope = json.loads(Path(request["artifact_path"]).read_text(encoding="utf-8"))
+    envelope["repository_mutation_binding"]["repository"]["source_tree"] = "git-tree:" + "e" * 40
+    _refresh_core_binding_hash(envelope)
+    _write_v2_mutation(request, envelope)
+    monkeypatch.setattr(
+        cli,
+        "_git_output",
+        lambda _workspace, *args: {
+            ("rev-parse", "HEAD"): "b" * 40,
+            ("rev-parse", "--verify", "b" * 40 + "^{tree}"): "d" * 40,
+            ("status", "--porcelain"): "",
+            ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
+        }[args],
+    )
+    calls = {"model": 0, "diagnosis": 0, "repair": 0}
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: calls.__setitem__("model", calls["model"] + 1),
+        diagnosis_factory=lambda *_args: calls.__setitem__("diagnosis", calls["diagnosis"] + 1),
+        repair_factory=lambda *_args: calls.__setitem__("repair", calls["repair"] + 1),
+    )
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["failure_phase"] == "SEMANTIC_ADMISSION"
+    assert result["error_code"] == "OPEN_SWE_SEMANTIC_V2_REJECTED_CORE_BINDING_SOURCE"
+    assert calls == {"model": 0, "diagnosis": 0, "repair": 0}
 
 
 def test_v2_missing_core_mutation_binding_rejects_before_model(tmp_path, monkeypatch):
@@ -3428,6 +3467,7 @@ def test_v2_hostile_single_fault_rejects_without_model_or_graph(
             return " M changed.py"
         return {
             ("rev-parse", "HEAD"): "b" * 40,
+            ("rev-parse", "--verify", "b" * 40 + "^{tree}"): "e" * 40,
             ("status", "--porcelain"): "",
             ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
         }[args]
@@ -3488,6 +3528,7 @@ def test_v2_bare_binding_and_strict_origin_are_distinct(tmp_path, monkeypatch):
         "_git_output",
         lambda _workspace, *args: {
             ("rev-parse", "HEAD"): "b" * 40,
+            ("rev-parse", "--verify", "b" * 40 + "^{tree}"): "e" * 40,
             ("status", "--porcelain"): "",
             ("remote", "get-url", "origin"): "James3014/Nexus-new",
         }[args],
@@ -3705,6 +3746,7 @@ def test_worker_run_admitted_v2_executes_real_composite_graph_once(tmp_path, mon
         "_git_output",
         lambda _workspace, *args: {
             ("rev-parse", "HEAD"): "b" * 40,
+            ("rev-parse", "--verify", "b" * 40 + "^{tree}"): "e" * 40,
             ("status", "--porcelain"): "",
             ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
         }[args],
@@ -3761,6 +3803,7 @@ def test_worker_run_admitted_v2_executes_direct_r25_composite_graph_once(tmp_pat
         "_git_output",
         lambda _workspace, *args: {
             ("rev-parse", "HEAD"): "b" * 40,
+            ("rev-parse", "--verify", "b" * 40 + "^{tree}"): "e" * 40,
             ("status", "--porcelain"): "",
             ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
         }[args],
@@ -3814,6 +3857,7 @@ def test_worker_run_fallback_and_multipath_do_not_admit_composite(tmp_path, monk
         "_git_output",
         lambda _workspace, *args: {
             ("rev-parse", "HEAD"): "b" * 40,
+            ("rev-parse", "--verify", "b" * 40 + "^{tree}"): "e" * 40,
             ("status", "--porcelain"): "",
             ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
         }[args],
@@ -4361,6 +4405,7 @@ def test_worker_run_malformed_r23_composite_completes_once_then_reconcile_is_loc
         "_git_output",
         lambda _workspace, *args: {
             ("rev-parse", "HEAD"): "b" * 40,
+            ("rev-parse", "--verify", "b" * 40 + "^{tree}"): "e" * 40,
             ("status", "--porcelain"): "",
             ("remote", "get-url", "origin"): "git@github.com:James3014/Nexus-new.git",
         }[args],

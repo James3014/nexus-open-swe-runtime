@@ -1696,6 +1696,14 @@ def _validate_repository_mutation_binding(
         return "core_binding_repository"
     if source_revision != f"git-commit:{expected_base}" or not _typed_git_tree(source_tree):
         return "core_binding_source"
+    try:
+        expected_base_tree = _git_output(
+            workspace, "rev-parse", "--verify", f"{expected_base}^{{tree}}"
+        )
+    except RuntimeErrorBounded:
+        return "core_binding_source"
+    if source_tree != f"git-tree:{expected_base_tree}":
+        return "core_binding_source"
     expected_workspace_identity = "sha256:" + _sha256(str(workspace.resolve()))
     if workspace_identity != expected_workspace_identity or repository.get("workspace_mode") not in {
         "checkout",
