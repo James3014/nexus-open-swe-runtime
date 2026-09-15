@@ -984,6 +984,11 @@ _SEMANTIC_REJECTION_CODES = frozenset({
     "task_card_evidence_duplicate", "path_symlink", "source_evidence", "source_present",
     "path_parent", "worker_identity", "worker_identity_hash", "predicate_exception",
     "workspace_head_read", "workspace_status_read", "origin_read", "card_read",
+    "core_binding_shape", "core_binding_schema", "core_binding_identity", "core_binding_operation",
+    "core_binding_hash", "core_binding_repository", "core_binding_source", "core_binding_workspace",
+    "core_binding_authority", "core_binding_discovery", "core_binding_contract",
+    "core_binding_scope", "core_binding_deletion", "core_binding_contract_hash",
+    "core_binding_freshness",
 })
 _FAILURE_PHASES = frozenset({
     "WORKER_CONTEXT", "RUNTIME_LOAD", "SEMANTIC_ADMISSION", "RECOVERY_PREPARE",
@@ -1002,6 +1007,8 @@ def _bounded_error_code(exc: BaseException) -> str:
             "OPEN_SWE_WORKSPACE_REQUIRED",
             "SESSION_BINDING_MISSING",
             "SESSION_BINDING_MISMATCH",
+            "SESSION_CORE_BINDING_MISSING",
+            "SESSION_CORE_BINDING_MISMATCH",
             "OPEN_SWE_SEMANTIC_V2_REJECTED",
             "OPEN_SWE_EXECUTION_INPUT_INVALID",
             "OPEN_SWE_V2_ARTIFACT_INVALID",
@@ -1019,6 +1026,17 @@ def _bounded_error_code(exc: BaseException) -> str:
             "OPENCLI_WEB_REPAIR_CONVERSATION_REUSE",
             "OPEN_SWE_REPAIR_RESULT_INVALID",
             "OPEN_SWE_COMPOSITE_RESULT_INVALID",
+            "OPEN_SWE_CORE_CHANGESET_GIT_FAILED",
+            "OPEN_SWE_CORE_CHANGESET_STATUS_INVALID",
+            "OPEN_SWE_CORE_CHANGESET_TREE_INVALID",
+            "OPEN_SWE_CORE_CHANGESET_TARGET_INVALID",
+            "OPEN_SWE_CORE_CHANGESET_SOURCE_INVALID",
+            "OPEN_SWE_CORE_CHANGESET_SOURCE_MISMATCH",
+            "OPEN_SWE_CORE_CHANGESET_SCOPE_MISMATCH",
+            "OPEN_SWE_CORE_CHANGESET_DELETION_FORBIDDEN",
+            "OPEN_SWE_CORE_CHANGESET_EFFECT_INVALID",
+            "OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH",
+            "OPEN_SWE_CORE_CHANGESET_UNJOURNALED_EFFECT",
         } or any(
             code == f"OPEN_SWE_SEMANTIC_V2_REJECTED_{reason.upper()}"
             for reason in _SEMANTIC_REJECTION_CODES
@@ -1089,6 +1107,243 @@ def _git_output(workspace: Path, *args: str) -> str:
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise RuntimeErrorBounded("OPEN_SWE_V2_WORKSPACE_BINDING_INVALID") from exc
     return completed.stdout.strip()
+
+
+def _git_temp_output(
+    workspace: Path, args: list[str], extra_env: Mapping[str, str]
+) -> str:
+    git = shutil.which("git")
+    if not git or not Path(git).is_absolute():
+        raise RuntimeErrorBounded("OPEN_SWE_V2_WORKSPACE_BINDING_INVALID")
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", **extra_env})
+    try:
+        completed = subprocess.run(
+            [git, "-C", str(workspace), "--no-optional-locks", *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=True,
+            timeout=10,
+            env=env,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_GIT_FAILED") from exc
+    return completed.stdout.strip()
+
+
+def _physical_changed_paths(workspace: Path, source_commit: str) -> dict[str, str]:
+    changed: dict[str, str] = {}
+    output = _git_output(workspace, "diff", "--name-status", "--no-renames", source_commit, "--")
+    for line in output.splitlines():
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) != 2 or parts[0] not in {"A", "M", "D", "T"}:
+            raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_STATUS_INVALID")
+        path = _safe_relative_path(parts[1])
+        changed[path] = "DELETE" if parts[0] == "D" else ("ADD" if parts[0] == "A" else "MODIFY")
+    untracked = _git_output(workspace, "ls-files", "--others", "--exclude-standard")
+    for raw_path in untracked.splitlines():
+        if raw_path:
+            changed[_safe_relative_path(raw_path)] = "ADD"
+    return changed
+
+
+def _git_tree_entry(workspace: Path, source_commit: str, path: str) -> tuple[str | None, str | None]:
+    output = _git_output(workspace, "ls-tree", source_commit, "--", path)
+    if not output:
+        return None, None
+    line = output.splitlines()[0]
+    try:
+        header, observed_path = line.split("\t", 1)
+        mode, object_type, oid = header.split(" ", 2)
+    except ValueError as exc:
+        raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_TREE_INVALID") from exc
+    if _safe_relative_path(observed_path) != path or object_type != "blob":
+        raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_TREE_INVALID")
+    return oid, mode
+
+
+def _workspace_file_mode(path: Path) -> str:
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_TARGET_INVALID")
+    return "100755" if path.stat().st_mode & 0o111 else "100644"
+
+
+def _physical_core_changeset_projection(
+    workspace: Path,
+    identity: RecoveryIdentity,
+    effect_journal: DurableEffectJournal,
+) -> dict[str, Any]:
+    """Project physical repository bytes for downstream Core verification.
+
+    This constructs Git objects only in a temporary object/index directory.  It
+    never stages or writes repository metadata.  Verifier observations are left
+    empty because this execution runtime is not Core verification authority.
+    """
+    if not identity.core_binding_hash:
+        return {"status": "LEGACY_UNBOUND"}
+    if not _typed_git_commit(identity.core_source_revision) or not _typed_git_tree(
+        identity.core_source_tree
+    ):
+        raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_SOURCE_INVALID")
+    source_commit = identity.core_source_revision.removeprefix("git-commit:")
+    bound_source_tree = identity.core_source_tree.removeprefix("git-tree:")
+    try:
+        observed_source_tree = _git_output(
+            workspace, "rev-parse", f"{source_commit}^{{tree}}"
+        )
+    except (RuntimeErrorBounded, KeyError):
+        return {
+            "status": "UNAVAILABLE_PHYSICAL_GIT_SUBJECT",
+            "core_binding_hash": identity.core_binding_hash,
+            "acceptance_contract_hash": identity.acceptance_contract_hash,
+        }
+    if observed_source_tree != bound_source_tree:
+        raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_SOURCE_MISMATCH")
+    changes = _physical_changed_paths(workspace, source_commit)
+    actual_paths = tuple(sorted(changes))
+    allowed = set(identity.allowed_paths)
+    if any(path not in allowed for path in actual_paths):
+        raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_SCOPE_MISMATCH")
+    deleted_paths = tuple(path for path in actual_paths if changes[path] == "DELETE")
+    if deleted_paths and identity.core_deletion_policy == "FORBID":
+        raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_DELETION_FORBIDDEN")
+
+    effect_paths: set[str] = set()
+    for effect in effect_journal.result_effects():
+        try:
+            relative = Path(str(effect["path"])).resolve().relative_to(workspace).as_posix()
+        except (KeyError, ValueError) as exc:
+            raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_INVALID") from exc
+        relative = _safe_relative_path(relative)
+        if relative not in allowed:
+            raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_SCOPE_MISMATCH")
+        physical = workspace / relative
+        if physical.exists():
+            try:
+                actual_sha = _sha256(physical.read_bytes())
+            except OSError as exc:
+                raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_INVALID") from exc
+            if actual_sha != effect.get("postimage_sha256"):
+                raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH")
+        effect_paths.add(relative)
+    if actual_paths and not set(actual_paths).issubset(effect_paths):
+        raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_UNJOURNALED_EFFECT")
+    if not actual_paths:
+        return {
+            "status": "NO_PHYSICAL_CHANGESET",
+            "core_binding_hash": identity.core_binding_hash,
+            "acceptance_contract_hash": identity.acceptance_contract_hash,
+            "source_revision": identity.core_source_revision,
+            "source_tree": identity.core_source_tree,
+            "paths": [],
+            "deleted_paths": [],
+            "required_verifier_ids": list(identity.core_required_verifier_ids),
+            "verifier_observations": [],
+            "core_verification_status": "NOT_SUBMITTED",
+        }
+
+    git_objects_raw = _git_output(workspace, "rev-parse", "--git-path", "objects")
+    git_objects = Path(git_objects_raw)
+    if not git_objects.is_absolute():
+        git_objects = (workspace / git_objects).resolve()
+    entries: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="open-swe-core-tree-") as temp_root:
+        temp = Path(temp_root)
+        object_dir = temp / "objects"
+        object_dir.mkdir(mode=0o700)
+        index = temp / "index"
+        env = {
+            "GIT_INDEX_FILE": str(index),
+            "GIT_OBJECT_DIRECTORY": str(object_dir),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(git_objects),
+        }
+        _git_temp_output(workspace, ["read-tree", source_commit], env)
+        for path in actual_paths:
+            change_type = changes[path]
+            before_oid, before_mode = _git_tree_entry(workspace, source_commit, path)
+            after_oid: str | None = None
+            after_mode: str | None = None
+            if change_type == "DELETE":
+                _git_temp_output(workspace, ["update-index", "--force-remove", "--", path], env)
+            else:
+                target = workspace / path
+                after_mode = _workspace_file_mode(target)
+                after_oid = _git_temp_output(workspace, ["hash-object", "-w", "--", path], env)
+                _git_temp_output(
+                    workspace,
+                    ["update-index", "--add", "--cacheinfo", f"{after_mode},{after_oid},{path}"],
+                    env,
+                )
+            if change_type == "ADD" and before_oid is not None:
+                change_type = "MODIFY"
+            entries.append({
+                "path": path,
+                "change_type": change_type,
+                "before_oid": before_oid,
+                "after_oid": after_oid,
+                "before_mode": before_mode,
+                "after_mode": after_mode,
+            })
+        target_tree_oid = _git_temp_output(workspace, ["write-tree"], env)
+
+    source_tree_ref = f"git-tree:{observed_source_tree}"
+    target_tree_ref = f"git-tree:{target_tree_oid}"
+    manifest = {
+        "source_tree": source_tree_ref,
+        "target_tree": target_tree_ref,
+        "entries": entries,
+    }
+    manifest_value = [
+        "nexus.core.git-change-manifest.v1-experimental",
+        source_tree_ref,
+        target_tree_ref,
+        [
+            [
+                row["path"],
+                row["change_type"],
+                row["before_oid"],
+                row["after_oid"],
+                row["before_mode"],
+                row["after_mode"],
+            ]
+            for row in sorted(entries, key=lambda item: item["path"])
+        ],
+    ]
+    diff_hash = _core_hash(manifest_value)
+    change_set = {
+        "change_set_id": f"open-swe:{identity.operation_id}",
+        "source_revision": identity.core_source_revision,
+        "target_revision": target_tree_ref,
+        "diff_hash": diff_hash,
+        "paths": list(actual_paths),
+        "deleted_paths": list(deleted_paths),
+    }
+    change_set_value: list[Any] = [
+        change_set["change_set_id"],
+        change_set["source_revision"],
+        change_set["target_revision"],
+        change_set["diff_hash"],
+        sorted(change_set["paths"]),
+    ]
+    if deleted_paths:
+        change_set_value.append(sorted(change_set["deleted_paths"]))
+    return {
+        "status": "PHYSICAL_CHANGESET_BOUND",
+        "core_binding_hash": identity.core_binding_hash,
+        "acceptance_contract_hash": identity.acceptance_contract_hash,
+        "operation_id": identity.operation_id,
+        "attempt_id": identity.core_attempt_id,
+        "change_set": change_set,
+        "change_set_hash": _core_hash(change_set_value),
+        "change_manifest": manifest,
+        "required_verifier_ids": list(identity.core_required_verifier_ids),
+        "verifier_observations": [],
+        "core_verification_status": "PENDING_REQUIRED_VERIFIERS",
+    }
 
 
 def _read_regular_artifact(artifact: Path) -> bytes:
@@ -1216,6 +1471,7 @@ def _source_ref_for_path(refs: list[Any], path: str) -> str | None:
 
 _V2_KEYS = {
     "binding",
+    "repository_mutation_binding",
     "definition_of_done",
     "diagnosis",
     "evidence_refs",
@@ -1287,6 +1543,253 @@ def _hex_digest(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
+_CORE_MUTATION_BINDING_SCHEMA = "nexus.repository_mutation_binding.v1"
+_CORE_PUBLIC_PROTOCOL_VERSION = "0.1.0-experimental"
+_CORE_BINDING_KEYS = {
+    "schema",
+    "binding_id",
+    "operation_id",
+    "attempt_id",
+    "repository",
+    "integration_authority",
+    "capability_discovery",
+    "core",
+    "freshness",
+    "binding_hash",
+}
+_CORE_REPOSITORY_KEYS = {
+    "canonical_id",
+    "origin",
+    "source_revision",
+    "source_tree",
+    "workspace_identity",
+    "workspace_mode",
+}
+_CORE_AUTHORITY_KEYS = {"execution_lane", "authority_ref", "authority_hash"}
+_CORE_DISCOVERY_KEYS = {"required", "receipt_hash", "index_revision"}
+_CORE_KEYS = {"protocol_version", "acceptance_contract", "acceptance_contract_hash"}
+_CORE_FRESHNESS_KEYS = {"created_at", "valid_until", "revalidate_before_first_effect"}
+_CORE_ACCEPTANCE_KEYS = {
+    "contract_id",
+    "requirements_hash",
+    "required_verifier_ids",
+    "allowed_paths",
+    "deletion_policy",
+}
+
+
+def _core_canonical_json(value: Any) -> str:
+    """Mirror the public Core protocol's transport canonical JSON rule."""
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _core_hash(value: Any) -> str:
+    return "sha256:" + _sha256(_core_canonical_json(value))
+
+
+def _prefixed_sha256(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None
+
+
+def _typed_git_commit(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"git-commit:[0-9a-f]{40}", value) is not None
+
+
+def _typed_git_tree(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"git-tree:[0-9a-f]{40}", value) is not None
+
+
+def _core_acceptance_contract_hash(value: Mapping[str, Any]) -> str:
+    canonical = [
+        value["contract_id"],
+        value["requirements_hash"],
+        sorted(value["required_verifier_ids"]),
+        sorted(value["allowed_paths"]),
+        value["deletion_policy"],
+    ]
+    return _core_hash(canonical)
+
+
+def _parse_rfc3339(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _validate_repository_mutation_binding(
+    request: Mapping[str, Any],
+    workspace: Path,
+    legacy_binding: Mapping[str, Any],
+    mutation_binding: Any,
+    allowed_paths: tuple[str, ...],
+    *,
+    expected_base: str,
+    observed_origin: str,
+) -> str | None:
+    """Validate the non-authoritative integration binding before write authority."""
+    if not isinstance(mutation_binding, Mapping) or set(mutation_binding) != _CORE_BINDING_KEYS:
+        return "core_binding_shape"
+    repository = mutation_binding.get("repository")
+    authority = mutation_binding.get("integration_authority")
+    discovery = mutation_binding.get("capability_discovery")
+    core = mutation_binding.get("core")
+    freshness = mutation_binding.get("freshness")
+    if (
+        not isinstance(repository, Mapping)
+        or set(repository) != _CORE_REPOSITORY_KEYS
+        or not isinstance(authority, Mapping)
+        or set(authority) != _CORE_AUTHORITY_KEYS
+        or not isinstance(discovery, Mapping)
+        or set(discovery) != _CORE_DISCOVERY_KEYS
+        or not isinstance(core, Mapping)
+        or set(core) != _CORE_KEYS
+        or not isinstance(freshness, Mapping)
+        or set(freshness) != _CORE_FRESHNESS_KEYS
+    ):
+        return "core_binding_shape"
+    if mutation_binding.get("schema") != _CORE_MUTATION_BINDING_SCHEMA:
+        return "core_binding_schema"
+    if not isinstance(mutation_binding.get("binding_id"), str) or not str(
+        mutation_binding["binding_id"]
+    ).strip():
+        return "core_binding_identity"
+    if mutation_binding.get("operation_id") != request.get("operation_id"):
+        return "core_binding_operation"
+    attempt_id = mutation_binding.get("attempt_id")
+    if not isinstance(attempt_id, str) or not attempt_id.strip():
+        return "core_binding_operation"
+    supplied_attempt = request.get("attempt_id")
+    if supplied_attempt not in (None, "") and supplied_attempt != attempt_id:
+        return "core_binding_operation"
+    binding_hash = mutation_binding.get("binding_hash")
+    if not _prefixed_sha256(binding_hash):
+        return "core_binding_hash"
+    hash_material = dict(mutation_binding)
+    hash_material.pop("binding_hash", None)
+    if _core_hash(hash_material) != binding_hash:
+        return "core_binding_hash"
+
+    canonical_id = repository.get("canonical_id")
+    origin = repository.get("origin")
+    source_revision = repository.get("source_revision")
+    source_tree = repository.get("source_tree")
+    workspace_identity = repository.get("workspace_identity")
+    if (
+        not isinstance(canonical_id, str)
+        or _canonical_binding_repository(canonical_id)
+        != _canonical_binding_repository(str(legacy_binding.get("repository") or ""))
+        or not isinstance(origin, str)
+        or _canonical_origin_repository(origin) != _canonical_origin_repository(observed_origin)
+    ):
+        return "core_binding_repository"
+    if source_revision != f"git-commit:{expected_base}" or not _typed_git_tree(source_tree):
+        return "core_binding_source"
+    try:
+        expected_base_tree = _git_output(
+            workspace, "rev-parse", "--verify", f"{expected_base}^{{tree}}"
+        )
+    except RuntimeErrorBounded:
+        return "core_binding_source"
+    if source_tree != f"git-tree:{expected_base_tree}":
+        return "core_binding_source"
+    expected_workspace_identity = "sha256:" + _sha256(str(workspace.resolve()))
+    if workspace_identity != expected_workspace_identity or repository.get("workspace_mode") not in {
+        "checkout",
+        "managed_worktree",
+        "target",
+    }:
+        return "core_binding_workspace"
+
+    if authority.get("execution_lane") not in {
+        "DIRECT_CANONICAL",
+        "DIRECT_DELEGATED",
+        "GOVERNED",
+    }:
+        return "core_binding_authority"
+    if not isinstance(authority.get("authority_ref"), str) or not str(
+        authority["authority_ref"]
+    ).strip() or not _prefixed_sha256(authority.get("authority_hash")):
+        return "core_binding_authority"
+    if (
+        discovery.get("required") is not True
+        or not _prefixed_sha256(discovery.get("receipt_hash"))
+        or not _typed_git_commit(discovery.get("index_revision"))
+    ):
+        return "core_binding_discovery"
+
+    if core.get("protocol_version") != _CORE_PUBLIC_PROTOCOL_VERSION:
+        return "core_binding_contract"
+    contract = core.get("acceptance_contract")
+    if not isinstance(contract, Mapping) or set(contract) != _CORE_ACCEPTANCE_KEYS:
+        return "core_binding_contract"
+    if (
+        not isinstance(contract.get("contract_id"), str)
+        or not str(contract["contract_id"]).strip()
+        or not _prefixed_sha256(contract.get("requirements_hash"))
+        or not _string_list(contract.get("required_verifier_ids"))
+        or not contract.get("required_verifier_ids")
+        or len(set(contract["required_verifier_ids"])) != len(contract["required_verifier_ids"])
+        or not _string_list(contract.get("allowed_paths"))
+        or not contract.get("allowed_paths")
+        or len(set(contract["allowed_paths"])) != len(contract["allowed_paths"])
+        or contract.get("deletion_policy") not in {"FORBID", "ALLOW"}
+    ):
+        return "core_binding_contract"
+    try:
+        contract_paths = tuple(_safe_relative_path(path) for path in contract["allowed_paths"])
+    except RuntimeErrorBounded:
+        return "core_binding_scope"
+    if sorted(contract_paths) != sorted(allowed_paths):
+        return "core_binding_scope"
+    # The current Open SWE repair surface has no deletion tool.  Accepting ALLOW
+    # would overstate executable scope and make the runtime's contract asymmetric.
+    if contract.get("deletion_policy") != "FORBID":
+        return "core_binding_deletion"
+    acceptance_hash = core.get("acceptance_contract_hash")
+    if not _prefixed_sha256(acceptance_hash) or _core_acceptance_contract_hash(contract) != acceptance_hash:
+        return "core_binding_contract_hash"
+
+    if freshness.get("revalidate_before_first_effect") is not True:
+        return "core_binding_freshness"
+    created_at = _parse_rfc3339(freshness.get("created_at"))
+    if created_at is None:
+        return "core_binding_freshness"
+    valid_until = freshness.get("valid_until")
+    if valid_until is not None:
+        deadline = _parse_rfc3339(valid_until)
+        if deadline is None or deadline <= datetime.now(timezone.utc):
+            return "core_binding_freshness"
+    return None
+
+
+def _core_binding_identity(mutation_binding: Mapping[str, Any]) -> dict[str, Any]:
+    repository = mutation_binding["repository"]
+    core = mutation_binding["core"]
+    contract = core["acceptance_contract"]
+    return {
+        "core_binding_hash": str(mutation_binding["binding_hash"]),
+        "acceptance_contract_hash": str(core["acceptance_contract_hash"]),
+        "core_repository": str(repository["canonical_id"]),
+        "core_source_revision": str(repository["source_revision"]),
+        "core_source_tree": str(repository["source_tree"]),
+        "core_attempt_id": str(mutation_binding["attempt_id"]),
+        "core_required_verifier_ids": tuple(str(value) for value in contract["required_verifier_ids"]),
+        "core_deletion_policy": str(contract["deletion_policy"]),
+    }
+
+
 def _evidence_anchor(value: str) -> bool:
     return re.fullmatch(r"(?:[0-9a-f]{16}|[0-9a-f]{64})", value) is not None
 
@@ -1352,12 +1855,16 @@ def _semantic_v2_admission(
         if _sha256(_canonical_json(envelope)) != supplied_hash:
             return _semantic_reject("envelope_hash")
         binding = envelope["binding"]
+        mutation_binding = envelope["repository_mutation_binding"]
         diagnosis = envelope["diagnosis"]
         scope = envelope["scope_signal"]
         selected = envelope["selected_worker"]
         refs = envelope["evidence_refs"]
         inspect_first = envelope["inspect_first"]
-        if not all(isinstance(value, Mapping) for value in (binding, diagnosis, scope, selected)):
+        if not all(
+            isinstance(value, Mapping)
+            for value in (binding, mutation_binding, diagnosis, scope, selected)
+        ):
             return _semantic_reject("binding_shape")
         if set(binding) != _V2_BINDING_KEYS or set(diagnosis) != _V2_DIAGNOSIS_KEYS:
             return _semantic_reject("binding_keys")
@@ -1442,6 +1949,17 @@ def _semantic_v2_admission(
             origin
         ) != _canonical_binding_repository(str(binding["repository"])):
             return _semantic_reject("origin")
+        core_binding_reason = _validate_repository_mutation_binding(
+            request,
+            workspace,
+            binding,
+            mutation_binding,
+            allowed_paths,
+            expected_base=expected_base,
+            observed_origin=origin,
+        )
+        if core_binding_reason is not None:
+            return _semantic_reject(core_binding_reason)
         if _workspace_path_has_symlink(workspace, task_card_ref):
             return _semantic_reject("card_symlink")
         try:
@@ -1627,6 +2145,38 @@ def _base_result(request: Mapping[str, Any], *, kind: str, status: str) -> dict[
     }
 
 
+def _request_core_hashes(request: Mapping[str, Any]) -> tuple[str, str] | None:
+    direct_binding = request.get("core_binding_hash")
+    direct_contract = request.get("acceptance_contract_hash")
+    if _prefixed_sha256(direct_binding) and _prefixed_sha256(direct_contract):
+        return str(direct_binding), str(direct_contract)
+    artifact_path = request.get("artifact_path")
+    if not isinstance(artifact_path, str) or not artifact_path:
+        return None
+    try:
+        raw = _read_regular_artifact(Path(artifact_path).expanduser())
+        envelope = _parse_unique_json(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, RuntimeErrorBounded):
+        return None
+    if envelope.get("schema") != "external_execution_envelope.v2":
+        return None
+    mutation_binding = envelope.get("repository_mutation_binding")
+    if not isinstance(mutation_binding, Mapping):
+        return None
+    binding_hash = mutation_binding.get("binding_hash")
+    core = mutation_binding.get("core")
+    if not _prefixed_sha256(binding_hash) or not isinstance(core, Mapping):
+        return None
+    contract_hash = core.get("acceptance_contract_hash")
+    if not _prefixed_sha256(contract_hash):
+        return None
+    material = dict(mutation_binding)
+    material.pop("binding_hash", None)
+    if _core_hash(material) != binding_hash:
+        return None
+    return str(binding_hash), str(contract_hash)
+
+
 def _worker_material_fingerprint(
     request: Mapping[str, Any], artifact_bytes: bytes | None = None
 ) -> str | None:
@@ -1708,6 +2258,13 @@ def _reconcile_operation(request: Mapping[str, Any], *, kind: str) -> dict[str, 
                     if state.get(field) != expected:
                         state = None
                         break
+            if state is not None and state.get("core_binding_status") == "BOUND":
+                supplied_core = _request_core_hashes(request)
+                if supplied_core is None or supplied_core != (
+                    state.get("core_binding_hash"),
+                    state.get("acceptance_contract_hash"),
+                ):
+                    state = None
             if state is not None and request.get("operation") in {
                 "worker_run",
                 "worker_continue",
@@ -1827,6 +2384,43 @@ def _opencli_session_namespace(request: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
+def _session_core_identity_value(core_identity: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "core_binding_hash": str(core_identity["core_binding_hash"]),
+        "acceptance_contract_hash": str(core_identity["acceptance_contract_hash"]),
+        "core_repository": str(core_identity["core_repository"]),
+        "core_source_revision": str(core_identity["core_source_revision"]),
+        "core_source_tree": str(core_identity["core_source_tree"]),
+        "core_attempt_id": str(core_identity["core_attempt_id"]),
+        "core_required_verifier_ids": list(core_identity["core_required_verifier_ids"]),
+        "core_deletion_policy": str(core_identity["core_deletion_policy"]),
+    }
+
+
+def _bind_session_core_identity(
+    request: Mapping[str, Any],
+    session_id: str,
+    core_identity: Mapping[str, Any],
+    *,
+    allow_initial_bind: bool,
+) -> None:
+    path = _session_path(request, session_id)
+    context = _read_json(path)
+    if context is None:
+        raise RuntimeErrorBounded("SESSION_BINDING_MISSING")
+    expected = _session_core_identity_value(core_identity)
+    core_keys = set(expected)
+    present = core_keys.intersection(context)
+    if not present:
+        if not allow_initial_bind:
+            raise RuntimeErrorBounded("SESSION_CORE_BINDING_MISSING")
+        _atomic_json(path, {**context, **expected})
+        return
+    actual = {key: context.get(key) for key in expected}
+    if actual != expected:
+        raise RuntimeErrorBounded("SESSION_CORE_BINDING_MISMATCH")
+
+
 def _worker_context(
     request: Mapping[str, Any], prompt: str
 ) -> tuple[str, str, tuple[str, ...], str]:
@@ -1934,6 +2528,8 @@ def _worker_run(
     checkpoint_saver: Any | None = None
     effect_journal: DurableEffectJournal | None = None
     semantic_admission = FALLBACK
+    core_identity: dict[str, Any] = {}
+    had_session_binding = bool(request.get("session_id"))
     diagnosis_model: Any | None = None
     try:
         failure_phase = "WORKER_CONTEXT"
@@ -1950,6 +2546,18 @@ def _worker_run(
             reason = semantic_admission.reason_code or "predicate_exception"
             raise RuntimeErrorBounded(f"OPEN_SWE_SEMANTIC_V2_REJECTED_{reason.upper()}")
         packet = semantic_admission.envelope
+        if semantic_admission_decision == ADMIT:
+            if not isinstance(packet, Mapping) or not isinstance(
+                packet.get("repository_mutation_binding"), Mapping
+            ):
+                raise RuntimeErrorBounded("OPEN_SWE_SEMANTIC_V2_REJECTED_CORE_BINDING_SHAPE")
+            core_identity = _core_binding_identity(packet["repository_mutation_binding"])
+            _bind_session_core_identity(
+                request,
+                session_id,
+                core_identity,
+                allow_initial_bind=not had_session_binding,
+            )
         scope = packet.get("scope_signal") if isinstance(packet, Mapping) else None
         composite_admitted = bool(
             semantic_admission_decision == ADMIT
@@ -1979,6 +2587,7 @@ def _worker_run(
                 })
             ),
             composite_admitted=composite_admitted,
+            **core_identity,
         )
         recovery_journal = DurableOperationJournal(
             request.get("runtime_state_root") or "", recovery_identity
@@ -2136,6 +2745,11 @@ def _worker_run(
         else:
             response = _worker_result(task_id, unit_id, "BLOCKED", summary)
         failure_phase = "RESULT_FINALIZATION"
+        core_change_set_projection: dict[str, Any] = {"status": "LEGACY_UNBOUND"}
+        if core_identity and effect_journal is not None and recovery_journal is not None:
+            core_change_set_projection = _physical_core_changeset_projection(
+                workspace, recovery_journal.identity, effect_journal
+            )
         result = {
             **started,
             "status": "COMPLETED",
@@ -2155,6 +2769,12 @@ def _worker_run(
             "repair_admitted": repair_admitted,
             "repair_phase_count": repair_phase_count,
             "worker_identity_sha256": str(request.get("worker_identity_sha256") or ""),
+            "core_binding_status": "BOUND" if core_identity else "LEGACY_UNBOUND",
+            "core_binding_hash": str(core_identity.get("core_binding_hash") or ""),
+            "acceptance_contract_hash": str(
+                core_identity.get("acceptance_contract_hash") or ""
+            ),
+            "core_change_set_projection": core_change_set_projection,
             "finished_at": _now(),
         }
         if recovery_journal is not None:
@@ -2179,6 +2799,11 @@ def _worker_run(
             "repair_admitted": repair_admitted,
             "repair_phase_count": repair_phase_count,
             "worker_identity_sha256": str(request.get("worker_identity_sha256") or ""),
+            "core_binding_status": "BOUND" if core_identity else "LEGACY_UNBOUND",
+            "core_binding_hash": str(core_identity.get("core_binding_hash") or ""),
+            "acceptance_contract_hash": str(
+                core_identity.get("acceptance_contract_hash") or ""
+            ),
             "finished_at": _now(),
         }
         error_code = _bounded_error_code(exc)
@@ -2237,9 +2862,26 @@ def _worker_reconcile(
                 identity_data.get("checkpoint_namespace", "open-swe-repair-v1")
             ),
             composite_admitted=bool(identity_data.get("composite_admitted", False)),
+            core_binding_hash=str(identity_data.get("core_binding_hash", "")),
+            acceptance_contract_hash=str(identity_data.get("acceptance_contract_hash", "")),
+            core_repository=str(identity_data.get("core_repository", "")),
+            core_source_revision=str(identity_data.get("core_source_revision", "")),
+            core_source_tree=str(identity_data.get("core_source_tree", "")),
+            core_attempt_id=str(identity_data.get("core_attempt_id", "")),
+            core_required_verifier_ids=tuple(
+                str(value) for value in identity_data.get("core_required_verifier_ids", [])
+            ),
+            core_deletion_policy=str(identity_data.get("core_deletion_policy", "")),
         )
         if identity.operation_id != operation_id:
             return cached
+        if identity.core_binding_hash:
+            supplied_core = _request_core_hashes(request)
+            if supplied_core != (
+                identity.core_binding_hash,
+                identity.acceptance_contract_hash,
+            ):
+                return cached
         expected_transport = _sha256(_canonical_json(request.get("transport_config") or {}))
         expected_runtime = _sha256(
             _canonical_json({
@@ -2307,6 +2949,9 @@ def _worker_reconcile(
                     recovery_state = journal.read()
             persisted_composite = _persisted_composite_worker_result(journal, effect_journal)
             if persisted_composite is not None:
+                core_projection = _physical_core_changeset_projection(
+                    Path(identity.workspace), identity, effect_journal
+                ) if identity.core_binding_hash else {"status": "LEGACY_UNBOUND"}
                 result = {
                     **cached,
                     "status": "COMPLETED",
@@ -2319,6 +2964,10 @@ def _worker_reconcile(
                     ),
                     "process_started": True,
                     "directory": identity.workspace,
+                    "core_binding_status": "BOUND" if identity.core_binding_hash else "LEGACY_UNBOUND",
+                    "core_binding_hash": identity.core_binding_hash,
+                    "acceptance_contract_hash": identity.acceptance_contract_hash,
+                    "core_change_set_projection": core_projection,
                     "finished_at": _now(),
                 }
                 journal.terminal(result)
@@ -2441,6 +3090,9 @@ def _worker_reconcile(
         )
         if envelope is None or not isinstance(envelope.get("summary"), str):
             return cached
+        core_projection = _physical_core_changeset_projection(
+            Path(identity.workspace), identity, effect_journal
+        ) if identity.core_binding_hash else {"status": "LEGACY_UNBOUND"}
         result = {
             **cached,
             "status": "COMPLETED",
@@ -2450,6 +3102,10 @@ def _worker_reconcile(
             ),
             "process_started": True,
             "directory": identity.workspace,
+            "core_binding_status": "BOUND" if identity.core_binding_hash else "LEGACY_UNBOUND",
+            "core_binding_hash": identity.core_binding_hash,
+            "acceptance_contract_hash": identity.acceptance_contract_hash,
+            "core_change_set_projection": core_projection,
             "finished_at": _now(),
         }
         journal.terminal(result)
