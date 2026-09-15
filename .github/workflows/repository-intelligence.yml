@@ -50,3 +50,42 @@ jobs:
           path: ${{ steps.ri.outputs.report-path }}
           if-no-files-found: error
           retention-days: 30
+
+  terminal:
+    needs: snapshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Observe terminal external check set
+        id: ri-terminal
+        uses: James3014/repository-intelligence-engine/terminal@7d7a0e375f0b7be7b57d96653a4064fd379231eb
+        with:
+          pr-number: ${{ github.event.pull_request.number }}
+          expected-head-sha: ${{ github.event.pull_request.head.sha }}
+          timeout-seconds: "900"
+          poll-seconds: "5"
+          quiescence-seconds: "20"
+
+      - name: Validate terminal advisory envelope
+        shell: bash
+        env:
+          REPORT_PATH: ${{ steps.ri-terminal.outputs.report-path }}
+          CONTENT_SHA256: ${{ steps.ri-terminal.outputs.content-sha256 }}
+          CLAIM_CEILING: ${{ steps.ri-terminal.outputs.claim-ceiling }}
+          SNAPSHOT_SEMANTICS: ${{ steps.ri-terminal.outputs.snapshot-semantics }}
+          OBSERVED_COUNT: ${{ steps.ri-terminal.outputs.observed-external-check-count }}
+        run: |
+          set -euo pipefail
+          test -s "$REPORT_PATH"
+          test "$CLAIM_CEILING" = "ADVISORY_EVIDENCE_ONLY"
+          test "$SNAPSHOT_SEMANTICS" = "OBSERVED_CHECK_SET_TERMINAL_AFTER_QUIESCENCE"
+          test "${#CONTENT_SHA256}" -eq 64
+          test "$OBSERVED_COUNT" -gt 0
+
+      - name: Upload terminal Repository Intelligence evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: repository-intelligence-terminal-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ steps.ri-terminal.outputs.report-path }}
+          if-no-files-found: error
+          retention-days: 30
