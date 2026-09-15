@@ -543,3 +543,43 @@ def test_restart_trace_recovered_response_updates_graph_once_and_terminal_reconc
     journal.terminal({"status": "COMPLETED"})
     assert journal.read()["status"] == "COMPLETED"
     assert calls == ["detail:conversation-1:False:turn_1"]
+
+
+def test_recovery_identity_rejects_same_operation_with_different_core_binding(tmp_path: Path):
+    identity = replace(
+        _identity(tmp_path),
+        core_binding_hash="sha256:" + "1" * 64,
+        acceptance_contract_hash="sha256:" + "2" * 64,
+        core_repository="James3014/nexus-open-swe-runtime",
+        core_source_revision="git-commit:" + "3" * 40,
+        core_source_tree="git-tree:" + "4" * 40,
+        core_attempt_id="attempt-1",
+        core_required_verifier_ids=("pytest",),
+        core_deletion_policy="FORBID",
+    )
+    journal = DurableOperationJournal(tmp_path / "state", identity)
+    journal.prepare()
+
+    changed = replace(identity, core_binding_hash="sha256:" + "9" * 64)
+    with pytest.raises(RuntimeError, match="RECOVERY_IDENTITY_MISMATCH"):
+        DurableOperationJournal.open(tmp_path / "state", changed)
+
+
+def test_effect_journal_lists_only_exact_operation_results(tmp_path: Path):
+    identity = _identity(tmp_path)
+    journal = DurableEffectJournal(tmp_path / "state", identity)
+    target = tmp_path / "a.py"
+    effect = journal.intent(
+        turn_id="turn_1",
+        tool_call_id="call_1",
+        tool_name="write_file",
+        arguments={"file_path": "a.py", "content": "done\n"},
+        path=target,
+        preimage=None,
+        postimage="done\n",
+    )
+    journal.recover_write(effect)
+    records = journal.result_effects()
+    assert len(records) == 1
+    assert records[0]["effect_id"] == effect.effect_id
+    assert records[0]["status"] == "RESULT"
