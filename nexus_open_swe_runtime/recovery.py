@@ -108,10 +108,19 @@ class RecoveryIdentity:
     runtime_identity_sha256: str
     checkpoint_namespace: str = "open-swe-repair-v1"
     composite_admitted: bool = False
+    core_binding_hash: str = ""
+    acceptance_contract_hash: str = ""
+    core_repository: str = ""
+    core_source_revision: str = ""
+    core_source_tree: str = ""
+    core_attempt_id: str = ""
+    core_required_verifier_ids: tuple[str, ...] = ()
+    core_deletion_policy: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["allowed_paths"] = list(self.allowed_paths)
+        value["core_required_verifier_ids"] = list(self.core_required_verifier_ids)
         return value
 
     def digest(self) -> str:
@@ -350,6 +359,29 @@ class DurableEffectJournal:
         if path.is_symlink():
             raise RuntimeError("RECOVERY_STATE_SYMLINK")
         return json.loads(path.read_text(encoding="utf-8"))
+
+    def result_effects(self) -> list[dict[str, Any]]:
+        """Return verified durable write RESULT records for this exact operation."""
+        records: list[dict[str, Any]] = []
+        if not self.root.exists():
+            return records
+        for path in sorted(self.root.glob("effect_*.json")):
+            if path.is_symlink() or not path.is_file():
+                raise RuntimeError("RECOVERY_STATE_SYMLINK")
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("RECOVERY_RECORD_CORRUPT") from exc
+            if not isinstance(value, dict):
+                raise RuntimeError("RECOVERY_RECORD_CORRUPT")
+            if value.get("operation_id") != self.identity.operation_id:
+                continue
+            if value.get("status") != "RESULT":
+                continue
+            if value.get("effect_id") != path.stem:
+                raise RuntimeError("RECOVERY_EFFECT_IDENTITY_MISMATCH")
+            records.append(value)
+        return records
 
     def recover_write(self, effect: Effect) -> str:
         state = self.read(effect.effect_id)
