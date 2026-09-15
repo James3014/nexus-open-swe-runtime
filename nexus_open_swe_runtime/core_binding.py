@@ -19,7 +19,7 @@ from typing import Any, Mapping
 CORE_BINDING_SCHEMA = "nexus.repository_mutation_binding.v1"
 CORE_PROTOCOL_VERSION = "0.1.0-experimental"
 CORE_PROTOCOL_CANDIDATE = (
-    "James3014/nexus-core#29@aabf2d4d00be4a3a357646be97b4d784d486ccb4"
+    "James3014/nexus-core@8ce871463fd3571d5d39ddece9ac698c515dd47e"
 )
 CORE_CHANGE_MANIFEST_SCHEMA = "nexus.core.git-change-manifest.v1-experimental"
 
