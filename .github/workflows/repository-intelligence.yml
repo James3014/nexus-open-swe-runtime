@@ -1,0 +1,52 @@
+name: Repository Intelligence
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - converted_to_draft
+      - labeled
+      - unlabeled
+      - edited
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+
+concurrency:
+  group: repository-intelligence-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Collect Repository Intelligence
+        id: ri
+        uses: James3014/repository-intelligence-engine@v0.1.1
+
+      - name: Validate advisory envelope
+        shell: bash
+        env:
+          REPORT_PATH: ${{ steps.ri.outputs.report-path }}
+          CONTENT_SHA256: ${{ steps.ri.outputs.content-sha256 }}
+          CLAIM_CEILING: ${{ steps.ri.outputs.claim-ceiling }}
+        run: |
+          set -euo pipefail
+          test -s "$REPORT_PATH"
+          test "$CLAIM_CEILING" = "ADVISORY_EVIDENCE_ONLY"
+          test "${#CONTENT_SHA256}" -eq 64
+
+      - name: Upload Repository Intelligence evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: repository-intelligence-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ steps.ri.outputs.report-path }}
+          if-no-files-found: error
+          retention-days: 30
