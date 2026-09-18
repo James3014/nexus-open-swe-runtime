@@ -108,6 +108,10 @@ class RecoveryIdentity:
     runtime_identity_sha256: str
     checkpoint_namespace: str = "open-swe-repair-v1"
     composite_admitted: bool = False
+    effect_authorization_hash: str = ""
+    tool_projection_hash: str = ""
+    tool_projection_backend_id: str = ""
+    projected_tools: tuple[str, ...] = ()
     core_binding_hash: str = ""
     acceptance_contract_hash: str = ""
     core_repository: str = ""
@@ -120,6 +124,7 @@ class RecoveryIdentity:
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["allowed_paths"] = list(self.allowed_paths)
+        value["projected_tools"] = list(self.projected_tools)
         value["core_required_verifier_ids"] = list(self.core_required_verifier_ids)
         return value
 

@@ -265,6 +265,50 @@ def _worker_request(tmp_path: Path) -> dict:
     }
 
 
+def _project_worker_request(request: dict, tools: tuple[str, ...]) -> dict:
+    request["attempt_id"] = "attempt-wave2"
+    authorization_material = {
+        "schema": "nexus.runtime.effect_authorization.v1",
+        "authority_id": "owner-wave2",
+        "authority_ref": "wave2",
+        "operation_id": request["operation_id"],
+        "attempt_id": request["attempt_id"],
+        "repository": "James3014/nexus-open-swe-runtime",
+        "source_revision": "1" * 40,
+        "base_revision": "1" * 40,
+        "workspace_id": "workspace-wave2",
+        "target_id": "open-swe-runtime",
+        "expires_at": None,
+        "effects": {
+            "filesystem": {"write_paths": ["a.py"]},
+            "process": {"commands": []},
+            "network": {"hosts": []},
+            "git": {"operations": []},
+        },
+    }
+    authorization = {
+        **authorization_material,
+        "authorization_hash": cli._sha256(cli._canonical_json(authorization_material)),
+    }
+    projection_material = {
+        "schema": "nexus.runtime.tool_projection_manifest.v1",
+        "authorization_hash": authorization["authorization_hash"],
+        "operation_id": request["operation_id"],
+        "attempt_id": request["attempt_id"],
+        "provider": request["provider_id"],
+        "backend_id": "nexus-open-swe-runtime",
+        "selected_tools": sorted(tools),
+        "selected_effects": {"filesystem": {"write_paths": ["a.py"]}},
+        "authority_kind": "DERIVED_PROJECTION_ONLY",
+    }
+    request["effect_authorization"] = authorization
+    request["tool_projection_manifest"] = {
+        **projection_material,
+        "projection_hash": cli._sha256(cli._canonical_json(projection_material)),
+    }
+    return request
+
+
 @pytest.mark.parametrize(
     "raw_state",
     [b"[]", b"null", b'"string"', b"123", b"true", b"{malformed"],
@@ -1742,10 +1786,34 @@ def test_real_deepagents_graphs_expose_only_qualified_surfaces(tmp_path):
     semantic = cli.build_semantic_graph(model, tmp_path, runtime, "test:surface")
     diagnosis = cli.build_diagnosis_graph(model, tmp_path, runtime, "test:surface")
     repair = cli.build_repair_graph(model, tmp_path, runtime, ("a.py",), "test:surface")
+    projected_diagnosis = cli.build_diagnosis_graph(
+        model,
+        tmp_path,
+        runtime,
+        "test:projected-diagnosis",
+        selected_tools=("read_file", "record_diagnosis"),
+    )
+    projected_repair = cli.build_repair_graph(
+        model,
+        tmp_path,
+        runtime,
+        ("a.py",),
+        "test:projected-repair",
+        selected_tools=("read_file", "record_worker_result", "write_file"),
+    )
 
     assert set(cli.executable_tool_surface(semantic)) == cli.SEMANTIC_TOOLS
     assert set(cli.executable_tool_surface(diagnosis)) == cli.DIAGNOSIS_TOOLS
     assert set(cli.executable_tool_surface(repair)) == cli.REPAIR_TOOLS
+    assert set(cli.executable_tool_surface(projected_diagnosis)) == {
+        "read_file",
+        "record_diagnosis",
+    }
+    assert set(cli.executable_tool_surface(projected_repair)) == {
+        "read_file",
+        "record_worker_result",
+        "write_file",
+    }
     forbidden = {"execute", "shell", "task", "delete_file", "http_request", "git_push"}
     assert forbidden.isdisjoint(cli.executable_tool_surface(semantic))
     assert forbidden.isdisjoint(cli.executable_tool_surface(diagnosis))
@@ -4470,3 +4538,174 @@ def test_worker_run_malformed_r23_composite_completes_once_then_reconcile_is_loc
     assert reconciled["status"] == "COMPLETED"
     assert model_calls == 0
     assert replace_calls == []
+
+
+def test_wave2_tampered_projection_blocks_before_model_or_graph(tmp_path):
+    request = _project_worker_request(
+        _worker_request(tmp_path),
+        ("read_file", "record_diagnosis", "record_worker_result", "write_file"),
+    )
+    request["tool_projection_manifest"]["selected_tools"] = [
+        "edit_file",
+        "read_file",
+        "record_diagnosis",
+        "record_worker_result",
+        "write_file",
+    ]
+    calls = {"model": 0, "diagnosis": 0, "repair": 0}
+
+    def model_factory(*_args):
+        calls["model"] += 1
+        return object()
+
+    def diagnosis_factory(*_args):
+        calls["diagnosis"] += 1
+        return FakeGraph(())
+
+    def repair_factory(*_args):
+        calls["repair"] += 1
+        return FakeGraph(())
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=model_factory,
+        diagnosis_factory=diagnosis_factory,
+        repair_factory=repair_factory,
+    )
+
+    assert result["status"] == "OPEN_SWE_TOOL_PROJECTION_BLOCKED"
+    assert result["process_started"] is False
+    assert result["error_code"] == "OPEN_SWE_TOOL_PROJECTION_HASH_INVALID"
+    assert calls == {"model": 0, "diagnosis": 0, "repair": 0}
+    assert cli._read_operation_state(cli._operation_path(request)) is None
+
+
+def test_wave2_unprojected_graph_tool_is_blocked_before_graph_invoke(tmp_path):
+    request = _project_worker_request(
+        _worker_request(tmp_path),
+        ("read_file", "record_diagnosis", "record_worker_result", "write_file"),
+    )
+    diagnosis = FakeGraph(
+        cli.DIAGNOSIS_TOOLS,
+        _record(
+            "record_diagnosis",
+            {
+                "status": "ROOT_CAUSE_SUPPORTED",
+                "summary": "supported",
+                "evidence_paths": ["a.py"],
+            },
+        ),
+    )
+    repair = FakeGraph(
+        ("read_file", "record_worker_result", "write_file"),
+        _record("record_worker_result", {"summary": "done"}),
+    )
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: object(),
+        diagnosis_factory=lambda *_args, **_kwargs: diagnosis,
+        repair_factory=lambda *_args, **_kwargs: repair,
+    )
+
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["error_code"] == "OPEN_SWE_TOOL_EXPOSURE_WIDENED"
+    assert diagnosis.calls == 0
+    assert repair.calls == 0
+    assert result["tool_projection_status"] == "BOUND"
+    assert result["execution_exposure_receipt"]["actual_exposed_tools"] == []
+
+
+def test_wave2_projected_worker_exposes_only_manifest_tools_and_emits_receipt(tmp_path):
+    projected_tools = (
+        "read_file",
+        "record_diagnosis",
+        "record_worker_result",
+        "write_file",
+    )
+    request = _project_worker_request(_worker_request(tmp_path), projected_tools)
+    diagnosis = FakeGraph(
+        ("read_file", "record_diagnosis"),
+        _record(
+            "record_diagnosis",
+            {
+                "status": "ROOT_CAUSE_SUPPORTED",
+                "summary": "supported",
+                "evidence_paths": ["a.py"],
+            },
+        ),
+    )
+    repair = FakeGraph(
+        ("read_file", "record_worker_result", "write_file"),
+        _record("record_worker_result", {"summary": "done"}),
+    )
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: object(),
+        diagnosis_factory=lambda *_args, **_kwargs: diagnosis,
+        repair_factory=lambda *_args, **_kwargs: repair,
+    )
+
+    assert result["status"] == "COMPLETED"
+    assert diagnosis.calls == 1
+    assert repair.calls == 1
+    assert result["tool_projection_status"] == "BOUND"
+    assert result["effect_authorization_hash"] == request["effect_authorization"][
+        "authorization_hash"
+    ]
+    assert result["tool_projection_hash"] == request["tool_projection_manifest"][
+        "projection_hash"
+    ]
+    receipt = result["execution_exposure_receipt"]
+    assert receipt["schema"] == "nexus.open_swe_runtime.execution_exposure_receipt.v1"
+    assert receipt["authority_kind"] == "DERIVED_EXPOSURE_EVIDENCE_ONLY"
+    assert receipt["projection_hash"] == request["tool_projection_manifest"]["projection_hash"]
+    assert receipt["phase_tool_surfaces"] == {
+        "diagnosis": ["read_file", "record_diagnosis"],
+        "repair": ["read_file", "record_worker_result", "write_file"],
+    }
+    assert receipt["actual_exposed_tools"] == [
+        "read_file",
+        "record_diagnosis",
+        "record_worker_result",
+        "write_file",
+    ]
+    durable = cli._read_operation_state(cli._operation_path(request))
+    assert durable is not None
+    assert durable["execution_exposure_receipt"] == receipt
+
+
+def test_wave2_projection_missing_required_terminal_tool_blocks_before_repair_invoke(tmp_path):
+    request = _project_worker_request(
+        _worker_request(tmp_path),
+        ("read_file", "record_diagnosis", "write_file"),
+    )
+    diagnosis = FakeGraph(
+        ("read_file", "record_diagnosis"),
+        _record(
+            "record_diagnosis",
+            {
+                "status": "ROOT_CAUSE_SUPPORTED",
+                "summary": "supported",
+                "evidence_paths": ["a.py"],
+            },
+        ),
+    )
+    repair = FakeGraph(("read_file", "write_file"), _record("record_worker_result", {"summary": "x"}))
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: object(),
+        diagnosis_factory=lambda *_args, **_kwargs: diagnosis,
+        repair_factory=lambda *_args, **_kwargs: repair,
+    )
+
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["error_code"] == "OPEN_SWE_TOOL_PROJECTION_REQUIRED_TOOL_MISSING"
+    assert diagnosis.calls == 1
+    assert repair.calls == 0
