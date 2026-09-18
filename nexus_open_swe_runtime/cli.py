@@ -28,6 +28,14 @@ try:
         reconcile_bound_turn,
         validate_checkpoint,
     )
+    from .tool_projection import (
+        ToolProjectionError,
+        ValidatedToolProjection,
+        assert_exposed_tools,
+        build_exposure_receipt,
+        require_supported_projection_tools,
+        validate_tool_projection,
+    )
 except ImportError:  # direct ``python path/to/cli.py`` compatibility
     from nexus_open_swe_runtime.recovery import (  # type: ignore[no-redef]
         DurableEffectJournal,
@@ -38,6 +46,14 @@ except ImportError:  # direct ``python path/to/cli.py`` compatibility
         operation_flock,
         reconcile_bound_turn,
         validate_checkpoint,
+    )
+    from nexus_open_swe_runtime.tool_projection import (  # type: ignore[no-redef]
+        ToolProjectionError,
+        ValidatedToolProjection,
+        assert_exposed_tools,
+        build_exposure_receipt,
+        require_supported_projection_tools,
+        validate_tool_projection,
     )
 
 REQUEST_SCHEMA = "nexus.open_swe_runtime.request.v1"
@@ -53,6 +69,8 @@ REPAIR_TOOLS = frozenset({
     "record_worker_result",
     "write_file",
 })
+COMPOSITE_REPAIR_TOOL = "write_file_and_record_worker_result"
+WORKER_TOOL_UNIVERSE = frozenset(DIAGNOSIS_TOOLS | REPAIR_TOOLS | {COMPOSITE_REPAIR_TOOL})
 
 
 class RuntimeErrorBounded(RuntimeError):
@@ -451,30 +469,43 @@ def build_semantic_graph(model: Any, root: Path, runtime: Mapping[str, Any], key
     )
 
 
-def build_diagnosis_graph(model: Any, root: Path, runtime: Mapping[str, Any], key: str) -> Any:
+def build_diagnosis_graph(
+    model: Any,
+    root: Path,
+    runtime: Mapping[str, Any],
+    key: str,
+    selected_tools: tuple[str, ...] | None = None,
+) -> Any:
     @runtime["tool"]
     def record_diagnosis(envelope: dict[str, Any]) -> str:
         """Record the single structured diagnosis envelope."""
         return _canonical_json(envelope)
 
+    exposed = set(DIAGNOSIS_TOOLS if selected_tools is None else selected_tools) & DIAGNOSIS_TOOLS
+    filesystem_tools = [
+        name for name in ("read_file", "ls", "glob", "grep") if name in exposed
+    ]
+    explicit_tools = [record_diagnosis] if "record_diagnosis" in exposed else []
     _profile(runtime, key)
     backend = runtime["filesystem_backend"](root_dir=root, virtual_mode=True)
+    middleware = (
+        [runtime["filesystem_middleware"](backend=backend, tools=filesystem_tools)]
+        if filesystem_tools
+        else []
+    )
     return runtime["create_deep_agent"](
         model=model,
         system_prompt=(
             "Diagnose one bounded failing execution unit using repository and controller evidence. "
-            "Use only read tools. Call record_diagnosis exactly once with status "
+            f"The physically exposed tool names are {_canonical_json(sorted(exposed))}. "
+            "Use only those tools. Call record_diagnosis exactly once with status "
             "ROOT_CAUSE_SUPPORTED or INCONCLUSIVE, summary, and evidence_paths. Never mutate, "
             "execute, delegate, access network, use Git/GitHub, approve, merge, release, or deploy."
         ),
-        tools=[record_diagnosis],
+        tools=explicit_tools,
         subagents=[],
         backend=backend,
-        middleware=[
-            runtime["filesystem_middleware"](
-                backend=backend, tools=["read_file", "ls", "glob", "grep"]
-            )
-        ],
+        middleware=middleware,
     )
 
 
@@ -487,17 +518,20 @@ def build_repair_graph(
     checkpointer: Any | None = None,
     effect_journal: DurableEffectJournal | None = None,
     composite: bool = False,
+    selected_tools: tuple[str, ...] | None = None,
 ) -> Any:
     @runtime["tool"]
     def record_worker_result(envelope: dict[str, Any]) -> str:
         """Record the single structured bounded-repair result envelope."""
         return _canonical_json(envelope)
 
+    supported = set(REPAIR_TOOLS) | ({COMPOSITE_REPAIR_TOOL} if composite else set())
+    exposed = supported if selected_tools is None else set(selected_tools) & supported
     _profile(runtime, key)
     filesystem = runtime["filesystem_backend"](root_dir=root, virtual_mode=True)
     backend = ScopedRepairBackend(filesystem, root, allowed_paths, effect_journal)
     composite_tool = None
-    if composite:
+    if composite and COMPOSITE_REPAIR_TOOL in exposed:
 
         @runtime["tool"]
         def write_file_and_record_worker_result(
@@ -511,35 +545,43 @@ def build_repair_graph(
             return _canonical_json(receipt)
 
         composite_tool = write_file_and_record_worker_result
+    explicit_tools = []
+    if "record_worker_result" in exposed:
+        explicit_tools.append(record_worker_result)
+    if composite_tool is not None:
+        explicit_tools.append(composite_tool)
+    filesystem_tools = [
+        name
+        for name in ("read_file", "ls", "glob", "grep", "write_file", "edit_file")
+        if name in exposed
+    ]
+    if composite_tool is not None:
+        filesystem_tools.append(COMPOSITE_REPAIR_TOOL)
+    middleware = (
+        [runtime["filesystem_middleware"](backend=backend, tools=filesystem_tools)]
+        if filesystem_tools
+        else []
+    )
     return runtime["create_deep_agent"](
         model=model,
         system_prompt=(
             "Repair exactly one supported root cause inside an isolated Candidate workspace. "
             f"Authorized mutation paths are {_canonical_json({'paths': list(allowed_paths)})}. "
-            "Use only read, write_file, and edit_file tools. Never delete, execute, delegate, "
-            "access network, use Git/GitHub, commit, approve, merge, release, or deploy. "
+            f"The physically exposed tool names are {_canonical_json(sorted(exposed))}. "
+            "Use only those tools. Never delete, execute, delegate, access network, use "
+            "Git/GitHub, commit, approve, merge, release, or deploy. "
             + (
                 "For the final mutation and result, call write_file_and_record_worker_result exactly "
                 "once with the file content and a short factual summary; this composite action is "
                 "the required terminal action for an admitted single-file repair."
-                if composite
+                if composite_tool is not None
                 else "Call record_worker_result exactly once with a short factual summary."
             )
         ),
-        tools=(
-            [record_worker_result, composite_tool]
-            if composite_tool is not None
-            else [record_worker_result]
-        ),
+        tools=explicit_tools,
         subagents=[],
         backend=backend,
-        middleware=[
-            runtime["filesystem_middleware"](
-                backend=backend,
-                tools=["read_file", "ls", "glob", "grep", "write_file", "edit_file"]
-                + (["write_file_and_record_worker_result"] if composite else []),
-            )
-        ],
+        middleware=middleware,
         checkpointer=checkpointer,
     )
 
@@ -554,6 +596,7 @@ def _repair_graph(
     checkpointer: Any | None,
     effect_journal: DurableEffectJournal | None = None,
     composite: bool = False,
+    selected_tools: tuple[str, ...] | None = None,
 ) -> Any:
     if checkpointer is not None:
         try:
@@ -565,6 +608,8 @@ def _repair_graph(
             kwargs["effect_journal"] = effect_journal
         if "composite" in parameters:
             kwargs["composite"] = composite
+        if selected_tools is not None and "selected_tools" in parameters:
+            kwargs["selected_tools"] = selected_tools
         if "checkpointer" in parameters:
             return factory(model, workspace, runtime, allowed_paths, key, **kwargs)
     if effect_journal is not None:
@@ -576,8 +621,42 @@ def _repair_graph(
             kwargs = {"effect_journal": effect_journal}
             if "composite" in parameters:
                 kwargs["composite"] = composite
+            if selected_tools is not None and "selected_tools" in parameters:
+                kwargs["selected_tools"] = selected_tools
             return factory(model, workspace, runtime, allowed_paths, key, **kwargs)
+    if selected_tools is not None:
+        try:
+            parameters = inspect.signature(factory).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "selected_tools" in parameters:
+            return factory(
+                model,
+                workspace,
+                runtime,
+                allowed_paths,
+                key,
+                selected_tools=selected_tools,
+            )
     return factory(model, workspace, runtime, allowed_paths, key)
+
+
+def _diagnosis_graph(
+    factory: Callable[..., Any],
+    model: Any,
+    workspace: Path,
+    runtime: Mapping[str, Any],
+    key: str,
+    selected_tools: tuple[str, ...] | None = None,
+) -> Any:
+    try:
+        parameters = inspect.signature(factory).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    kwargs: dict[str, Any] = {}
+    if selected_tools is not None and "selected_tools" in parameters:
+        kwargs["selected_tools"] = selected_tools
+    return factory(model, workspace, runtime, key, **kwargs)
 
 
 def executable_tool_surface(graph: Any) -> tuple[str, ...]:
@@ -587,6 +666,40 @@ def executable_tool_surface(graph: Any) -> tuple[str, ...]:
         )
     except (AttributeError, KeyError, TypeError) as exc:
         raise RuntimeErrorBounded("OPEN_SWE_TOOL_SURFACE_UNAVAILABLE") from exc
+
+
+def _worker_tool_projection(request: Mapping[str, Any]) -> ValidatedToolProjection | None:
+    try:
+        projection = validate_tool_projection(request)
+        if projection is not None:
+            require_supported_projection_tools(projection, WORKER_TOOL_UNIVERSE)
+        return projection
+    except ToolProjectionError as exc:
+        raise RuntimeErrorBounded(str(exc)) from exc
+
+
+def _assert_projected_surface(
+    projection: ValidatedToolProjection | None,
+    surface: tuple[str, ...],
+) -> tuple[str, ...]:
+    if projection is None:
+        return surface
+    try:
+        return assert_exposed_tools(projection, surface)
+    except ToolProjectionError as exc:
+        raise RuntimeErrorBounded(str(exc)) from exc
+
+
+def _exposure_receipt(
+    projection: ValidatedToolProjection | None,
+    phase_surfaces: Mapping[str, tuple[str, ...]],
+) -> dict[str, Any] | None:
+    if projection is None:
+        return None
+    try:
+        return build_exposure_receipt(projection, phase_surfaces)
+    except ToolProjectionError as exc:
+        raise RuntimeErrorBounded(str(exc)) from exc
 
 
 def _recorded_payload(output: Any, tool_name: str) -> dict[str, Any] | None:
@@ -1037,7 +1150,11 @@ def _bounded_error_code(exc: BaseException) -> str:
             "OPEN_SWE_CORE_CHANGESET_EFFECT_INVALID",
             "OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH",
             "OPEN_SWE_CORE_CHANGESET_UNJOURNALED_EFFECT",
-        } or any(
+        } or code.startswith((
+            "OPEN_SWE_TOOL_PROJECTION_",
+            "OPEN_SWE_EFFECT_AUTHORIZATION_",
+            "OPEN_SWE_TOOL_EXPOSURE_",
+        )) or any(
             code == f"OPEN_SWE_SEMANTIC_V2_REJECTED_{reason.upper()}"
             for reason in _SEMANTIC_REJECTION_CODES
         ):
@@ -2194,11 +2311,15 @@ def _worker_material_fingerprint(
     return _sha256(
         _canonical_json({
             "operation": request.get("operation"),
+            "operation_id": request.get("operation_id"),
+            "attempt_id": request.get("attempt_id"),
             "session_id": request.get("session_id"),
             "workspace": str(Path(str(request.get("workspace_path") or "")).expanduser().resolve()),
             "provider_id": request.get("provider_id"),
             "model_id": request.get("model_id"),
             "worker_identity_sha256": request.get("worker_identity_sha256"),
+            "effect_authorization": request.get("effect_authorization"),
+            "tool_projection_manifest": request.get("tool_projection_manifest"),
             "prompt": prompt,
             "artifact_path": str(artifact),
             "artifact_sha256": artifact_sha256,
@@ -2215,6 +2336,13 @@ def _write_started(
         material_fingerprint = _worker_material_fingerprint(request, artifact_bytes)
         if material_fingerprint is not None:
             state["execution_material_sha256"] = material_fingerprint
+        raw_authorization = request.get("effect_authorization")
+        raw_projection = request.get("tool_projection_manifest")
+        if isinstance(raw_authorization, Mapping) and isinstance(raw_projection, Mapping):
+            state["effect_authorization_hash"] = str(
+                raw_authorization.get("authorization_hash") or ""
+            )
+            state["tool_projection_hash"] = str(raw_projection.get("projection_hash") or "")
     state["process_started"] = True
     state["finished_at"] = ""
     _atomic_json(_operation_path(request), state)
@@ -2513,6 +2641,14 @@ def _worker_run(
     ):
         return _base_result(request, kind="worker", status="OPEN_SWE_EXECUTION_INPUT_INVALID")
     try:
+        tool_projection = _worker_tool_projection(request)
+    except RuntimeErrorBounded as exc:
+        result = _base_result(request, kind="worker", status="OPEN_SWE_TOOL_PROJECTION_BLOCKED")
+        result["error_code"] = _bounded_error_code(exc)
+        return result
+    selected_tools = tool_projection.selected_tools if tool_projection is not None else None
+    phase_tool_surfaces: dict[str, tuple[str, ...]] = {}
+    try:
         artifact_bytes = _read_regular_artifact(artifact)
     except RuntimeErrorBounded:
         artifact_bytes = None
@@ -2566,6 +2702,12 @@ def _worker_run(
             and scope.get("max_files") == 1
             and scope.get("required_test_edit_paths", list(allowed_paths)) == list(allowed_paths)
         )
+        if (
+            composite_admitted
+            and tool_projection is not None
+            and COMPOSITE_REPAIR_TOOL not in tool_projection.selected_tools
+        ):
+            composite_admitted = False
         failure_phase = "RECOVERY_PREPARE"
         recovery_identity = RecoveryIdentity(
             operation_id=str(request.get("operation_id") or ""),
@@ -2587,6 +2729,18 @@ def _worker_run(
                 })
             ),
             composite_admitted=composite_admitted,
+            effect_authorization_hash=(
+                tool_projection.authorization_hash if tool_projection is not None else ""
+            ),
+            tool_projection_hash=(
+                tool_projection.projection_hash if tool_projection is not None else ""
+            ),
+            tool_projection_backend_id=(
+                tool_projection.backend_id if tool_projection is not None else ""
+            ),
+            projected_tools=(
+                tool_projection.selected_tools if tool_projection is not None else ()
+            ),
             **core_identity,
         )
         recovery_journal = DurableOperationJournal(
@@ -2627,6 +2781,8 @@ def _worker_run(
                 "evidence_paths": list(packet["scope_signal"]["required_test_edit_paths"]),
             }
         else:
+            if tool_projection is not None and "record_diagnosis" not in tool_projection.selected_tools:
+                raise RuntimeErrorBounded("OPEN_SWE_TOOL_PROJECTION_REQUIRED_TOOL_MISSING")
             diagnosis_model = model_factory(
                 runtime,
                 provider,
@@ -2634,9 +2790,21 @@ def _worker_run(
                 request.get("transport_config"),
                 request.get("runtime_state_root"),
             )
-            diagnosis_graph = diagnosis_factory(diagnosis_model, workspace, runtime, profile_key)
-            if set(executable_tool_surface(diagnosis_graph)) != DIAGNOSIS_TOOLS:
-                raise RuntimeErrorBounded("OPEN_SWE_TOOL_SURFACE_INVALID")
+            diagnosis_graph = _diagnosis_graph(
+                diagnosis_factory,
+                diagnosis_model,
+                workspace,
+                runtime,
+                profile_key,
+                selected_tools,
+            )
+            diagnosis_surface = executable_tool_surface(diagnosis_graph)
+            if tool_projection is None:
+                if set(diagnosis_surface) != DIAGNOSIS_TOOLS:
+                    raise RuntimeErrorBounded("OPEN_SWE_TOOL_SURFACE_INVALID")
+            else:
+                diagnosis_surface = _assert_projected_surface(tool_projection, diagnosis_surface)
+                phase_tool_surfaces["diagnosis"] = diagnosis_surface
             diagnosis_output = diagnosis_graph.invoke(
                 {
                     "messages": [
@@ -2692,6 +2860,15 @@ def _worker_run(
                 raise RuntimeErrorBounded("OPEN_SWE_PHASE_MODEL_REUSE")
             if provider == "opencli_chatgpt" and getattr(repair_model, "_conversation_id", None):
                 raise RuntimeErrorBounded("OPENCLI_WEB_REPAIR_CONVERSATION_REUSE")
+            projected_tool_set = set(tool_projection.selected_tools) if tool_projection else set()
+            composite_projected = tool_projection is None or COMPOSITE_REPAIR_TOOL in projected_tool_set
+            composite_for_graph = composite_admitted and composite_projected
+            if (
+                tool_projection is not None
+                and not composite_for_graph
+                and "record_worker_result" not in projected_tool_set
+            ):
+                raise RuntimeErrorBounded("OPEN_SWE_TOOL_PROJECTION_REQUIRED_TOOL_MISSING")
             repair_graph = _repair_graph(
                 repair_factory,
                 repair_model,
@@ -2701,19 +2878,28 @@ def _worker_run(
                 profile_key,
                 checkpoint_saver,
                 effect_journal,
-                composite=composite_admitted,
+                composite=composite_for_graph,
+                selected_tools=selected_tools,
             )
-            repair_tools = set(executable_tool_surface(repair_graph))
-            composite_runtime = (
-                composite_admitted and "write_file_and_record_worker_result" in repair_tools
-            )
-            expected_tools = (
-                REPAIR_TOOLS | {"write_file_and_record_worker_result"}
-                if composite_runtime
-                else REPAIR_TOOLS
-            )
-            if repair_tools != expected_tools:
-                raise RuntimeErrorBounded("OPEN_SWE_TOOL_SURFACE_INVALID")
+            repair_surface = executable_tool_surface(repair_graph)
+            repair_tools = set(repair_surface)
+            composite_runtime = composite_for_graph and COMPOSITE_REPAIR_TOOL in repair_tools
+            if tool_projection is None:
+                expected_tools = (
+                    REPAIR_TOOLS | {COMPOSITE_REPAIR_TOOL}
+                    if composite_runtime
+                    else REPAIR_TOOLS
+                )
+                if repair_tools != expected_tools:
+                    raise RuntimeErrorBounded("OPEN_SWE_TOOL_SURFACE_INVALID")
+            else:
+                repair_surface = _assert_projected_surface(tool_projection, repair_surface)
+                phase_tool_surfaces["repair"] = repair_surface
+                if composite_runtime:
+                    if COMPOSITE_REPAIR_TOOL not in repair_tools:
+                        raise RuntimeErrorBounded("OPEN_SWE_TOOL_PROJECTION_REQUIRED_TOOL_MISSING")
+                elif "record_worker_result" not in repair_tools:
+                    raise RuntimeErrorBounded("OPEN_SWE_TOOL_PROJECTION_REQUIRED_TOOL_MISSING")
             repair_config = {
                 "configurable": {
                     "thread_id": str(request.get("operation_id") or ""),
@@ -2750,6 +2936,7 @@ def _worker_run(
             core_change_set_projection = _physical_core_changeset_projection(
                 workspace, recovery_journal.identity, effect_journal
             )
+        exposure_receipt = _exposure_receipt(tool_projection, phase_tool_surfaces)
         result = {
             **started,
             "status": "COMPLETED",
@@ -2777,6 +2964,13 @@ def _worker_run(
             "core_change_set_projection": core_change_set_projection,
             "finished_at": _now(),
         }
+        if exposure_receipt is not None and tool_projection is not None:
+            result.update(
+                tool_projection_status="BOUND",
+                effect_authorization_hash=tool_projection.authorization_hash,
+                tool_projection_hash=tool_projection.projection_hash,
+                execution_exposure_receipt=exposure_receipt,
+            )
         if recovery_journal is not None:
             recovery_journal.terminal(result)
     except Exception as exc:
@@ -2806,6 +3000,18 @@ def _worker_run(
             ),
             "finished_at": _now(),
         }
+        if tool_projection is not None:
+            try:
+                exposure_receipt = _exposure_receipt(tool_projection, phase_tool_surfaces)
+            except RuntimeErrorBounded:
+                exposure_receipt = None
+            result.update(
+                tool_projection_status="BOUND",
+                effect_authorization_hash=tool_projection.authorization_hash,
+                tool_projection_hash=tool_projection.projection_hash,
+            )
+            if exposure_receipt is not None:
+                result["execution_exposure_receipt"] = exposure_receipt
         error_code = _bounded_error_code(exc)
         if error_code:
             result["error_code"] = error_code
@@ -2862,6 +3068,12 @@ def _worker_reconcile(
                 identity_data.get("checkpoint_namespace", "open-swe-repair-v1")
             ),
             composite_admitted=bool(identity_data.get("composite_admitted", False)),
+            effect_authorization_hash=str(identity_data.get("effect_authorization_hash", "")),
+            tool_projection_hash=str(identity_data.get("tool_projection_hash", "")),
+            tool_projection_backend_id=str(identity_data.get("tool_projection_backend_id", "")),
+            projected_tools=tuple(
+                str(value) for value in identity_data.get("projected_tools", [])
+            ),
             core_binding_hash=str(identity_data.get("core_binding_hash", "")),
             acceptance_contract_hash=str(identity_data.get("acceptance_contract_hash", "")),
             core_repository=str(identity_data.get("core_repository", "")),
@@ -2874,6 +3086,21 @@ def _worker_reconcile(
             core_deletion_policy=str(identity_data.get("core_deletion_policy", "")),
         )
         if identity.operation_id != operation_id:
+            return cached
+        try:
+            tool_projection = _worker_tool_projection(request)
+        except RuntimeErrorBounded:
+            return cached
+        if identity.tool_projection_hash:
+            if (
+                tool_projection is None
+                or tool_projection.authorization_hash != identity.effect_authorization_hash
+                or tool_projection.projection_hash != identity.tool_projection_hash
+                or tool_projection.backend_id != identity.tool_projection_backend_id
+                or tool_projection.selected_tools != identity.projected_tools
+            ):
+                return cached
+        elif tool_projection is not None:
             return cached
         if identity.core_binding_hash:
             supplied_core = _request_core_hashes(request)
@@ -3013,6 +3240,13 @@ def _worker_reconcile(
         )
         if hasattr(model, "configure_recovery_journal"):
             model.configure_recovery_journal(journal)
+        selected_tools = tool_projection.selected_tools if tool_projection is not None else None
+        if (
+            tool_projection is not None
+            and not identity.composite_admitted
+            and "record_worker_result" not in tool_projection.selected_tools
+        ):
+            return cached
         graph_args = [
             model,
             Path(identity.workspace),
@@ -3024,11 +3258,25 @@ def _worker_reconcile(
         ]
         graph_kwargs: dict[str, Any] = {}
         try:
-            if "composite" in inspect.signature(graph_builder).parameters:
-                graph_kwargs["composite"] = identity.composite_admitted
+            graph_parameters = inspect.signature(graph_builder).parameters
         except (TypeError, ValueError):
-            pass
+            graph_parameters = {}
+        if "composite" in graph_parameters:
+            graph_kwargs["composite"] = identity.composite_admitted
+        if selected_tools is not None and "selected_tools" in graph_parameters:
+            graph_kwargs["selected_tools"] = selected_tools
         graph = graph_builder(*graph_args, **graph_kwargs)
+        repair_surface = executable_tool_surface(graph)
+        if tool_projection is not None:
+            try:
+                repair_surface = _assert_projected_surface(tool_projection, repair_surface)
+            except RuntimeErrorBounded:
+                return cached
+            if identity.composite_admitted:
+                if COMPOSITE_REPAIR_TOOL not in repair_surface:
+                    return cached
+            elif "record_worker_result" not in repair_surface:
+                return cached
         repair_conversation_unbound = protocol_repair_pending and (
             recovery_state.get("conversation_id", "")
             == recovery_state.get("protocol_repair_original_conversation_id", "")
@@ -3071,6 +3319,11 @@ def _worker_reconcile(
         except (AttributeError, KeyError, TypeError, RuntimeErrorBounded, ValueError):
             return cached
         recovered_calls = getattr(recovered_message, "tool_calls", None) or []
+        if tool_projection is not None and any(
+            not isinstance(call, Mapping) or call.get("name") not in repair_surface
+            for call in recovered_calls
+        ):
+            return cached
         if recovered_calls:
             recovered_call_id = recovered_calls[0].get("id")
             turn_id = str(journal.read().get("turn_id") or "")
@@ -3093,6 +3346,27 @@ def _worker_reconcile(
         core_projection = _physical_core_changeset_projection(
             Path(identity.workspace), identity, effect_journal
         ) if identity.core_binding_hash else {"status": "LEGACY_UNBOUND"}
+        exposure_receipt = None
+        if tool_projection is not None:
+            phase_surfaces: dict[str, tuple[str, ...]] = {"repair": repair_surface}
+            cached_receipt = cached.get("execution_exposure_receipt")
+            cached_phases = (
+                cached_receipt.get("phase_tool_surfaces")
+                if isinstance(cached_receipt, Mapping)
+                and cached_receipt.get("projection_hash") == tool_projection.projection_hash
+                else None
+            )
+            if isinstance(cached_phases, Mapping):
+                for phase, tools in cached_phases.items():
+                    if not isinstance(phase, str) or not isinstance(tools, list):
+                        return cached
+                    try:
+                        phase_surfaces[phase] = _assert_projected_surface(
+                            tool_projection, tuple(str(tool) for tool in tools)
+                        )
+                    except RuntimeErrorBounded:
+                        return cached
+            exposure_receipt = _exposure_receipt(tool_projection, phase_surfaces)
         result = {
             **cached,
             "status": "COMPLETED",
@@ -3108,6 +3382,13 @@ def _worker_reconcile(
             "core_change_set_projection": core_projection,
             "finished_at": _now(),
         }
+        if exposure_receipt is not None and tool_projection is not None:
+            result.update(
+                tool_projection_status="BOUND",
+                effect_authorization_hash=tool_projection.authorization_hash,
+                tool_projection_hash=tool_projection.projection_hash,
+                execution_exposure_receipt=exposure_receipt,
+            )
         journal.terminal(result)
         return _write_terminal(request, result)
     except Exception:
