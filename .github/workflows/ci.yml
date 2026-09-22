@@ -21,7 +21,18 @@ jobs:
         run: uv sync --locked
       - name: Run Ruff
         run: uv run ruff check .
+      - name: Checkout pinned Nexus-new consumer
+        uses: actions/checkout@v4
+        with:
+          repository: James3014/Nexus-new
+          ref: 2999d62e0fb463646a12a659eefeee0aaf3367ea
+          path: .ci/nexus-new-consumer
+          fetch-depth: 1
+          persist-credentials: false
       - name: Run Pytest
+        env:
+          NEXUS_NEW_CONSUMER_ROOT: ${{ github.workspace }}/.ci/nexus-new-consumer
+          NEXUS_NEW_CONSUMER_REQUIRED: "1"
         run: uv run pytest -q
       - name: CLI protocol smoke
         run: echo '{}' | uv run nexus-open-swe-runtime
