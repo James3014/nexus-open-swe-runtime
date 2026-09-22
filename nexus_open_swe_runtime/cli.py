@@ -18,6 +18,7 @@ from typing import Any, Callable, Mapping
 from langchain_core.messages import AIMessage, ToolMessage
 
 try:
+    from .model_invocation import DurableInvocationJournal
     from .recovery import (
         DurableEffectJournal,
         DurableOperationJournal,
@@ -37,6 +38,9 @@ try:
         validate_tool_projection,
     )
 except ImportError:  # direct ``python path/to/cli.py`` compatibility
+    from nexus_open_swe_runtime.model_invocation import (  # type: ignore[no-redef]
+        DurableInvocationJournal,
+    )
     from nexus_open_swe_runtime.recovery import (  # type: ignore[no-redef]
         DurableEffectJournal,
         DurableOperationJournal,
@@ -700,6 +704,12 @@ def _exposure_receipt(
         return build_exposure_receipt(projection, phase_surfaces)
     except ToolProjectionError as exc:
         raise RuntimeErrorBounded(str(exc)) from exc
+
+
+def _invocation_receipts(invocation_journal: Any) -> list[dict[str, Any]]:
+    if invocation_journal is None:
+        return []
+    return invocation_journal.result_invocations()
 
 
 def _recorded_payload(output: Any, tool_name: str) -> dict[str, Any] | None:
@@ -2452,6 +2462,37 @@ def _semantic_run(
             request.get("transport_config"),
             request.get("runtime_state_root"),
         )
+        if hasattr(model, "configure_invocation_identity"):
+            model.configure_invocation_identity(
+                {
+                    "operation_id": str(request.get("operation_id") or ""),
+                    "provider_id": str(provider),
+                    "model_id": str(model_id),
+                    "worker_identity_sha256": str(
+                        request.get("worker_identity_sha256") or ""
+                    ),
+                    "transport_config_sha256": _sha256(
+                        _canonical_json(request.get("transport_config") or {})
+                    ),
+                    "runtime_identity_sha256": _sha256(
+                        _canonical_json({
+                            "module_sha256": _sha256(Path(__file__).read_bytes()),
+                            "deepagents": _deepagents_version(),
+                            "checkpoint_namespace": "open-swe-repair-v1",
+                        })
+                    ),
+                    "core_binding_hash": str(request.get("core_binding_hash") or ""),
+                    "acceptance_contract_hash": str(
+                        request.get("acceptance_contract_hash") or ""
+                    ),
+                    "effect_authorization_hash": str(
+                        request.get("effect_authorization_hash") or ""
+                    ),
+                    "tool_projection_hash": str(request.get("tool_projection_hash") or ""),
+                    "workspace": str(root),
+                    "checkpoint_namespace": "open-swe-repair-v1",
+                }
+            )
         graph = graph_factory(model, root, runtime, f"{provider}:{model_id}")
         if set(executable_tool_surface(graph)) != SEMANTIC_TOOLS:
             raise RuntimeErrorBounded("OPEN_SWE_TOOL_SURFACE_INVALID")
@@ -2667,6 +2708,7 @@ def _worker_run(
     core_identity: dict[str, Any] = {}
     had_session_binding = bool(request.get("session_id"))
     diagnosis_model: Any | None = None
+    invocation_journal: DurableInvocationJournal | None = None
     try:
         failure_phase = "WORKER_CONTEXT"
         task_id, unit_id, allowed_paths, session_id = _worker_context(request, prompt)
@@ -2746,6 +2788,9 @@ def _worker_run(
         recovery_journal = DurableOperationJournal(
             request.get("runtime_state_root") or "", recovery_identity
         )
+        invocation_journal = DurableInvocationJournal(
+            request.get("runtime_state_root") or "", recovery_identity
+        )
         failure_phase = "RECOVERY_PREPARE"
         recovery_journal.prepare()
         effect_journal = DurableEffectJournal(
@@ -2790,6 +2835,8 @@ def _worker_run(
                 request.get("transport_config"),
                 request.get("runtime_state_root"),
             )
+            if hasattr(diagnosis_model, "configure_invocation_journal"):
+                diagnosis_model.configure_invocation_journal(invocation_journal)
             diagnosis_graph = _diagnosis_graph(
                 diagnosis_factory,
                 diagnosis_model,
@@ -2856,6 +2903,8 @@ def _worker_run(
             )
             if hasattr(repair_model, "configure_recovery_journal"):
                 repair_model.configure_recovery_journal(recovery_journal)
+            if hasattr(repair_model, "configure_invocation_journal"):
+                repair_model.configure_invocation_journal(invocation_journal)
             if diagnosis_model is not None and repair_model is diagnosis_model:
                 raise RuntimeErrorBounded("OPEN_SWE_PHASE_MODEL_REUSE")
             if provider == "opencli_chatgpt" and getattr(repair_model, "_conversation_id", None):
@@ -2973,6 +3022,9 @@ def _worker_run(
             )
         if recovery_journal is not None:
             recovery_journal.terminal(result)
+        receipts = _invocation_receipts(invocation_journal)
+        if receipts:
+            result["model_invocation_receipts"] = receipts
     except Exception as exc:
         result = {
             **started,
@@ -3015,6 +3067,9 @@ def _worker_run(
         error_code = _bounded_error_code(exc)
         if error_code:
             result["error_code"] = error_code
+        receipts = _invocation_receipts(invocation_journal)
+        if receipts:
+            result["model_invocation_receipts"] = receipts
     return _write_terminal(request, result)
 
 
@@ -3139,6 +3194,7 @@ def _worker_reconcile(
             if actual != expected:
                 return cached
         journal = DurableOperationJournal.open(state_root, identity)
+        invocation_journal = DurableInvocationJournal(state_root, identity)
         if raw.get("status") == "COMPLETED":
             terminal = raw.get("terminal_result")
             if isinstance(terminal, Mapping):
@@ -3197,6 +3253,9 @@ def _worker_reconcile(
                     "core_change_set_projection": core_projection,
                     "finished_at": _now(),
                 }
+                receipts = _invocation_receipts(invocation_journal)
+                if receipts:
+                    result["model_invocation_receipts"] = receipts
                 journal.terminal(result)
                 return _write_terminal(request, result)
         protocol_repair_pending = recovery_state.get(
@@ -3240,6 +3299,8 @@ def _worker_reconcile(
         )
         if hasattr(model, "configure_recovery_journal"):
             model.configure_recovery_journal(journal)
+        if hasattr(model, "configure_invocation_journal"):
+            model.configure_invocation_journal(invocation_journal)
         selected_tools = tool_projection.selected_tools if tool_projection is not None else None
         if (
             tool_projection is not None
@@ -3389,6 +3450,9 @@ def _worker_reconcile(
                 tool_projection_hash=tool_projection.projection_hash,
                 execution_exposure_receipt=exposure_receipt,
             )
+        receipts = _invocation_receipts(invocation_journal)
+        if receipts:
+            result["model_invocation_receipts"] = receipts
         journal.terminal(result)
         return _write_terminal(request, result)
     except Exception:

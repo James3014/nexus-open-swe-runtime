@@ -14,6 +14,7 @@ import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
@@ -25,6 +26,19 @@ from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import PrivateAttr
+
+from .model_invocation import (
+    MODEL_INVOCATION_BACKEND_ID,
+    NOT_MEASURED,
+    TRANSPORT_OUTCOME_INVALID_RESPONSE,
+    TRANSPORT_OUTCOME_OBSERVED_OK,
+    ModelInvocationError,
+    build_model_invocation_receipt,
+    classify_transport_outcome,
+    external_outcome_known_for_error,
+    invocation_binding_from_identity,
+    provider_status_for_error,
+)
 
 try:
     import fcntl as _fcntl
@@ -815,6 +829,12 @@ class OpenCLIWebChatModel(BaseChatModel):
     _budget_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
     _durable_pacing_backend: DurablePacingBackend | None = PrivateAttr(default=None)
     _recovery_journal: Any = PrivateAttr(default=None)
+    _invocation_journal: Any = PrivateAttr(default=None)
+    _invocation_binding: dict[str, str] = PrivateAttr(default_factory=dict)
+    _invocation_identity_set: bool = PrivateAttr(default=False)
+    _recorded_invocations: list[dict[str, Any]] = PrivateAttr(default_factory=list)
+    _last_setup_latency_seconds: float | None = PrivateAttr(default=None)
+    _web_attempt_counts: dict[str, int] = PrivateAttr(default_factory=dict)
 
     def __init__(self, **data: Any) -> None:
         if "profile" in data:
@@ -859,6 +879,33 @@ class OpenCLIWebChatModel(BaseChatModel):
             conversation_id = None
         if isinstance(conversation_id, str) and conversation_id:
             self._conversation_id = conversation_id
+
+    def configure_invocation_identity(self, identity: Mapping[str, Any]) -> None:
+        """Bind the 12-key invocation evidence identity for later attempts."""
+        binding = invocation_binding_from_identity(identity)
+        self._invocation_binding = binding
+        self._invocation_identity_set = bool(
+            binding.get("operation_id")
+            and binding.get("provider_id")
+            and binding.get("model_id")
+        )
+
+    def configure_invocation_journal(self, journal: Any) -> None:
+        """Bind one durable invocation journal and its binding on the model."""
+        self._invocation_journal = journal
+        binding = getattr(journal, "binding", None)
+        if isinstance(binding, Mapping):
+            normalized = invocation_binding_from_identity(binding)
+            self._invocation_binding = normalized
+            self._invocation_identity_set = bool(
+                normalized.get("operation_id")
+                and normalized.get("provider_id")
+                and normalized.get("model_id")
+            )
+
+    def invocations(self) -> list[dict[str, Any]]:
+        """In-memory receipts recorded by this model instance."""
+        return list(self._recorded_invocations)
 
     def _journal_ask(self, turn_id: str, prompt: str) -> None:
         if self._recovery_journal is not None:
@@ -1576,12 +1623,211 @@ class OpenCLIWebChatModel(BaseChatModel):
                 response_finished=response_ref[0],
             )
 
+    def _wall_now(self) -> str:
+        return (
+            datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+    def _attempt_active_latency(self, attempt: Mapping[str, Any]) -> Any:
+        started = attempt.get("active_started_monotonic")
+        if not isinstance(started, (int, float)):
+            return NOT_MEASURED
+        return round(self._clock() - float(started), 6)
+
+    def _begin_invocation_attempt(
+        self, prompt: str, *, new_conversation: bool
+    ) -> dict[str, Any] | None:
+        if not self._invocation_identity_set:
+            return None
+        try:
+            prompt_envelope = json.loads(prompt)
+        except (json.JSONDecodeError, TypeError):
+            prompt_envelope = {}
+        if not isinstance(prompt_envelope, Mapping):
+            prompt_envelope = {}
+        turn_id = str(prompt_envelope.get("turn_id") or "")
+        count = self._web_attempt_counts.get(turn_id, 0) + 1
+        self._web_attempt_counts[turn_id] = count
+        prior_conversation_id = self._conversation_id
+        prior_conversation_id_sha256 = (
+            hashlib.sha256(prior_conversation_id.encode("utf-8")).hexdigest()
+            if isinstance(prior_conversation_id, str) and prior_conversation_id
+            else NOT_MEASURED
+        )
+        prompt_bytes = prompt.encode("utf-8")
+        setup = self._last_setup_latency_seconds
+        self._last_setup_latency_seconds = None
+        return {
+            "backend_id": MODEL_INVOCATION_BACKEND_ID,
+            "backend_identity": {
+                "executable": str(self.executable),
+                "opencli_profile": str(self.opencli_profile),
+                "site_session": str(self.site_session),
+            },
+            "turn_id": turn_id,
+            "attempt_ordinal": count,
+            "new_conversation": bool(new_conversation),
+            "resume_required": bool(self._repair_resume_used),
+            "prior_conversation_id": prior_conversation_id,
+            "prior_conversation_id_sha256": prior_conversation_id_sha256,
+            "conversation_id_sha256": None,
+            "timeout_phase": "ask",
+            "started_at": self._wall_now(),
+            "started_monotonic": round(self._clock(), 6),
+            "finished_monotonic": NOT_MEASURED,
+            "setup_latency_seconds": setup if setup is not None else NOT_MEASURED,
+            "active_latency_seconds": NOT_MEASURED,
+            "readback_latency_seconds": NOT_MEASURED,
+            "total_latency_seconds": NOT_MEASURED,
+            "request_bytes": len(prompt_bytes),
+            "request_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
+        }
+
+    def _failure_conversation_hash(self, attempt: Mapping[str, Any]) -> Any:
+        if attempt.get("new_conversation"):
+            return NOT_MEASURED
+        prior = attempt.get("prior_conversation_id")
+        if isinstance(prior, str) and prior:
+            return hashlib.sha256(prior.encode("utf-8")).hexdigest()
+        return NOT_MEASURED
+
+    def _timeout_class_for(self, attempt: Mapping[str, Any], error_code: str) -> Any:
+        timeout_family = frozenset({
+            "OPENCLI_WEB_TIMEOUT",
+            "OPENCLI_WEB_TIMEOUT_RECONCILE_UNKNOWN",
+            "OPENCLI_WEB_RESUME_REQUIRED",
+            "OPENCLI_WEB_REPAIR_RESUME_EXHAUSTED",
+        })
+        phase = str(attempt.get("timeout_phase") or "NOT_MEASURED")
+        if error_code in timeout_family or attempt.get("recovered_after_timeout"):
+            return phase if phase in {"ask", "readback", "reconcile"} else "ask"
+        return NOT_MEASURED
+
+    def _ask_telemetry(self, stdout: str) -> dict[str, Any]:
+        telemetry: dict[str, Any] = {
+            "input_tokens": NOT_MEASURED,
+            "output_tokens": NOT_MEASURED,
+            "cached_tokens": NOT_MEASURED,
+            "provider_model_revision": NOT_MEASURED,
+        }
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            return telemetry
+        if not isinstance(payload, list) or not payload or not isinstance(payload[0], Mapping):
+            return telemetry
+        head = payload[0]
+        for key in ("input_tokens", "output_tokens", "cached_tokens"):
+            value = head.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                telemetry[key] = value
+            elif isinstance(value, str) and value.strip().isdigit():
+                telemetry[key] = int(value.strip())
+        model_revision = head.get("model")
+        if isinstance(model_revision, str) and model_revision:
+            telemetry["provider_model_revision"] = model_revision
+        return telemetry
+
+    def _emit_invocation(self, attempt: Mapping[str, Any]) -> None:
+        if not self._invocation_identity_set:
+            return
+        binding = dict(self._invocation_binding or {})
+        try:
+            receipt = build_model_invocation_receipt(binding, attempt)
+        except ModelInvocationError:
+            return
+        self._recorded_invocations.append(receipt)
+        journal = self._invocation_journal
+        if journal is not None:
+            try:
+                journal.record(receipt)
+            except Exception:
+                pass
+
+    def _finalize_invocation_failure(
+        self, attempt: dict[str, Any] | None, exc: BaseException
+    ) -> None:
+        if attempt is None:
+            return
+        finished = self._clock()
+        error_class = str(exc)
+        outcome = classify_transport_outcome(error_class)
+        attempt["finished_monotonic"] = round(finished, 6)
+        attempt["total_latency_seconds"] = round(finished - attempt["started_monotonic"], 6)
+        attempt["error_class"] = error_class
+        attempt["transport_outcome"] = outcome
+        attempt["provider_status"] = provider_status_for_error(error_class)
+        attempt["response_valid"] = (
+            False if outcome == TRANSPORT_OUTCOME_INVALID_RESPONSE else NOT_MEASURED
+        )
+        attempt["external_effect_outcome_known"] = external_outcome_known_for_error(error_class)
+        attempt["blind_replay_prohibited"] = True
+        attempt["timeout_class"] = self._timeout_class_for(attempt, error_class)
+        if attempt.get("conversation_id_sha256") is None:
+            attempt["conversation_id_sha256"] = self._failure_conversation_hash(attempt)
+        self._emit_invocation(attempt)
+
+    def _finalize_invocation_success(
+        self, attempt: dict[str, Any] | None, response: str
+    ) -> None:
+        if attempt is None:
+            return
+        finished = self._clock()
+        current = self._conversation_id
+        conversation_id_sha256 = (
+            hashlib.sha256(current.encode("utf-8")).hexdigest()
+            if isinstance(current, str) and current
+            else NOT_MEASURED
+        )
+        attempt["finished_monotonic"] = round(finished, 6)
+        attempt["total_latency_seconds"] = round(finished - attempt["started_monotonic"], 6)
+        attempt["response_bytes"] = len(response.encode("utf-8"))
+        attempt["response_sha256"] = hashlib.sha256(response.encode("utf-8")).hexdigest()
+        attempt["conversation_id_sha256"] = conversation_id_sha256
+        attempt["transport_outcome"] = TRANSPORT_OUTCOME_OBSERVED_OK
+        attempt["provider_status"] = "ok"
+        attempt["error_class"] = NOT_MEASURED
+        attempt["response_valid"] = True
+        attempt["external_effect_outcome_known"] = True
+        attempt["blind_replay_prohibited"] = False
+        attempt["timeout_class"] = self._timeout_class_for(attempt, NOT_MEASURED)
+        attempt["recovered_after_timeout"] = bool(attempt.get("recovered_after_timeout"))
+        attempt["resume_required"] = bool(attempt.get("resume_required"))
+        self._emit_invocation(attempt)
+
     def _execute_web_send(
         self,
         prompt: str,
         *,
         response_finished_ref: list[bool] | None,
         new_conversation: bool = False,
+    ) -> str:
+        attempt = self._begin_invocation_attempt(prompt, new_conversation=new_conversation)
+        try:
+            response = self._execute_web_send_inner(
+                prompt,
+                response_finished_ref=response_finished_ref,
+                new_conversation=new_conversation,
+                attempt=attempt,
+            )
+        except Exception as exc:
+            self._finalize_invocation_failure(attempt, exc)
+            raise
+        self._finalize_invocation_success(attempt, response)
+        return response
+
+    def _execute_web_send_inner(
+        self,
+        prompt: str,
+        *,
+        response_finished_ref: list[bool] | None,
+        new_conversation: bool = False,
+        attempt: dict[str, Any] | None = None,
     ) -> str:
         self._late_readback_used = False
         try:
@@ -1610,15 +1856,22 @@ class OpenCLIWebChatModel(BaseChatModel):
             "-f",
             "json",
         ])
+        if attempt is not None:
+            attempt["active_started_monotonic"] = self._clock()
         try:
             stdout = self._run(argv)
         except OpenCLIWebModelError as exc:
+            if attempt is not None:
+                attempt["active_latency_seconds"] = self._attempt_active_latency(attempt)
             if str(exc) == "OPENCLI_WEB_BUSY":
                 self._cooldown_and_probe_status()
             if str(exc) != "OPENCLI_WEB_TIMEOUT" or not turn_id:
                 raise
             if response_finished_ref is not None:
                 response_finished_ref[0] = True
+            if attempt is not None:
+                attempt["recovered_after_timeout"] = True
+                attempt["timeout_phase"] = "reconcile"
             if new_conversation:
                 if turn_id.startswith("turn_repair_"):
                     return self._reconcile_fresh_repair_timeout(
@@ -1639,7 +1892,14 @@ class OpenCLIWebChatModel(BaseChatModel):
             raise OpenCLIWebModelError("OPENCLI_WEB_CONVERSATION_ID_MISMATCH")
         self._conversation_id = conversation_id
         self._journal_bound(conversation_id)
+        if attempt is not None:
+            attempt["active_latency_seconds"] = self._attempt_active_latency(attempt)
+            attempt.update(self._ask_telemetry(stdout))
+            attempt["timeout_phase"] = "readback"
+        readback_started = self._clock()
         response = self._detail_response(conversation_id, wait=True, turn_id=turn_id)
+        if attempt is not None:
+            attempt["readback_latency_seconds"] = round(self._clock() - readback_started, 6)
         self._journal_response(turn_id, response)
         if response_finished_ref is not None:
             response_finished_ref[0] = True
@@ -2290,7 +2550,11 @@ class OpenCLIWebChatModel(BaseChatModel):
         # local and avoids probing the external CLI before their send hook.
         send_impl = getattr(self._send_and_reconcile, "__func__", None)
         if send_impl is OpenCLIWebChatModel._send_and_reconcile:
+            setup_started = self._clock()
             self._select_intelligence_level()
+            self._last_setup_latency_seconds = round(
+                self._clock() - setup_started, 6
+            )
         prompt = self._render_prompt(messages, normalized_tools, tool_choice)
         turn_id = str(json.loads(prompt)["turn_id"])
         response = self._send_and_reconcile(prompt, budget_reserved=True)
