@@ -709,10 +709,7 @@ def _exposure_receipt(
 def _invocation_receipts(invocation_journal: Any) -> list[dict[str, Any]]:
     if invocation_journal is None:
         return []
-    try:
-        return invocation_journal.result_invocations()
-    except Exception:
-        return []
+    return invocation_journal.result_invocations()
 
 
 def _recorded_payload(output: Any, tool_name: str) -> dict[str, Any] | None:

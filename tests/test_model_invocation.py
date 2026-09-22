@@ -190,6 +190,18 @@ class TestJournalReadFailClosed:
         assert "MODEL_INVOCATION_RECORD_CORRUPT" in str(exc.value)
 
 
+    def test_cli_receipt_projection_preserves_fail_closed_corrupt_journal(self):
+        from nexus_open_swe_runtime.cli import _invocation_receipts
+
+        state_root, journal = _fresh_journal()
+        journal.record(_receipt())
+        inv_root = state_root / "recovery" / "invocations"
+        target = next(inv_root.iterdir())
+        target.write_text("{not-json", encoding="utf-8")
+        with pytest.raises(ModelInvocationError, match="MODEL_INVOCATION_RECORD_CORRUPT"):
+            _invocation_receipts(journal)
+
+
 class TestJournalRoundTrip:
     def test_round_trip_is_idempotent_and_filters_by_binding_operation(self):
         state_root, journal = _fresh_journal()
