@@ -19,6 +19,12 @@ from langchain_core.tools import tool
 
 from nexus_open_swe_runtime import cli
 from nexus_open_swe_runtime import opencli_web_model as web_model
+from nexus_open_swe_runtime.model_invocation import (
+    DurableInvocationJournal,
+    ModelInvocationError,
+    invocation_binding_from_identity,
+    observed_execution_identity,
+)
 from nexus_open_swe_runtime.opencli_web_model import (
     _DURABLE_STATE_SCHEMA,
     OPENCLI_WEB_PROTOCOL,
@@ -59,7 +65,12 @@ def _use_fake_clock(model: OpenCLIWebChatModel) -> _FakeClock:
     return clock
 
 
-def _fake_process(monkeypatch: pytest.MonkeyPatch, response: str):
+def _fake_process(
+    monkeypatch: pytest.MonkeyPatch,
+    response: str,
+    *,
+    ask_extra: dict[str, object] | None = None,
+):
     calls: list[tuple[list[str], dict[str, object]]] = []
     latest_prompt = ""
 
@@ -71,16 +82,17 @@ def _fake_process(monkeypatch: pytest.MonkeyPatch, response: str):
             return SimpleNamespace(returncode=0, stdout='[{"Status":"ok"}]', stderr="")
         if args[1:3] == ["chatgpt", "ask"]:
             latest_prompt = args[3]
+            ask_payload = {
+                "conversationId": "web-conversation-1",
+                "conversationUrl": "https://chatgpt.com/c/web-conversation-1",
+                "tool": "chatgpt",
+                "response": "",
+            }
+            if ask_extra:
+                ask_payload.update(ask_extra)
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps([
-                    {
-                        "conversationId": "web-conversation-1",
-                        "conversationUrl": "https://chatgpt.com/c/web-conversation-1",
-                        "tool": "chatgpt",
-                        "response": "",
-                    }
-                ]),
+                stdout=json.dumps([ask_payload]),
                 stderr="",
             )
         if args[1:3] == ["chatgpt", "detail"]:
@@ -4563,3 +4575,111 @@ def test_r23_composite_repair_equivalence_and_refresh_use_local_projection(
 
     mismatch = projected.replace('writes \\"quoted\\"', 'writes \\"changed\\"')
     assert OpenCLIWebChatModel._inverse_repaired_composite_response(mismatch) is None
+
+
+
+def _invocation_identity_for_opencli():
+    return {
+        "operation_id": "operation-opencli-identity",
+        "provider_id": "opencli_chatgpt",
+        "model_id": "advanced",
+        "worker_identity_sha256": "w" * 64,
+        "transport_config_sha256": "t" * 64,
+        "runtime_identity_sha256": "r" * 64,
+        "core_binding_hash": "c" * 64,
+        "acceptance_contract_hash": "a" * 64,
+        "effect_authorization_hash": "e" * 64,
+        "tool_projection_hash": "p" * 64,
+        "workspace": "/workspace",
+        "checkpoint_namespace": "open-swe-repair-v1",
+    }
+
+
+def test_opencli_invocation_receipt_keeps_configured_and_observed_identity_distinct(
+    tmp_path, monkeypatch
+):
+    _fake_process(
+        monkeypatch,
+        '{"type":"final","content":"bounded answer"}',
+        ask_extra={
+            "tool": "physical-chatgpt-provider",
+            "model": "physical-model-r1",
+        },
+    )
+    identity = _invocation_identity_for_opencli()
+    journal = DurableInvocationJournal(tmp_path, identity)
+    model = OpenCLIWebChatModel(
+        executable="/opt/opencli",
+        intelligence_level="advanced",
+        timeout_seconds=41,
+    )
+    model.configure_invocation_identity(identity)
+    model.configure_invocation_journal(journal)
+
+    result = model.invoke([HumanMessage(content="inspect once")])
+    receipts = journal.result_invocations()
+
+    assert result.content == "bounded answer"
+    assert len(receipts) == 1
+    receipt = receipts[0]
+    assert receipt["provider_id"] == "opencli_chatgpt"
+    assert receipt["model_id"] == "advanced"
+    assert observed_execution_identity(receipt) == {
+        "provider_id": "physical-chatgpt-provider",
+        "model_id": "physical-model-r1",
+        "model_revision": "physical-model-r1",
+        "observation_source": "opencli.ask:tool,model",
+    }
+
+
+def test_opencli_missing_physical_model_identity_is_not_filled_from_configured(
+    tmp_path, monkeypatch
+):
+    _fake_process(
+        monkeypatch,
+        '{"type":"final","content":"bounded answer"}',
+        ask_extra={"tool": "physical-chatgpt-provider"},
+    )
+    identity = _invocation_identity_for_opencli()
+    journal = DurableInvocationJournal(tmp_path, identity)
+    model = OpenCLIWebChatModel(
+        executable="/opt/opencli",
+        intelligence_level="advanced",
+        timeout_seconds=41,
+    )
+    model.configure_invocation_journal(journal)
+
+    model.invoke([HumanMessage(content="inspect once")])
+    receipt = journal.result_invocations()[0]
+    observed = observed_execution_identity(receipt)
+
+    assert receipt["model_id"] == "advanced"
+    assert observed["provider_id"] == "physical-chatgpt-provider"
+    assert observed["model_id"] == "NOT_MEASURED"
+    assert observed["model_revision"] == "NOT_MEASURED"
+    assert observed["observation_source"] == "opencli.ask:tool"
+
+
+def test_opencli_invocation_journal_failure_is_not_silently_dropped(monkeypatch):
+    _fake_process(
+        monkeypatch,
+        '{"type":"final","content":"bounded answer"}',
+        ask_extra={"tool": "physical-provider", "model": "physical-model"},
+    )
+    identity = _invocation_identity_for_opencli()
+
+    class FailingJournal:
+        binding = invocation_binding_from_identity(identity)
+
+        def record(self, _receipt):
+            raise ModelInvocationError("MODEL_INVOCATION_PERSISTENCE_FAILED")
+
+    model = OpenCLIWebChatModel(
+        executable="/opt/opencli",
+        intelligence_level="advanced",
+        timeout_seconds=41,
+    )
+    model.configure_invocation_journal(FailingJournal())
+
+    with pytest.raises(ModelInvocationError, match="MODEL_INVOCATION_PERSISTENCE_FAILED"):
+        model.invoke([HumanMessage(content="inspect once")])
