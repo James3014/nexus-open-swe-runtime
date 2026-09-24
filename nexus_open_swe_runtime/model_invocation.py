@@ -522,7 +522,10 @@ class InvocationEvidenceChatModel(BaseChatModel):
     ) -> BaseChatModel:
         if not hasattr(self._delegate, "bind_tools"):
             raise ModelInvocationError("MODEL_INVOCATION_BIND_TOOLS_UNSUPPORTED")
-        bound = self._delegate.bind_tools(tools, tool_choice=tool_choice, **kwargs)
+        bind_kwargs = dict(kwargs)
+        if tool_choice is not None:
+            bind_kwargs["tool_choice"] = tool_choice
+        bound = self._delegate.bind_tools(tools, **bind_kwargs)
         return InvocationEvidenceChatModel(
             delegate=bound,
             configured_provider_id=self.configured_provider_id,
@@ -654,10 +657,23 @@ class DurableInvocationJournal:
     def record(self, receipt: Mapping[str, Any]) -> None:
         receipt = _validated_receipt(receipt, self.binding)
         self._ensure_root()
-        _fsync_replace(
-            self.journal_root / f"{receipt['invocation_id']}.json",
-            receipt,
-        )
+        path = self.journal_root / f"{receipt['invocation_id']}.json"
+        if path.is_symlink():
+            raise ModelInvocationError("MODEL_INVOCATION_STATE_SYMLINK")
+        if path.exists():
+            try:
+                existing_raw = json.loads(path.read_text(encoding="utf-8"))
+                existing = _validated_receipt(existing_raw, self.binding)
+            except (OSError, ValueError) as exc:
+                raise ModelInvocationError("MODEL_INVOCATION_RECORD_CORRUPT") from exc
+            except ModelInvocationError as exc:
+                if str(exc) == "MODEL_INVOCATION_IDENTITY_MISMATCH":
+                    raise
+                raise ModelInvocationError("MODEL_INVOCATION_RECORD_CORRUPT") from exc
+            if existing == receipt:
+                return
+            raise ModelInvocationError("MODEL_INVOCATION_RECEIPT_CONFLICT")
+        _fsync_replace(path, receipt)
 
     def result_invocations(self, *, operation_id: str | None = None) -> list[dict[str, Any]]:
         if not self.journal_root.is_dir():
