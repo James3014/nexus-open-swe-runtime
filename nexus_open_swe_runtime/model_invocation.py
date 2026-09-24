@@ -5,8 +5,16 @@ import hashlib
 import json
 import os
 import tempfile
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
+
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from pydantic import PrivateAttr
 
 """Model-invocation execution evidence.
 
@@ -248,6 +256,20 @@ def build_model_invocation_receipt(
         "new_conversation": attempt.get("new_conversation", False),
     }))
     invocation_id = f"inv_{invocation_identity}"
+    backend_identity = dict(attempt.get("backend_identity") or {})
+    backend_identity["configured_identity"] = {
+        "provider_id": provider_id,
+        "model_id": model_id,
+    }
+    backend_identity["observed_execution_identity"] = {
+        "provider_id": attempt.get("observed_provider_id", NOT_MEASURED),
+        "model_id": attempt.get("observed_model_id", NOT_MEASURED),
+        "model_revision": attempt.get(
+            "observed_model_revision",
+            attempt.get("provider_model_revision", NOT_MEASURED),
+        ),
+        "observation_source": attempt.get("identity_observation_source", NOT_MEASURED),
+    }
     receipt: dict[str, Any] = {
         "schema": MODEL_INVOCATION_RECEIPT_SCHEMA,
         "authority_kind": MODEL_INVOCATION_AUTHORITY_KIND,
@@ -256,7 +278,7 @@ def build_model_invocation_receipt(
         "model_id": model_id,
         "provider_model_revision": attempt.get("provider_model_revision", NOT_MEASURED),
         "backend_id": backend_id,
-        "backend_identity": dict(attempt.get("backend_identity") or {}),
+        "backend_identity": backend_identity,
         "worker_identity_sha256": str(binding.get("worker_identity_sha256") or ""),
         "core_binding_hash": str(binding.get("core_binding_hash") or ""),
         "acceptance_contract_hash": str(binding.get("acceptance_contract_hash") or ""),
