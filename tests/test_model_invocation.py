@@ -294,7 +294,11 @@ def test_generic_transport_records_response_owned_observed_identity(tmp_path):
                 "model_name": "physical-model-b",
                 "system_fingerprint": "physical-revision-b",
             },
-            usage_metadata={"input_tokens": 10, "output_tokens": 4},
+            usage_metadata={
+                "input_tokens": 10,
+                "output_tokens": 4,
+                "total_tokens": 14,
+            },
         )
     )
     identity = _generic_identity()
