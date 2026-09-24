@@ -32,7 +32,6 @@ from .model_invocation import (
     NOT_MEASURED,
     TRANSPORT_OUTCOME_INVALID_RESPONSE,
     TRANSPORT_OUTCOME_OBSERVED_OK,
-    ModelInvocationError,
     build_model_invocation_receipt,
     classify_transport_outcome,
     external_outcome_known_for_error,
