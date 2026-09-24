@@ -11,9 +11,13 @@ from types import SimpleNamespace
 from typing import TypedDict
 
 import pytest
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from nexus_open_swe_runtime import cli
+from nexus_open_swe_runtime.model_invocation import (
+    InvocationEvidenceChatModel,
+    observed_execution_identity,
+)
 from nexus_open_swe_runtime.opencli_web_model import OpenCLIWebChatModel, _tool_call_id
 from nexus_open_swe_runtime.recovery import (
     DurableEffectJournal,
@@ -4709,3 +4713,172 @@ def test_wave2_projection_missing_required_terminal_tool_blocks_before_repair_in
     assert result["error_code"] == "OPEN_SWE_TOOL_PROJECTION_REQUIRED_TOOL_MISSING"
     assert diagnosis.calls == 1
     assert repair.calls == 0
+
+
+
+class _IdentityDelegate:
+    def __init__(self, provider: str, model: str, revision: str):
+        self.provider = provider
+        self.model = model
+        self.revision = revision
+        self.calls = 0
+
+    def bind_tools(self, _tools, **_kwargs):
+        return self
+
+    def invoke(self, _messages, **_kwargs):
+        self.calls += 1
+        return AIMessage(
+            content="physical response",
+            response_metadata={
+                "model_provider": self.provider,
+                "model_name": self.model,
+                "system_fingerprint": self.revision,
+            },
+        )
+
+
+class _InvokingGraph(FakeGraph):
+    def __init__(self, model, surface, output=None, effect=None):
+        super().__init__(surface, output=output, effect=effect)
+        self.model = model
+
+    def invoke(self, payload, config=None):
+        messages = payload.get("messages") if isinstance(payload, dict) else None
+        self.model.invoke(
+            messages if isinstance(messages, list) else [HumanMessage(content="physical call")]
+        )
+        return super().invoke(payload, config=config)
+
+
+def test_build_model_wraps_generic_provider_in_invocation_evidence_model():
+    delegate = _IdentityDelegate("physical-provider", "physical-model", "physical-r1")
+    model = cli._build_model(
+        {"init_chat_model": lambda **_kwargs: delegate},
+        "configured-provider",
+        "configured-model",
+    )
+
+    assert isinstance(model, InvocationEvidenceChatModel)
+    assert model.configured_provider_id == "configured-provider"
+    assert model.configured_model_id == "configured-model"
+
+
+def test_semantic_run_projects_generic_transport_physical_identity_receipt(tmp_path):
+    request = _semantic_request(tmp_path)
+    delegate = _IdentityDelegate(
+        "physical-google-provider",
+        "physical-gemini-model",
+        "physical-gemini-r1",
+    )
+    runtime = {
+        "human_message": lambda content: HumanMessage(content=content),
+        "init_chat_model": lambda **_kwargs: delegate,
+    }
+
+    def graph_factory(model, _root, _runtime_value, _key):
+        return _InvokingGraph(
+            model,
+            cli.SEMANTIC_TOOLS,
+            _record(
+                "record_finding",
+                {"schema": "external_execution_envelope.v1", "binding": {}},
+            ),
+        )
+
+    result = cli._semantic_run(
+        request,
+        runtime_loader=lambda: runtime,
+        model_factory=cli._build_model,
+        graph_factory=graph_factory,
+    )
+
+    assert result["status"] == "INTELLIGENCE_COMPLETED"
+    assert delegate.calls == 1
+    receipts = result["model_invocation_receipts"]
+    assert len(receipts) == 1
+    receipt = receipts[0]
+    assert receipt["provider_id"] == "google_genai"
+    assert receipt["model_id"] == "gemini-test"
+    assert observed_execution_identity(receipt) == {
+        "provider_id": "physical-google-provider",
+        "model_id": "physical-gemini-model",
+        "model_revision": "physical-gemini-r1",
+        "observation_source": (
+            "langchain.response_metadata:model_provider,model_name,system_fingerprint"
+        ),
+    }
+
+
+def test_worker_diagnosis_and_repair_share_cross_transport_identity_invariant(tmp_path):
+    request = _worker_request(tmp_path)
+    workspace = Path(request["workspace_path"])
+    delegates: list[_IdentityDelegate] = []
+
+    def model_factory(_runtime_value, provider, model_id, _transport_config, _state_root):
+        phase = len(delegates) + 1
+        delegate = _IdentityDelegate(
+            f"physical-provider-{phase}",
+            f"physical-model-{phase}",
+            f"physical-r{phase}",
+        )
+        delegates.append(delegate)
+        return InvocationEvidenceChatModel(
+            delegate=delegate,
+            configured_provider_id=provider,
+            configured_model_id=model_id,
+        )
+
+    def diagnosis_factory(model, *_args, **_kwargs):
+        return _InvokingGraph(
+            model,
+            cli.DIAGNOSIS_TOOLS,
+            _record(
+                "record_diagnosis",
+                {
+                    "status": "ROOT_CAUSE_SUPPORTED",
+                    "summary": "a.py contains the failing value",
+                    "evidence_paths": ["a.py"],
+                },
+            ),
+        )
+
+    def repair_factory(model, *_args, **_kwargs):
+        return _InvokingGraph(
+            model,
+            cli.REPAIR_TOOLS,
+            _record("record_worker_result", {"summary": "repaired a.py"}),
+            effect=lambda: (workspace / "a.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            ),
+        )
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=model_factory,
+        diagnosis_factory=diagnosis_factory,
+        repair_factory=repair_factory,
+    )
+
+    assert result["status"] == "COMPLETED"
+    receipts = result["model_invocation_receipts"]
+    assert len(receipts) == 2
+    assert [item["provider_id"] for item in receipts] == [
+        "google_genai",
+        "google_genai",
+    ]
+    assert [item["model_id"] for item in receipts] == [
+        "gemini-test",
+        "gemini-test",
+    ]
+    observed = [observed_execution_identity(item) for item in receipts]
+    assert [item["provider_id"] for item in observed] == [
+        "physical-provider-1",
+        "physical-provider-2",
+    ]
+    assert [item["model_id"] for item in observed] == [
+        "physical-model-1",
+        "physical-model-2",
+    ]
+    assert all(delegate.calls == 1 for delegate in delegates)
