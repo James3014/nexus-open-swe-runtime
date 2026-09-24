@@ -32,7 +32,6 @@ from .model_invocation import (
     NOT_MEASURED,
     TRANSPORT_OUTCOME_INVALID_RESPONSE,
     TRANSPORT_OUTCOME_OBSERVED_OK,
-    ModelInvocationError,
     build_model_invocation_receipt,
     classify_transport_outcome,
     external_outcome_known_for_error,
@@ -1684,6 +1683,10 @@ class OpenCLIWebChatModel(BaseChatModel):
             "total_latency_seconds": NOT_MEASURED,
             "request_bytes": len(prompt_bytes),
             "request_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
+            "observed_provider_id": NOT_MEASURED,
+            "observed_model_id": NOT_MEASURED,
+            "observed_model_revision": NOT_MEASURED,
+            "identity_observation_source": NOT_MEASURED,
         }
 
     def _failure_conversation_hash(self, attempt: Mapping[str, Any]) -> Any:
@@ -1712,6 +1715,10 @@ class OpenCLIWebChatModel(BaseChatModel):
             "output_tokens": NOT_MEASURED,
             "cached_tokens": NOT_MEASURED,
             "provider_model_revision": NOT_MEASURED,
+            "observed_provider_id": NOT_MEASURED,
+            "observed_model_id": NOT_MEASURED,
+            "observed_model_revision": NOT_MEASURED,
+            "identity_observation_source": NOT_MEASURED,
         }
         try:
             payload = json.loads(stdout)
@@ -1728,26 +1735,33 @@ class OpenCLIWebChatModel(BaseChatModel):
                 telemetry[key] = value
             elif isinstance(value, str) and value.strip().isdigit():
                 telemetry[key] = int(value.strip())
+        observed_keys: list[str] = []
+        provider = head.get("tool")
+        if isinstance(provider, str) and provider.strip():
+            telemetry["observed_provider_id"] = provider.strip()
+            observed_keys.append("tool")
         model_revision = head.get("model")
-        if isinstance(model_revision, str) and model_revision:
-            telemetry["provider_model_revision"] = model_revision
+        if isinstance(model_revision, str) and model_revision.strip():
+            observed_model = model_revision.strip()
+            telemetry["provider_model_revision"] = observed_model
+            telemetry["observed_model_id"] = observed_model
+            telemetry["observed_model_revision"] = observed_model
+            observed_keys.append("model")
+        if observed_keys:
+            telemetry["identity_observation_source"] = (
+                "opencli.ask:" + ",".join(observed_keys)
+            )
         return telemetry
 
     def _emit_invocation(self, attempt: Mapping[str, Any]) -> None:
         if not self._invocation_identity_set:
             return
         binding = dict(self._invocation_binding or {})
-        try:
-            receipt = build_model_invocation_receipt(binding, attempt)
-        except ModelInvocationError:
-            return
-        self._recorded_invocations.append(receipt)
+        receipt = build_model_invocation_receipt(binding, attempt)
         journal = self._invocation_journal
         if journal is not None:
-            try:
-                journal.record(receipt)
-            except Exception:
-                pass
+            journal.record(receipt)
+        self._recorded_invocations.append(receipt)
 
     def _finalize_invocation_failure(
         self, attempt: dict[str, Any] | None, exc: BaseException

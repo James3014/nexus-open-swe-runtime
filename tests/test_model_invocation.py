@@ -6,14 +6,18 @@ import shutil
 import tempfile
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage
 
 from nexus_open_swe_runtime.model_invocation import (
     MODEL_INVOCATION_RECEIPT_FIELDS,
     MODEL_INVOCATION_RECEIPT_SCHEMA,
+    NOT_MEASURED,
     DurableInvocationJournal,
+    InvocationEvidenceChatModel,
     ModelInvocationError,
     build_model_invocation_receipt,
     invocation_binding_from_identity,
+    observed_execution_identity,
 )
 
 
@@ -225,3 +229,180 @@ class TestJournalRoundTrip:
     def test_result_invocations_empty_before_any_record(self):
         state_root, journal = _fresh_journal()
         assert journal.result_invocations() == []
+
+
+
+class _GenericDelegate:
+    def __init__(self, message):
+        self.message = message
+        self.calls = 0
+
+    def bind_tools(self, _tools, **_kwargs):
+        return self
+
+    def invoke(self, _messages, **_kwargs):
+        self.calls += 1
+        return self.message
+
+
+def _generic_identity():
+    return {
+        **_identity(),
+        "provider_id": "configured-provider",
+        "model_id": "configured-model",
+    }
+
+
+def test_missing_observed_identity_never_falls_back_to_configured_identity():
+    receipt = _receipt()
+    observed = observed_execution_identity(receipt)
+
+    assert receipt["provider_id"] == "opencli-chatgpt-web"
+    assert receipt["model_id"] == "chatgpt-4o"
+    assert observed["provider_id"] == NOT_MEASURED
+    assert observed["model_id"] == NOT_MEASURED
+    assert observed["model_revision"] == NOT_MEASURED
+
+
+def test_configured_a_and_observed_b_remain_distinct_hash_bound_evidence():
+    receipt = _receipt(
+        attempt=_attempt(
+            observed_provider_id="physical-provider-b",
+            observed_model_id="physical-model-b",
+            observed_model_revision="physical-revision-b",
+            identity_observation_source="test.response_metadata",
+        )
+    )
+    observed = observed_execution_identity(receipt)
+
+    assert receipt["provider_id"] == "opencli-chatgpt-web"
+    assert receipt["model_id"] == "chatgpt-4o"
+    assert observed == {
+        "provider_id": "physical-provider-b",
+        "model_id": "physical-model-b",
+        "model_revision": "physical-revision-b",
+        "observation_source": "test.response_metadata",
+    }
+
+
+def test_generic_transport_records_response_owned_observed_identity(tmp_path):
+    delegate = _GenericDelegate(
+        AIMessage(
+            content="physical response",
+            response_metadata={
+                "model_provider": "physical-provider-b",
+                "model_name": "physical-model-b",
+                "system_fingerprint": "physical-revision-b",
+            },
+            usage_metadata={
+                "input_tokens": 10,
+                "output_tokens": 4,
+                "total_tokens": 14,
+            },
+        )
+    )
+    identity = _generic_identity()
+    journal = DurableInvocationJournal(tmp_path, identity)
+    model = InvocationEvidenceChatModel(
+        delegate=delegate,
+        configured_provider_id="configured-provider",
+        configured_model_id="configured-model",
+    )
+    model.configure_invocation_identity(identity)
+    model.configure_invocation_journal(journal)
+
+    result = model.invoke([HumanMessage(content="run once")])
+    receipts = journal.result_invocations()
+
+    assert result.content == "physical response"
+    assert delegate.calls == 1
+    assert len(receipts) == 1
+    receipt = receipts[0]
+    assert receipt["provider_id"] == "configured-provider"
+    assert receipt["model_id"] == "configured-model"
+    assert observed_execution_identity(receipt) == {
+        "provider_id": "physical-provider-b",
+        "model_id": "physical-model-b",
+        "model_revision": "physical-revision-b",
+        "observation_source": (
+            "langchain.response_metadata:model_provider,model_name,system_fingerprint"
+        ),
+    }
+    assert receipt["input_tokens"] == 10
+    assert receipt["output_tokens"] == 4
+
+
+def test_generic_transport_missing_response_identity_stays_not_measured(tmp_path):
+    delegate = _GenericDelegate(AIMessage(content="no identity metadata"))
+    identity = _generic_identity()
+    journal = DurableInvocationJournal(tmp_path, identity)
+    model = InvocationEvidenceChatModel(
+        delegate=delegate,
+        configured_provider_id="configured-provider",
+        configured_model_id="configured-model",
+    )
+    model.configure_invocation_journal(journal)
+
+    model.invoke([HumanMessage(content="run once")])
+    observed = observed_execution_identity(journal.result_invocations()[0])
+
+    assert observed["provider_id"] == NOT_MEASURED
+    assert observed["model_id"] == NOT_MEASURED
+    assert observed["model_revision"] == NOT_MEASURED
+    assert observed["observation_source"] == NOT_MEASURED
+
+
+def test_generic_transport_receipt_persistence_failure_is_not_silently_dropped():
+    delegate = _GenericDelegate(
+        AIMessage(
+            content="physical response",
+            response_metadata={
+                "model_provider": "physical-provider",
+                "model_name": "physical-model",
+            },
+        )
+    )
+    identity = _generic_identity()
+
+    class FailingJournal:
+        binding = invocation_binding_from_identity(identity)
+
+        def record(self, _receipt):
+            raise ModelInvocationError("MODEL_INVOCATION_PERSISTENCE_FAILED")
+
+    model = InvocationEvidenceChatModel(
+        delegate=delegate,
+        configured_provider_id="configured-provider",
+        configured_model_id="configured-model",
+    )
+    model.configure_invocation_journal(FailingJournal())
+
+    with pytest.raises(ModelInvocationError, match="MODEL_INVOCATION_PERSISTENCE_FAILED"):
+        model.invoke([HumanMessage(content="run once")])
+    assert delegate.calls == 1
+
+
+def test_same_invocation_id_cannot_be_rewritten_with_different_observed_identity():
+    _state_root, journal = _fresh_journal()
+    first = _receipt(
+        attempt=_attempt(
+            observed_provider_id="provider-a",
+            observed_model_id="model-a",
+            observed_model_revision="revision-a",
+            identity_observation_source="response-a",
+        )
+    )
+    second = _receipt(
+        attempt=_attempt(
+            observed_provider_id="provider-b",
+            observed_model_id="model-b",
+            observed_model_revision="revision-b",
+            identity_observation_source="response-b",
+        )
+    )
+    assert first["invocation_id"] == second["invocation_id"]
+    journal.record(first)
+
+    with pytest.raises(ModelInvocationError, match="MODEL_INVOCATION_RECEIPT_CONFLICT"):
+        journal.record(second)
+    assert journal.result_invocations() == [first]

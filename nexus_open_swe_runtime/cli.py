@@ -18,7 +18,7 @@ from typing import Any, Callable, Mapping
 from langchain_core.messages import AIMessage, ToolMessage
 
 try:
-    from .model_invocation import DurableInvocationJournal
+    from .model_invocation import DurableInvocationJournal, InvocationEvidenceChatModel
     from .recovery import (
         DurableEffectJournal,
         DurableOperationJournal,
@@ -40,6 +40,7 @@ try:
 except ImportError:  # direct ``python path/to/cli.py`` compatibility
     from nexus_open_swe_runtime.model_invocation import (  # type: ignore[no-redef]
         DurableInvocationJournal,
+        InvocationEvidenceChatModel,
     )
     from nexus_open_swe_runtime.recovery import (  # type: ignore[no-redef]
         DurableEffectJournal,
@@ -431,7 +432,12 @@ def _build_model(
         )
     if config:
         raise RuntimeErrorBounded("OPEN_SWE_TRANSPORT_CONFIG_PROVIDER_MISMATCH")
-    return runtime["init_chat_model"](model=model_id, model_provider=provider)
+    delegate = runtime["init_chat_model"](model=model_id, model_provider=provider)
+    return InvocationEvidenceChatModel(
+        delegate=delegate,
+        configured_provider_id=provider,
+        configured_model_id=model_id,
+    )
 
 
 def _profile(runtime: Mapping[str, Any], key: str) -> None:
@@ -2453,6 +2459,7 @@ def _semantic_run(
     if not root.is_dir() or not prompt or not provider or not model_id:
         return _base_result(request, kind="semantic", status="OPEN_SWE_EXECUTION_INPUT_INVALID")
     started = _write_started(request, "semantic")
+    invocation_journal: DurableInvocationJournal | None = None
     try:
         runtime = runtime_loader()
         model = model_factory(
@@ -2462,37 +2469,47 @@ def _semantic_run(
             request.get("transport_config"),
             request.get("runtime_state_root"),
         )
-        if hasattr(model, "configure_invocation_identity"):
-            model.configure_invocation_identity(
-                {
-                    "operation_id": str(request.get("operation_id") or ""),
-                    "provider_id": str(provider),
-                    "model_id": str(model_id),
-                    "worker_identity_sha256": str(
-                        request.get("worker_identity_sha256") or ""
-                    ),
-                    "transport_config_sha256": _sha256(
-                        _canonical_json(request.get("transport_config") or {})
-                    ),
-                    "runtime_identity_sha256": _sha256(
-                        _canonical_json({
-                            "module_sha256": _sha256(Path(__file__).read_bytes()),
-                            "deepagents": _deepagents_version(),
-                            "checkpoint_namespace": "open-swe-repair-v1",
-                        })
-                    ),
-                    "core_binding_hash": str(request.get("core_binding_hash") or ""),
-                    "acceptance_contract_hash": str(
-                        request.get("acceptance_contract_hash") or ""
-                    ),
-                    "effect_authorization_hash": str(
-                        request.get("effect_authorization_hash") or ""
-                    ),
-                    "tool_projection_hash": str(request.get("tool_projection_hash") or ""),
-                    "workspace": str(root),
+        invocation_identity = {
+            "operation_id": str(request.get("operation_id") or ""),
+            "provider_id": str(provider),
+            "model_id": str(model_id),
+            "worker_identity_sha256": str(
+                request.get("worker_identity_sha256") or ""
+            ),
+            "transport_config_sha256": _sha256(
+                _canonical_json(request.get("transport_config") or {})
+            ),
+            "runtime_identity_sha256": _sha256(
+                _canonical_json({
+                    "module_sha256": _sha256(Path(__file__).read_bytes()),
+                    "deepagents": _deepagents_version(),
                     "checkpoint_namespace": "open-swe-repair-v1",
-                }
+                })
+            ),
+            "core_binding_hash": str(request.get("core_binding_hash") or ""),
+            "acceptance_contract_hash": str(
+                request.get("acceptance_contract_hash") or ""
+            ),
+            "effect_authorization_hash": str(
+                request.get("effect_authorization_hash") or ""
+            ),
+            "tool_projection_hash": str(request.get("tool_projection_hash") or ""),
+            "workspace": str(root),
+            "checkpoint_namespace": "open-swe-repair-v1",
+        }
+        if hasattr(model, "configure_invocation_identity"):
+            model.configure_invocation_identity(invocation_identity)
+        runtime_state_root = request.get("runtime_state_root")
+        if (
+            isinstance(runtime_state_root, str)
+            and runtime_state_root
+            and hasattr(model, "configure_invocation_journal")
+        ):
+            invocation_journal = DurableInvocationJournal(
+                runtime_state_root,
+                invocation_identity,
             )
+            model.configure_invocation_journal(invocation_journal)
         graph = graph_factory(model, root, runtime, f"{provider}:{model_id}")
         if set(executable_tool_surface(graph)) != SEMANTIC_TOOLS:
             raise RuntimeErrorBounded("OPEN_SWE_TOOL_SURFACE_INVALID")
@@ -2513,6 +2530,9 @@ def _semantic_run(
             "retry_safe": False,
             "finished_at": _now(),
         }
+        receipts = _invocation_receipts(invocation_journal)
+        if receipts:
+            result["model_invocation_receipts"] = receipts
     except Exception as exc:
         result = {
             **started,
@@ -2523,6 +2543,9 @@ def _semantic_run(
             "error": type(exc).__name__,
             "finished_at": _now(),
         }
+        receipts = _invocation_receipts(invocation_journal)
+        if receipts:
+            result["model_invocation_receipts"] = receipts
     return _write_terminal(request, result)
 
 
