@@ -1,5 +1,7 @@
 """Issue #68: additive hints + search-recovery evidence."""
+
 from __future__ import annotations
+
 import importlib.util
 
 

@@ -1,9 +1,17 @@
-"""Additive retrieval-hint execution evidence (#68)."""
+"""Additive retrieval-hint execution evidence (#68).
+
+Execution-side seam that accepts externally prepared, revision-bound additive
+retrieval hints, preserves worker search/read recovery, and emits bounded
+derived evidence about whether hints reduced exploration. It never computes a
+retrieval policy, never removes authorized tools, and never treats Top-K as
+complete.
+"""
+
 from __future__ import annotations
+
 import hashlib
 import json
 from collections.abc import Mapping
-from typing import Any
 
 HINT_EXECUTION_SCHEMA = "nexus.open_swe_runtime.hint_execution_evidence.v1"
 HINT_EXECUTION_CLAIM_CEILING = "OPEN_SWE_RETRIEVAL_HINT_EXECUTION_EVIDENCE_ONLY"
