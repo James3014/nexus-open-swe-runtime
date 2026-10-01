@@ -23,8 +23,10 @@ jobs:
       REPOSITORY: ${{ github.repository }}
       RUN_ID: ${{ github.run_id }}
       RUN_ATTEMPT: ${{ github.run_attempt }}
+      ACTIVATION_STATE: ${{ vars.NEXUS_HYBRID_REPLICATION_ACTIVATION_STATE }}
       T_AUTO: ${{ vars.NEXUS_HYBRID_REPLICATION_T_AUTO }}
       EXCLUDED_TASKS: ${{ vars.NEXUS_HYBRID_REPLICATION_EXCLUDED_TASKS }}
+      EXCLUSION_SET_SHA256: ${{ vars.NEXUS_HYBRID_REPLICATION_EXCLUSION_SET_SHA256 }}
     steps:
       - name: Capture immutable research observation
         shell: bash
@@ -39,6 +41,7 @@ jobs:
           import hashlib
           import json
           import os
+          import re
           import urllib.error
           import urllib.parse
           import urllib.request
@@ -62,7 +65,9 @@ jobs:
           repository = os.environ["REPOSITORY"]
           action = os.environ["EVENT_ACTION"]
           source_event_id = f"actions:{os.environ['RUN_ID']}:{os.environ['RUN_ATTEMPT']}"
+          activation_state = os.environ.get("ACTIVATION_STATE", "").strip()
           t_auto = os.environ.get("T_AUTO", "").strip()
+          expected_exclusion_set_sha256 = os.environ.get("EXCLUSION_SET_SHA256", "").strip()
           excluded = {
               item.strip()
               for item in os.environ.get("EXCLUDED_TASKS", "").split(",")
@@ -96,6 +101,50 @@ jobs:
                   raw = response.read()
               return None if not raw else json.loads(raw.decode())
 
+          def implementation_pr_numbers(issue_number):
+              found = set()
+              for page in range(1, 11):
+                  batch = request(
+                      f"/repos/{repository}/issues/{issue_number}/timeline?per_page=100&page={page}"
+                  ) or []
+                  if not isinstance(batch, list):
+                      raise RuntimeError("issue_timeline_response_not_list")
+                  for item in batch:
+                      if not isinstance(item, dict) or item.get("event") != "cross-referenced":
+                          continue
+                      source = item.get("source") if isinstance(item.get("source"), dict) else {}
+                      source_issue = (
+                          source.get("issue") if isinstance(source.get("issue"), dict) else {}
+                      )
+                      if "pull_request" not in source_issue:
+                          continue
+                      if str(source_issue.get("repository_url") or "") != (
+                          f"https://api.github.com/repos/{repository}"
+                      ):
+                          continue
+                      source_number = source_issue.get("number")
+                      if isinstance(source_number, int):
+                          found.add(source_number)
+                  if len(batch) < 100:
+                      return sorted(found)
+              raise RuntimeError("issue_timeline_exceeds_bounded_pagination")
+
+          def tracked_parent(body_text):
+              matches = {
+                  int(item)
+                  for item in re.findall(
+                      r"(?im)^\s*(?:tracks|parent(?:\s+task)?\s*:?)\s+#(\d+)\s*$",
+                      body_text,
+                  )
+              }
+              if not matches:
+                  return None, None, False
+              if len(matches) != 1:
+                  return None, None, True
+              parent_number = next(iter(matches))
+              parent = request(f"/repos/{repository}/issues/{parent_number}")
+              return parent_number, str(parent.get("created_at") or ""), False
+
           event = json.load(open(os.environ["EVENT_PATH"], encoding="utf-8"))
           issue = event["issue"]
           number = int(issue["number"])
@@ -108,6 +157,13 @@ jobs:
                   print("capture already exists; idempotent no-op")
                   raise SystemExit(0)
 
+              current_issue = request(f"/repos/{repository}/issues/{number}")
+              issue_state_at_admission = str(current_issue.get("state") or "")
+              implementation_prs = implementation_pr_numbers(number)
+              title = str(current_issue.get("title") or "")
+              body = str(current_issue.get("body") or "")
+              parent_number, parent_created_at, parent_ambiguous = tracked_parent(body)
+
               repo_payload = event["repository"]
               default_branch = str(repo_payload["default_branch"])
               ref = request(
@@ -115,23 +171,21 @@ jobs:
               )
               base_sha = str(ref["object"]["sha"])
               captured_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-              title = str(issue.get("title") or "")
-              body = str(issue.get("body") or "")
               contract = {
                   "body": body,
-                  "created_at": str(issue["created_at"]),
+                  "created_at": str(current_issue["created_at"]),
                   "issue": number,
                   "repository": repository,
                   "title": title,
-                  "updated_at": str(issue["updated_at"]),
+                  "updated_at": str(current_issue["updated_at"]),
               }
               capture = {
                   "schema": "nexus.hybrid_replication.capture.v1",
                   "repository": repository,
                   "issue_number": number,
-                  "created_at": str(issue["created_at"]),
+                  "created_at": str(current_issue["created_at"]),
                   "captured_at": captured_at,
-                  "issue_updated_at": str(issue["updated_at"]),
+                  "issue_updated_at": str(current_issue["updated_at"]),
                   "title": title,
                   "body_gzip_base64": encode_body(body),
                   "pre_implementation_revision": base_sha,
@@ -154,27 +208,45 @@ jobs:
                   payload={"body": capture_comment},
               )
 
-              if not t_auto:
-                  print("capture persisted; T_auto is unset, so no prospective admission is created")
+              actual_exclusion_set_sha256 = digest(
+                  ",".join(sorted(excluded)).encode("utf-8")
+              )
+              if activation_state != "AUTOMATIC_CAPTURE_READY" or not t_auto:
+                  print(
+                      "capture persisted; AUTOMATIC_CAPTURE_READY + T_auto are required "
+                      "before prospective admission"
+                  )
                   raise SystemExit(0)
+              if expected_exclusion_set_sha256 != actual_exclusion_set_sha256:
+                  raise SystemExit("activation exclusion-set hash mismatch; admission blocked")
 
+              other_repos = [
+                  repo
+                  for repo in CANDIDATE_REPOSITORIES
+                  if repo != repository and (repo in title or repo in body)
+              ]
               if task_key == "James3014/Nexus-new#1216":
                   disposition = "EXPERIMENT_CONTROL_ISSUE"
               elif task_key in excluded:
                   disposition = "CONTAMINATION_EXCLUDED"
-              elif str(issue["created_at"]) < t_auto:
+              elif str(current_issue["created_at"]) < t_auto:
                   disposition = "EXCLUDED_PRE_BOUNDARY"
-              else:
-                  other_repos = [
-                      repo
-                      for repo in CANDIDATE_REPOSITORIES
-                      if repo != repository and (repo in title or repo in body)
-                  ]
+              elif parent_ambiguous:
+                  disposition = "PARENT_TASK_SCOPE_GAP"
+              elif parent_created_at is not None:
                   disposition = (
-                      "CROSS_REPO_SCOPE_GAP"
-                      if other_repos
-                      else "ADMITTED_PRIMARY_FRESH_TASK"
+                      "EXCLUDE_PARENT_TASK_PRE_BOUNDARY"
+                      if parent_created_at < t_auto
+                      else "PARENT_TASK_SCOPE_GAP"
                   )
+              elif other_repos:
+                  disposition = "CROSS_REPO_SCOPE_GAP"
+              elif issue_state_at_admission != "open":
+                  disposition = "INTAKE_PROTOCOL_LOSS_TERMINAL_BEFORE_ADMISSION"
+              elif implementation_prs:
+                  disposition = "INTAKE_PROTOCOL_LOSS_IMPLEMENTATION_PRESENT"
+              else:
+                  disposition = "ADMITTED_PRIMARY_FRESH_TASK"
 
               admission = {
                   "schema": "nexus.hybrid_replication.admission.v1",
@@ -182,6 +254,12 @@ jobs:
                   "capture_sha256": capture["capture_sha256"],
                   "disposition": disposition,
                   "activation_boundary": t_auto,
+                  "activation_state": activation_state,
+                  "exclusion_set_sha256": actual_exclusion_set_sha256,
+                  "issue_state_at_admission": issue_state_at_admission,
+                  "implementation_pr_numbers": implementation_prs,
+                  "tracked_parent_issue_number": parent_number,
+                  "tracked_parent_created_at": parent_created_at,
                   "admitted_at": captured_at,
               }
               admission["receipt_sha256"] = digest(canonical(admission))
