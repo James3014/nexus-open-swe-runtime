@@ -18,7 +18,6 @@ jobs:
       issues: write
     env:
       GH_TOKEN: ${{ github.token }}
-      EVENT_PATH: ${{ github.event_path }}
       EVENT_ACTION: ${{ github.event.action }}
       REPOSITORY: ${{ github.repository }}
       RUN_ID: ${{ github.run_id }}
@@ -145,7 +144,7 @@ jobs:
               parent = request(f"/repos/{repository}/issues/{parent_number}")
               return parent_number, str(parent.get("created_at") or ""), False
 
-          event = json.load(open(os.environ["EVENT_PATH"], encoding="utf-8"))
+          event = json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8"))
           issue = event["issue"]
           number = int(issue["number"])
           task_key = f"{repository}#{number}"
