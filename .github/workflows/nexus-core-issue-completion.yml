@@ -1,9 +1,6 @@
 name: Nexus Core issue completion
 
 on:
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened, edited]
   pull_request_target:
     branches: [main]
     types: [opened, synchronize, reopened, edited]
@@ -49,7 +46,7 @@ jobs:
           import subprocess
 
           base = os.environ["BASE_SHA"]
-          protected = [".nexus-core/config.toml"]
+          protected = [".github/workflows/nexus-core-issue-completion.yml",".nexus-core/config.toml"]
 
           def base_bytes(path: str) -> bytes:
               result = subprocess.run(
