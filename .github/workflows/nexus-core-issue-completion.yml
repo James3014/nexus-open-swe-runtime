@@ -4,6 +4,9 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, edited]
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
@@ -31,8 +34,43 @@ jobs:
       - name: Fetch exact base ref
         run: |
           set -euo pipefail
-          git fetch --no-tags origin "${{ github.event.pull_request.base.ref }}:refs/remotes/origin/${{ github.event.pull_request.base.ref }}"
+          git fetch --no-tags origin "${{ github.event.pull_request.base.sha }}:refs/remotes/origin/${{ github.event.pull_request.base.ref }}"
 
+      - name: Protect trusted Core governance inputs
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          base = os.environ["BASE_SHA"]
+          protected = [".nexus-core/config.toml"]
+
+          def base_bytes(path: str) -> bytes:
+              result = subprocess.run(
+                  ["git", "show", f"{base}:{path}"],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  check=False,
+              )
+              if result.returncode != 0:
+                  raise SystemExit(f"NEXUS_CORE_TRUSTED_INPUT_BASE_MISSING: {path}")
+              return result.stdout
+
+          changed = []
+          for path in protected:
+              target = Path(path)
+              if not target.is_file() or target.read_bytes() != base_bytes(path):
+                  changed.append(path)
+
+          if changed:
+              raise SystemExit("NEXUS_CORE_GOVERNANCE_INPUT_CHANGED: " + ", ".join(changed))
+          PY
       - name: Resolve exact Issue binding
         id: issue
         shell: bash
