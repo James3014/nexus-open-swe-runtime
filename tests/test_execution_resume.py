@@ -40,6 +40,8 @@ def test_exact_identity_resumes_without_replaying_completed_effect():
 
 def test_authorization_source_backend_provider_or_projection_drift_reconciles():
     fields = {
+        "operation_id": "op-other",
+        "core_attempt_id": "attempt-other",
         "core_source_revision": "other",
         "tool_projection_backend_id": "other",
         "provider_id": "other",
