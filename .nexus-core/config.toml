@@ -1,0 +1,6 @@
+version = 1
+base_ref = "origin/main"
+allowed_patterns = ["**"]
+deletion_policy = "FORBID"
+verifier_command = ["uv", "run", "pytest", "-q", "--ignore=tests/test_cross_repo_acceptance.py"]
+timeout_seconds = 1800
