@@ -1,0 +1,113 @@
+name: Nexus Core issue completion
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  nexus-core-issue-completion:
+    name: Nexus Core issue completion
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      PR_BODY: ${{ github.event.pull_request.body || '' }}
+      UV_TOOL_DIR: /tmp/nexus-core-tools
+      UV_TOOL_BIN_DIR: /tmp/nexus-core-bin
+    steps:
+      - name: Checkout exact pull-request head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch exact base ref
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "${{ github.event.pull_request.base.ref }}:refs/remotes/origin/${{ github.event.pull_request.base.ref }}"
+
+      - name: Resolve exact Issue binding
+        id: issue
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import re
+
+          body = os.environ.get("PR_BODY", "")
+          matches = re.findall(r"<!--\s*NEXUS_CORE_ISSUE:\s*([1-9][0-9]*)\s*-->", body)
+          if len(matches) != 1:
+              raise SystemExit(
+                  "NEXUS_CORE_ISSUE_BINDING_REQUIRED: PR body must contain exactly one "
+                  "'<!-- NEXUS_CORE_ISSUE: <number> -->' marker."
+              )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"number={matches[0]}\n")
+          PY
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # trusted immutable pin
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install pinned nexus-certify outside candidate tree
+        run: |
+          set -euo pipefail
+          mkdir -p "$UV_TOOL_BIN_DIR"
+          uv tool install --force "git+https://github.com/James3014/nexus-core.git@00c791009aa4d626dacfe31012454ed1569a7b7c"
+          echo "$UV_TOOL_BIN_DIR" >> "$GITHUB_PATH"
+
+      - name: Bootstrap verifier environment outside subject tree
+        run: |
+          set -euo pipefail
+          export UV_PROJECT_ENVIRONMENT=/tmp/nexus-open-swe-core-venv
+          uv sync --locked --no-install-project
+          echo "UV_PROJECT_ENVIRONMENT=$UV_PROJECT_ENVIRONMENT" >> "$GITHUB_ENV"
+          echo "UV_NO_SYNC=1" >> "$GITHUB_ENV"
+
+
+      - name: Bind exact Issue contract
+        run: |
+          set -euo pipefail
+          nexus-certify issue-init --repo . --issue "${{ steps.issue.outputs.number }}"
+
+      - name: Verify exact Issue-bound candidate
+        run: |
+          set -euo pipefail
+          nexus-certify issue-check --repo . --issue "${{ steps.issue.outputs.number }}"
+
+      - name: Diagnose Core verifier failure
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import glob
+          import json
+
+          receipts = sorted(glob.glob(".nexus-core/receipts/*.json"))
+          if not receipts:
+              print("NEXUS_CORE_DIAGNOSTIC: no receipt available")
+              raise SystemExit(0)
+          path = receipts[-1]
+          payload = json.load(open(path, encoding="utf-8"))
+          verifier = payload.get("verifier") or {}
+          print("NEXUS_CORE_DIAGNOSTIC_RECEIPT:", path)
+          print("status:", payload.get("status"))
+          print("reason_codes:", payload.get("reason_codes"))
+          print("verifier_command:", verifier.get("command"))
+          print("verifier_exit_code:", verifier.get("exit_code"))
+          print("--- verifier stdout ---")
+          print(verifier.get("stdout", ""))
+          print("--- verifier stderr ---")
+          print(verifier.get("stderr", ""))
+          PY
