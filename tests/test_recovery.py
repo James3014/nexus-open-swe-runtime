@@ -579,7 +579,23 @@ def test_effect_journal_lists_only_exact_operation_results(tmp_path: Path):
         postimage="done\n",
     )
     journal.recover_write(effect)
+
+    foreign_identity = replace(identity, operation_id="b" * 64)
+    foreign_journal = DurableEffectJournal(tmp_path / "state", foreign_identity)
+    foreign_target = tmp_path / "b.py"
+    foreign_effect = foreign_journal.intent(
+        turn_id="turn_2",
+        tool_call_id="call_2",
+        tool_name="write_file",
+        arguments={"file_path": "b.py", "content": "foreign\n"},
+        path=foreign_target,
+        preimage=None,
+        postimage="foreign\n",
+    )
+    foreign_journal.recover_write(foreign_effect)
+
     records = journal.result_effects()
     assert len(records) == 1
     assert records[0]["effect_id"] == effect.effect_id
+    assert records[0]["operation_id"] == identity.operation_id
     assert records[0]["status"] == "RESULT"
