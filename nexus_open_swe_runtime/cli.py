@@ -18,6 +18,12 @@ from typing import Any, Callable, Mapping
 from langchain_core.messages import AIMessage, ToolMessage
 
 try:
+    from .hint_execution import (
+        HintExecutionObserver,
+        add_recovery_observation,
+        bind_execution_hints,
+        build_hint_execution_receipt,
+    )
     from .model_invocation import DurableInvocationJournal, InvocationEvidenceChatModel
     from .recovery import (
         DurableEffectJournal,
@@ -38,6 +44,12 @@ try:
         validate_tool_projection,
     )
 except ImportError:  # direct ``python path/to/cli.py`` compatibility
+    from nexus_open_swe_runtime.hint_execution import (  # type: ignore[no-redef]
+        HintExecutionObserver,
+        add_recovery_observation,
+        bind_execution_hints,
+        build_hint_execution_receipt,
+    )
     from nexus_open_swe_runtime.model_invocation import (  # type: ignore[no-redef]
         DurableInvocationJournal,
         InvocationEvidenceChatModel,
@@ -2310,6 +2322,63 @@ def _request_core_hashes(request: Mapping[str, Any]) -> tuple[str, str] | None:
     return str(binding_hash), str(contract_hash)
 
 
+def _worker_hint_binding(
+    request: Mapping[str, Any],
+    tool_projection: ValidatedToolProjection | None,
+    core_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    hints = request.get("retrieval_hints")
+    authorization = request.get("effect_authorization")
+    repository = ""
+    revision = ""
+    if isinstance(authorization, Mapping):
+        repository = str(authorization.get("repository") or "")
+        revision = str(authorization.get("source_revision") or "")
+    if (not repository or not revision) and isinstance(core_identity, Mapping):
+        repository = str(core_identity.get("core_repository") or repository)
+        revision = str(core_identity.get("core_source_revision") or revision)
+    authorized_tools = tool_projection.selected_tools if tool_projection is not None else WORKER_TOOL_UNIVERSE
+    if not repository or not revision:
+        return {
+            "bound": False,
+            "blockers": ["hint_execution_identity_unavailable"],
+            "hints": [],
+            "authorized_tools": sorted(authorized_tools),
+            "hint_identity": {},
+        }
+    try:
+        return bind_execution_hints(
+            expected_repository=repository,
+            expected_revision=revision,
+            hint_input=hints,
+            authorized_tools=authorized_tools,
+        )
+    except (TypeError, ValueError):
+        return {
+            "bound": False,
+            "blockers": ["hint_input_invalid"],
+            "hints": [],
+            "authorized_tools": sorted(authorized_tools),
+            "hint_identity": {},
+        }
+
+
+def _hint_prompt_suffix(binding: Mapping[str, Any]) -> str:
+    if not binding.get("bound"):
+        return ""
+    hints = binding.get("hints")
+    if not isinstance(hints, list) or not hints:
+        return ""
+    return (
+        "\n\nAdvisory retrieval hints (non-authoritative; search/read recovery remains allowed):\n"
+        + _canonical_json(hints)
+    )
+
+
+def _hint_receipt_sha256(request: Mapping[str, Any]) -> str:
+    return _sha256(_canonical_json(request.get("retrieval_hints")))
+
+
 def _worker_material_fingerprint(
     request: Mapping[str, Any], artifact_bytes: bytes | None = None
 ) -> str | None:
@@ -2336,6 +2405,7 @@ def _worker_material_fingerprint(
             "worker_identity_sha256": request.get("worker_identity_sha256"),
             "effect_authorization": request.get("effect_authorization"),
             "tool_projection_manifest": request.get("tool_projection_manifest"),
+            "retrieval_hints": request.get("retrieval_hints"),
             "prompt": prompt,
             "artifact_path": str(artifact),
             "artifact_sha256": artifact_sha256,
@@ -2352,6 +2422,7 @@ def _write_started(
         material_fingerprint = _worker_material_fingerprint(request, artifact_bytes)
         if material_fingerprint is not None:
             state["execution_material_sha256"] = material_fingerprint
+        state["retrieval_hints_sha256"] = _hint_receipt_sha256(request)
         raw_authorization = request.get("effect_authorization")
         raw_projection = request.get("tool_projection_manifest")
         if isinstance(raw_authorization, Mapping) and isinstance(raw_projection, Mapping):
@@ -2732,6 +2803,8 @@ def _worker_run(
     had_session_binding = bool(request.get("session_id"))
     diagnosis_model: Any | None = None
     invocation_journal: DurableInvocationJournal | None = None
+    hint_binding: dict[str, Any] = {"bound": False, "blockers": ["hint_unavailable_canonical_execution"], "hints": [], "authorized_tools": [], "hint_identity": {}}
+    hint_observer: HintExecutionObserver | None = None
     try:
         failure_phase = "WORKER_CONTEXT"
         task_id, unit_id, allowed_paths, session_id = _worker_context(request, prompt)
@@ -2759,6 +2832,11 @@ def _worker_run(
                 core_identity,
                 allow_initial_bind=not had_session_binding,
             )
+        hint_binding = _worker_hint_binding(request, tool_projection, core_identity)
+        hint_observer = HintExecutionObserver(hint_binding, workspace)
+        started["hint_execution_receipt"] = hint_observer.receipt()
+        started["hint_binding_blockers"] = list(hint_binding.get("blockers") or [])
+        _atomic_json(_operation_path(request), started)
         scope = packet.get("scope_signal") if isinstance(packet, Mapping) else None
         composite_admitted = bool(
             semantic_admission_decision == ADMIT
@@ -2879,12 +2957,13 @@ def _worker_run(
                 {
                     "messages": [
                         runtime["human_message"](
-                            content=f"Controller evidence (untrusted):\n{evidence}\n\nExecution instruction:\n{prompt}"
+                            content=f"Controller evidence (untrusted):\n{evidence}\n\nExecution instruction:\n{prompt}{_hint_prompt_suffix(hint_binding)}"
                         )
                     ]
                 },
-                config={"recursion_limit": 40},
+                config={"recursion_limit": 40, "callbacks": [hint_observer]},
             )
+            hint_observer.inspect_output(diagnosis_output)
             diagnosis = _recorded_payload(diagnosis_output, "record_diagnosis")
             if not isinstance(diagnosis, Mapping):
                 raise RuntimeErrorBounded("OPEN_SWE_DIAGNOSIS_INVALID")
@@ -2977,6 +3056,7 @@ def _worker_run(
                     "thread_id": str(request.get("operation_id") or ""),
                 },
                 "recursion_limit": 60,
+                "callbacks": [hint_observer],
             }
             repair_output = repair_graph.invoke(
                 {
@@ -2984,13 +3064,14 @@ def _worker_run(
                         runtime["human_message"](
                             content=(
                                 f"Supported diagnosis: {_canonical_json(dict(diagnosis))}\n"
-                                f"Controller evidence (untrusted):\n{evidence}\n\n{prompt}"
+                                f"Controller evidence (untrusted):\n{evidence}\n\n{prompt}{_hint_prompt_suffix(hint_binding)}"
                             )
                         )
                     ]
                 },
                 config=repair_config,
             )
+            hint_observer.inspect_output(repair_output)
             repair = (
                 _composite_worker_result(repair_output, effect_journal)
                 if composite_runtime
@@ -3036,6 +3117,8 @@ def _worker_run(
             "core_change_set_projection": core_change_set_projection,
             "finished_at": _now(),
         }
+        result["hint_execution_receipt"] = hint_observer.receipt() if hint_observer is not None else build_hint_execution_receipt(bound=False)
+        result["hint_binding_blockers"] = list(hint_binding.get("blockers") or [])
         if exposure_receipt is not None and tool_projection is not None:
             result.update(
                 tool_projection_status="BOUND",
@@ -3075,6 +3158,8 @@ def _worker_run(
             ),
             "finished_at": _now(),
         }
+        result["hint_execution_receipt"] = hint_observer.receipt() if hint_observer is not None else build_hint_execution_receipt(bound=False)
+        result["hint_binding_blockers"] = list(hint_binding.get("blockers") or [])
         if tool_projection is not None:
             try:
                 exposure_receipt = _exposure_receipt(tool_projection, phase_tool_surfaces)
@@ -3118,9 +3203,22 @@ def _worker_reconcile(
     model_builder: Callable[..., Any] = _build_model,
     graph_builder: Callable[..., Any] = build_repair_graph,
 ) -> dict[str, Any]:
+    persisted_state = _read_operation_state(_operation_path(request))
     cached = _reconcile_operation(request, kind="worker")
     if cached.get("status") != "OPEN_SWE_OUTCOME_UNKNOWN":
         return cached
+    if isinstance(persisted_state, Mapping):
+        persisted_hint_hash = persisted_state.get("retrieval_hints_sha256")
+        if isinstance(persisted_hint_hash, str):
+            if persisted_hint_hash != _hint_receipt_sha256(request):
+                return cached
+        elif "retrieval_hints" in request:
+            return cached
+    prior_hint_receipt = (
+        persisted_state.get("hint_execution_receipt")
+        if isinstance(persisted_state, Mapping) and isinstance(persisted_state.get("hint_execution_receipt"), Mapping)
+        else None
+    )
     operation_id = str(request.get("operation_id") or "")
     state_root = _state_root(request)
     recovery_path = state_root / "recovery" / "operations" / f"{operation_id}.json"
@@ -3200,6 +3298,12 @@ def _worker_reconcile(
             or identity.runtime_identity_sha256 != expected_runtime
         ):
             return cached
+        recovery_core_identity = {
+            "core_repository": identity.core_repository,
+            "core_source_revision": identity.core_source_revision,
+        }
+        recovery_hint_binding = _worker_hint_binding(request, tool_projection, recovery_core_identity)
+        recovery_observer = HintExecutionObserver(recovery_hint_binding, Path(identity.workspace))
         for key, expected in (
             ("workspace_path", identity.workspace),
             ("provider_id", identity.provider_id),
@@ -3417,9 +3521,11 @@ def _worker_reconcile(
         config = {
             "configurable": {"thread_id": operation_id},
             "recursion_limit": 60,
+            "callbacks": [recovery_observer],
         }
         graph.update_state(config, {"messages": [recovered_message]}, as_node="model")
         output = graph.invoke(None, config=config)
+        recovery_observer.inspect_output(output)
         envelope = (
             _composite_worker_result(output, effect_journal)
             if identity.composite_admitted
@@ -3465,7 +3571,15 @@ def _worker_reconcile(
             "acceptance_contract_hash": identity.acceptance_contract_hash,
             "core_change_set_projection": core_projection,
             "finished_at": _now(),
+            "retrieval_hints_sha256": _hint_receipt_sha256(request),
         }
+        recovery_hint_receipt = recovery_observer.receipt()
+        result["hint_execution_receipt"] = (
+            add_recovery_observation(prior_hint_receipt, recovery_hint_receipt)
+            if prior_hint_receipt is not None
+            else recovery_hint_receipt
+        )
+        result["hint_binding_blockers"] = list(recovery_hint_binding.get("blockers") or [])
         if exposure_receipt is not None and tool_projection is not None:
             result.update(
                 tool_projection_status="BOUND",
