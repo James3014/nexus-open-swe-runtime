@@ -1,6 +1,53 @@
-version = 1
+version = 2
 base_ref = "origin/main"
 allowed_patterns = ["**"]
 deletion_policy = "FORBID"
-verifier_command = ["uv", "run", "pytest", "-q", "--ignore=tests/test_cross_repo_acceptance.py"]
+universe_generation = 1
+
+[[materials]]
+id = "nexus-new-consumer"
+observe_command = ["bash", "-lc", "set -euo pipefail; printf 'git-commit:%s\\n' \"$(git -C \"$NEXUS_NEW_CONSUMER_ROOT\" rev-parse HEAD)\""]
+timeout_seconds = 300
+logical_subject_id = "dependency/nexus-new-consumer"
+evidence_kind = "resolved-dependency"
+requirement_mode = "REQUIRED"
+applicability = "APPLICABLE"
+expected_identity = "git-commit:2999d62e0fb463646a12a659eefeee0aaf3367ea"
+
+[[verifiers]]
+id = "cross-repo-acceptance"
+command = ["uv", "run", "pytest", "-q", "tests/test_cross_repo_acceptance.py"]
 timeout_seconds = 1800
+logical_subject_id = "open-swe/cross-repo-acceptance"
+evidence_kind = "test-result"
+requirement_mode = "REQUIRED"
+applicability = "APPLICABLE"
+required_material_ids = ["nexus-new-consumer"]
+
+[[verifiers]]
+id = "full-tests"
+command = ["uv", "run", "pytest", "-q"]
+timeout_seconds = 1800
+logical_subject_id = "open-swe/full-tests"
+evidence_kind = "test-result"
+requirement_mode = "REQUIRED"
+applicability = "APPLICABLE"
+required_material_ids = ["nexus-new-consumer"]
+
+[[verifiers]]
+id = "ruff"
+command = ["uv", "run", "ruff", "check", "."]
+timeout_seconds = 600
+logical_subject_id = "open-swe/ruff"
+evidence_kind = "static-analysis"
+requirement_mode = "REQUIRED"
+applicability = "APPLICABLE"
+
+[[verifiers]]
+id = "cli-smoke"
+command = ["bash", "-lc", "echo '{}' | uv run nexus-open-swe-runtime"]
+timeout_seconds = 600
+logical_subject_id = "open-swe/cli-smoke"
+evidence_kind = "package-smoke"
+requirement_mode = "REQUIRED"
+applicability = "APPLICABLE"
