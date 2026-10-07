@@ -21,6 +21,20 @@ jobs:
         run: uv sync --locked
       - name: Run Ruff
         run: uv run ruff check .
+      - name: Fetch pinned Nexus-new consumer without submodule initialization
+        shell: bash
+        run: |
+          set -euo pipefail
+          consumer_root="$RUNNER_TEMP/nexus-new-consumer"
+          rm -rf "$consumer_root"
+          git init "$consumer_root"
+          git -C "$consumer_root" remote add origin https://github.com/James3014/Nexus-new.git
+          git -C "$consumer_root" fetch --no-tags --depth=1 origin 2999d62e0fb463646a12a659eefeee0aaf3367ea
+          git -C "$consumer_root" checkout --detach FETCH_HEAD
+          test "$(git -C "$consumer_root" rev-parse HEAD)" = 2999d62e0fb463646a12a659eefeee0aaf3367ea
+          test -z "$(git -C "$consumer_root" status --short)"
+          echo "NEXUS_NEW_CONSUMER_ROOT=$consumer_root" >> "$GITHUB_ENV"
+          echo "NEXUS_NEW_CONSUMER_REQUIRED=1" >> "$GITHUB_ENV"
       - name: Run Pytest
         run: uv run pytest -q
       - name: CLI protocol smoke
