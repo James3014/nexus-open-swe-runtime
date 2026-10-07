@@ -1,0 +1,1 @@
+Disposable Core v2 canary for Issue #84; do not merge.\n
