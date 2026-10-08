@@ -40,9 +40,9 @@ jobs:
       issue-number: ${{ steps.gate.outputs.issue-number }}
     steps:
       - id: gate
-        uses: James3014/nexus-core/.github/actions/issue-gate@d26204c394adae5b0d344f1cf06fd80c55d1a8a7
+        uses: James3014/nexus-core/.github/actions/issue-gate@dafa3f9339269b8fc200c60e24b712134cb9b4fc
         with:
-          nexus-certify-ref: "d26204c394adae5b0d344f1cf06fd80c55d1a8a7"
+          nexus-certify-ref: "dafa3f9339269b8fc200c60e24b712134cb9b4fc"
 
   verify:
     name: Nexus Core issue completion   # the required status check
@@ -57,7 +57,7 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: James3014/nexus-core/.github/actions/receipt-verify@d26204c394adae5b0d344f1cf06fd80c55d1a8a7
+      - uses: James3014/nexus-core/.github/actions/receipt-verify@dafa3f9339269b8fc200c60e24b712134cb9b4fc
         with:
           artifact-name: ${{ needs.run.outputs.artifact-name }}
           # This very workflow file, on the default branch.
@@ -66,4 +66,4 @@ jobs:
           head-sha: ${{ github.event.pull_request.head.sha }}
           base-sha: ${{ github.event.pull_request.base.sha }}
           issue-number: ${{ needs.run.outputs.issue-number }}
-          nexus-certify-ref: "d26204c394adae5b0d344f1cf06fd80c55d1a8a7"
+          nexus-certify-ref: "dafa3f9339269b8fc200c60e24b712134cb9b4fc"
