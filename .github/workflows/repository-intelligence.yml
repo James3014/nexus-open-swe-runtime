@@ -63,8 +63,8 @@ jobs:
           pr-number: ${{ github.event.pull_request.number }}
           expected-head-sha: ${{ github.event.pull_request.head.sha }}
           timeout-seconds: "900"
-          poll-seconds: "5"
-          quiescence-seconds: "20"
+          poll-seconds: "60"
+          quiescence-seconds: "60"
 
       - name: Validate terminal advisory envelope
         shell: bash
