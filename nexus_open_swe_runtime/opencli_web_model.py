@@ -797,6 +797,23 @@ def _tool_call_id(name: str, arguments: Mapping[str, Any], raw: str) -> str:
     return "opencli_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
 
 
+_CREDENTIAL_ENV_MARKERS = ("API_KEY", "SECRET", "PASSWORD", "CREDENTIAL")
+_CREDENTIAL_ENV_PREFIXES = ("GOOGLE_", "GEMINI_", "OPENAI_", "ANTHROPIC_")
+
+
+def _is_credential_env_name(name: str) -> bool:
+    """Return True for env names that carry model-provider or generic secrets.
+
+    OPENCLI-scoped names are exempt because they configure the child process itself.
+    """
+    upper = name.upper()
+    if "OPENCLI" in upper:
+        return False
+    return upper.startswith(_CREDENTIAL_ENV_PREFIXES) or any(
+        marker in upper for marker in _CREDENTIAL_ENV_MARKERS
+    )
+
+
 class OpenCLIWebChatModel(BaseChatModel):
     """LangChain chat-model bridge backed by ChatGPT Web through OpenCLI.
 
@@ -1003,6 +1020,7 @@ class OpenCLIWebChatModel(BaseChatModel):
                 or "TOKEN" in k
                 and "PROVIDER" not in k
                 and "OPENCLI" not in k
+                or _is_credential_env_name(k)
             )
         }
         if self.opencli_profile:
