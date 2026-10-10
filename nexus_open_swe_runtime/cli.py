@@ -2529,6 +2529,12 @@ def _semantic_run(
     model_id = str(request.get("model_id") or "")
     if not root.is_dir() or not prompt or not provider or not model_id:
         return _base_result(request, kind="semantic", status="OPEN_SWE_EXECUTION_INPUT_INVALID")
+    try:
+        tool_projection = validate_tool_projection(request)
+    except ToolProjectionError as exc:
+        result = _base_result(request, kind="semantic", status="OPEN_SWE_TOOL_PROJECTION_BLOCKED")
+        result["error_code"] = _bounded_error_code(RuntimeErrorBounded(str(exc)))
+        return result
     started = _write_started(request, "semantic")
     invocation_journal: DurableInvocationJournal | None = None
     try:
@@ -2561,10 +2567,16 @@ def _semantic_run(
             "acceptance_contract_hash": str(
                 request.get("acceptance_contract_hash") or ""
             ),
-            "effect_authorization_hash": str(
-                request.get("effect_authorization_hash") or ""
+            "effect_authorization_hash": (
+                tool_projection.authorization_hash
+                if tool_projection is not None
+                else str(request.get("effect_authorization_hash") or "")
             ),
-            "tool_projection_hash": str(request.get("tool_projection_hash") or ""),
+            "tool_projection_hash": (
+                tool_projection.projection_hash
+                if tool_projection is not None
+                else str(request.get("tool_projection_hash") or "")
+            ),
             "workspace": str(root),
             "checkpoint_namespace": "open-swe-repair-v1",
         }
