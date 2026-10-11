@@ -125,6 +125,39 @@ def _fake_process(
     return calls
 
 
+_CREDENTIAL_ENV_NAMES = (
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "MY_SERVICE_API_KEY",
+    "DB_PASSWORD",
+    "CLIENT_SECRET",
+    "AWS_SECRET_ACCESS_KEY",
+    "SOME_CREDENTIAL_FILE",
+    "gemini_api_key",
+)
+
+
+def test_opencli_child_environment_excludes_provider_and_secret_names(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    for name in _CREDENTIAL_ENV_NAMES:
+        monkeypatch.setenv(name, f"leak-{name.lower()}")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("OPENCLI_TIMEOUT_HINT", "kept-value")
+
+    env = OpenCLIWebChatModel(model="chatgpt")._environment()
+
+    for name in _CREDENTIAL_ENV_NAMES:
+        assert name not in env
+        assert f"leak-{name.lower()}" not in env.values()
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert env["OPENCLI_TIMEOUT_HINT"] == "kept-value"
+
+
 def test_build_model_selects_opencli_web_bridge_without_langchain_provider():
     def fail_init(**_kwargs):
         raise AssertionError("init_chat_model must not be used for ChatGPT Web")
