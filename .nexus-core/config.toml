@@ -11,7 +11,7 @@ network = "bridge"
 
 [[materials]]
 id = "nexus-new-consumer"
-observe_command = ["bash", "-lc", "set -euo pipefail; export NEXUS_NEW_CONSUMER_ROOT=\"$(bash scripts/ci/nexus_core_provision_consumer.sh 2999d62e0fb463646a12a659eefeee0aaf3367ea)\"; printf 'git-commit:%s\n' \"$(git -c safe.directory='*' -C \"$NEXUS_NEW_CONSUMER_ROOT\" rev-parse HEAD)\""]
+observe_command = ["bash", "-lc", "set -euo pipefail; export NEXUS_NEW_CONSUMER_ROOT=\"$(bash scripts/ci/nexus_core_provision_consumer.sh \"$(python3 scripts/ci/consumer_pin.py)\")\"; printf 'git-commit:%s\n' \"$(git -c safe.directory='*' -C \"$NEXUS_NEW_CONSUMER_ROOT\" rev-parse HEAD)\""]
 timeout_seconds = 300
 logical_subject_id = "dependency/nexus-new-consumer"
 evidence_kind = "resolved-dependency"
@@ -21,7 +21,7 @@ expected_identity = "git-commit:2999d62e0fb463646a12a659eefeee0aaf3367ea"
 
 [[verifiers]]
 id = "cross-repo-acceptance"
-command = ["bash", "-lc", "set -euo pipefail; export NEXUS_NEW_CONSUMER_ROOT=\"$(bash scripts/ci/nexus_core_provision_consumer.sh 2999d62e0fb463646a12a659eefeee0aaf3367ea)\" NEXUS_NEW_CONSUMER_REQUIRED=1; uv run pytest -q tests/test_cross_repo_acceptance.py || exit $?"]
+command = ["bash", "-lc", "set -euo pipefail; export NEXUS_NEW_CONSUMER_ROOT=\"$(bash scripts/ci/nexus_core_provision_consumer.sh \"$(python3 scripts/ci/consumer_pin.py)\")\" NEXUS_NEW_CONSUMER_REQUIRED=1; uv run pytest -q tests/test_cross_repo_acceptance.py || exit $?"]
 timeout_seconds = 1800
 logical_subject_id = "open-swe/cross-repo-acceptance"
 evidence_kind = "test-result"
@@ -31,7 +31,7 @@ required_material_ids = ["nexus-new-consumer"]
 
 [[verifiers]]
 id = "full-tests"
-command = ["bash", "-lc", "set -euo pipefail; export NEXUS_NEW_CONSUMER_ROOT=\"$(bash scripts/ci/nexus_core_provision_consumer.sh 2999d62e0fb463646a12a659eefeee0aaf3367ea)\" NEXUS_NEW_CONSUMER_REQUIRED=1; uv run pytest -q || exit $?"]
+command = ["bash", "-lc", "set -euo pipefail; export NEXUS_NEW_CONSUMER_ROOT=\"$(bash scripts/ci/nexus_core_provision_consumer.sh \"$(python3 scripts/ci/consumer_pin.py)\")\" NEXUS_NEW_CONSUMER_REQUIRED=1; uv run pytest -q || exit $?"]
 timeout_seconds = 1800
 logical_subject_id = "open-swe/full-tests"
 evidence_kind = "test-result"

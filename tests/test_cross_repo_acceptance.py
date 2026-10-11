@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import importlib.util
 import json
 import os
 import re
@@ -20,7 +21,15 @@ from pathlib import Path
 
 import pytest
 
-EXPECTED_CONSUMER_REVISION = "2999d62e0fb463646a12a659eefeee0aaf3367ea"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+_spec = importlib.util.spec_from_file_location(
+    "consumer_pin", REPO_ROOT / "scripts" / "ci" / "consumer_pin.py"
+)
+assert _spec is not None and _spec.loader is not None
+_consumer_pin = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_consumer_pin)
+# Single source: .nexus-core/config.toml (see scripts/ci/consumer_pin.py).
+EXPECTED_CONSUMER_REVISION = _consumer_pin.read_consumer_pin()
 CONSUMER_ROOT_ENV = "NEXUS_NEW_CONSUMER_ROOT"
 CONSUMER_REQUIRED_ENV = "NEXUS_NEW_CONSUMER_REQUIRED"
 CONSUMER_CLIENT = Path("nexus/services/open_swe_external_intelligence.py")
