@@ -81,7 +81,7 @@ def test_worker_reconcile_real_graph_replays_write_effect_once_after_restart(tmp
         transport_config_sha256=cli._sha256("{}"),
         runtime_identity_sha256=cli._sha256(
             cli._canonical_json({
-                "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
+                **cli._runtime_code_identity(),
                 "deepagents": cli._deepagents_version(),
                 "checkpoint_namespace": "open-swe-repair-v1",
             })
@@ -976,7 +976,7 @@ def test_worker_reconcile_direct_restart_trace_has_one_winner_and_zero_call_lose
     operation_id = "r" * 64
     runtime_identity = cli._sha256(
         cli._canonical_json({
-            "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
+            **cli._runtime_code_identity(),
             "deepagents": cli._deepagents_version(),
             "checkpoint_namespace": "open-swe-repair-v1",
         })
@@ -1136,7 +1136,7 @@ def test_worker_reconcile_repairs_malformed_write_before_checkpoint_resume(tmp_p
     operation_id = "q" * 64
     runtime_identity = cli._sha256(
         cli._canonical_json({
-            "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
+            **cli._runtime_code_identity(),
             "deepagents": cli._deepagents_version(),
             "checkpoint_namespace": "open-swe-repair-v1",
         })
@@ -1307,7 +1307,7 @@ def test_worker_reconcile_pending_repair_projects_locally_then_continues_origina
     operation_id = "h" * 64
     runtime_identity = cli._sha256(
         cli._canonical_json({
-            "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
+            **cli._runtime_code_identity(),
             "deepagents": cli._deepagents_version(),
             "checkpoint_namespace": "open-swe-repair-v1",
         })
@@ -2039,6 +2039,75 @@ def test_runtime_identity_dispatch():
     assert "artifact_identity" in result
     assert "module_file" in result["artifact_identity"]
     assert "module_sha256" in result["artifact_identity"]
+
+
+def test_identity_keeps_cli_module_hash_and_adds_package_hash():
+    result = cli.dispatch({"schema": cli.REQUEST_SCHEMA, "operation": "identity"})
+    artifact = result["artifact_identity"]
+    assert artifact["module_sha256"] == cli._sha256(Path(cli.__file__).read_bytes())
+    assert artifact["package_sha256"] == cli._package_sha256()
+
+
+def _copy_package_sources(dest: Path) -> Path:
+    dest.mkdir()
+    for source in Path(cli.__file__).resolve().parent.glob("*.py"):
+        (dest / source.name).write_bytes(source.read_bytes())
+    return dest
+
+
+def test_package_sha256_covers_non_cli_modules(tmp_path):
+    package = _copy_package_sources(tmp_path / "pkg")
+    baseline = cli._package_sha256(package)
+    assert cli._package_sha256(package) == baseline
+
+    model_module = package / "model_invocation.py"
+    model_module.write_bytes(model_module.read_bytes() + b"\n# drift\n")
+
+    assert cli._package_sha256(package) != baseline
+
+
+def test_package_sha256_detects_added_and_renamed_modules(tmp_path):
+    package = _copy_package_sources(tmp_path / "pkg")
+    baseline = cli._package_sha256(package)
+
+    (package / "extra_module.py").write_bytes(b"VALUE = 1\n")
+    added = cli._package_sha256(package)
+    assert added != baseline
+
+    (package / "extra_module.py").rename(package / "renamed_module.py")
+    assert cli._package_sha256(package) not in {baseline, added}
+
+
+def test_semantic_runtime_identity_changes_with_non_cli_package_module(tmp_path, monkeypatch):
+    class _IdentityCapturingModel:
+        def __init__(self):
+            self.identity = None
+
+        def configure_invocation_identity(self, identity):
+            self.identity = dict(identity)
+
+    def runtime_identity_for(package_hash: str, run_root: Path) -> str:
+        monkeypatch.setattr(cli, "_package_sha256", lambda *_args, **_kwargs: package_hash)
+        run_root.mkdir()
+        request = _semantic_request(run_root)
+        model = _IdentityCapturingModel()
+        graph = FakeGraph(
+            cli.SEMANTIC_TOOLS,
+            _record("record_finding", {"schema": "external_execution_envelope.v1", "binding": {}}),
+        )
+        result = cli._semantic_run(
+            request,
+            runtime_loader=_runtime,
+            model_factory=lambda *_args: model,
+            graph_factory=lambda *_args: graph,
+        )
+        assert result["status"] == "INTELLIGENCE_COMPLETED"
+        return model.identity["runtime_identity_sha256"]
+
+    first = runtime_identity_for("1" * 64, tmp_path / "first")
+    second = runtime_identity_for("2" * 64, tmp_path / "second")
+
+    assert first != second
 
 
 def test_protocol_schema_mismatch_fails_closed():
@@ -3796,7 +3865,7 @@ def _composite_recovery_fixture(
     target.write_text("VALUE = 1\n", encoding="utf-8")
     runtime_identity = cli._sha256(
         cli._canonical_json({
-            "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
+            **cli._runtime_code_identity(),
             "deepagents": cli._deepagents_version(),
             "checkpoint_namespace": "open-swe-repair-v1",
         })
@@ -4208,7 +4277,7 @@ def test_worker_reconcile_flat_direct_response_with_checkpoint_has_one_local_eff
         transport_config_sha256=cli._sha256(cli._canonical_json(request["transport_config"])),
         runtime_identity_sha256=cli._sha256(
             cli._canonical_json({
-                "module_sha256": cli._sha256(Path(cli.__file__).read_bytes()),
+                **cli._runtime_code_identity(),
                 "deepagents": cli._deepagents_version(),
                 "checkpoint_namespace": "open-swe-repair-v1",
             })
