@@ -116,6 +116,23 @@ def _sha256(value: bytes | str) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _package_sha256(package_root: Path | None = None) -> str:
+    """Digest every package module, ordered by relative path, so any drift changes identity."""
+    root = (package_root or Path(__file__).resolve().parent).resolve()
+    manifest = [
+        f"{path.relative_to(root).as_posix()}\0{_sha256(path.read_bytes())}"
+        for path in sorted(root.rglob("*.py"))
+    ]
+    return _sha256("\n".join(manifest))
+
+
+def _runtime_code_identity() -> dict[str, str]:
+    return {
+        "module_sha256": _sha256(Path(__file__).read_bytes()),
+        "package_sha256": _package_sha256(),
+    }
+
+
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -2529,6 +2546,12 @@ def _semantic_run(
     model_id = str(request.get("model_id") or "")
     if not root.is_dir() or not prompt or not provider or not model_id:
         return _base_result(request, kind="semantic", status="OPEN_SWE_EXECUTION_INPUT_INVALID")
+    try:
+        tool_projection = validate_tool_projection(request)
+    except ToolProjectionError as exc:
+        result = _base_result(request, kind="semantic", status="OPEN_SWE_TOOL_PROJECTION_BLOCKED")
+        result["error_code"] = _bounded_error_code(RuntimeErrorBounded(str(exc)))
+        return result
     started = _write_started(request, "semantic")
     invocation_journal: DurableInvocationJournal | None = None
     try:
@@ -2552,7 +2575,7 @@ def _semantic_run(
             ),
             "runtime_identity_sha256": _sha256(
                 _canonical_json({
-                    "module_sha256": _sha256(Path(__file__).read_bytes()),
+                    **_runtime_code_identity(),
                     "deepagents": _deepagents_version(),
                     "checkpoint_namespace": "open-swe-repair-v1",
                 })
@@ -2561,10 +2584,16 @@ def _semantic_run(
             "acceptance_contract_hash": str(
                 request.get("acceptance_contract_hash") or ""
             ),
-            "effect_authorization_hash": str(
-                request.get("effect_authorization_hash") or ""
+            "effect_authorization_hash": (
+                tool_projection.authorization_hash
+                if tool_projection is not None
+                else str(request.get("effect_authorization_hash") or "")
             ),
-            "tool_projection_hash": str(request.get("tool_projection_hash") or ""),
+            "tool_projection_hash": (
+                tool_projection.projection_hash
+                if tool_projection is not None
+                else str(request.get("tool_projection_hash") or "")
+            ),
             "workspace": str(root),
             "checkpoint_namespace": "open-swe-repair-v1",
         }
@@ -2866,7 +2895,7 @@ def _worker_run(
             transport_config_sha256=_sha256(_canonical_json(request.get("transport_config") or {})),
             runtime_identity_sha256=_sha256(
                 _canonical_json({
-                    "module_sha256": _sha256(Path(__file__).read_bytes()),
+                    **_runtime_code_identity(),
                     "deepagents": _deepagents_version(),
                     "checkpoint_namespace": "open-swe-repair-v1",
                 })
@@ -3288,7 +3317,7 @@ def _worker_reconcile(
         expected_transport = _sha256(_canonical_json(request.get("transport_config") or {}))
         expected_runtime = _sha256(
             _canonical_json({
-                "module_sha256": _sha256(Path(__file__).read_bytes()),
+                **_runtime_code_identity(),
                 "deepagents": _deepagents_version(),
                 "checkpoint_namespace": identity.checkpoint_namespace,
             })
@@ -3607,6 +3636,10 @@ def _identity_result(request: Mapping[str, Any]) -> dict[str, Any]:
         module_sha256 = hashlib.sha256(module_path.read_bytes()).hexdigest()
     except OSError:
         module_sha256 = "unavailable"
+    try:
+        package_sha256 = _package_sha256()
+    except OSError:
+        package_sha256 = "unavailable"
 
     result = _base_result(request, kind="identity", status="IDENTIFIED")
     result.update(
@@ -3616,6 +3649,7 @@ def _identity_result(request: Mapping[str, Any]) -> dict[str, Any]:
         artifact_identity={
             "module_file": str(module_path),
             "module_sha256": module_sha256,
+            "package_sha256": package_sha256,
             "deepagents_version": _deepagents_version(),
         },
         authority_boundary="execution_runtime_only",
