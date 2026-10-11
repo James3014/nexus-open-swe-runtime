@@ -388,6 +388,81 @@ def test_semantic_terminal_result_is_durable_and_reconcile_never_redispatches(tm
     assert graph.calls == 1
 
 
+class _IdentityCapturingModel:
+    def __init__(self):
+        self.identity = None
+
+    def configure_invocation_identity(self, identity):
+        self.identity = dict(identity)
+
+
+def test_semantic_run_tampered_projection_blocks_before_identity_model_or_graph(tmp_path):
+    request = _project_worker_request(
+        _semantic_request(tmp_path),
+        ("read_file", "record_finding", "write_file"),
+    )
+    request["tool_projection_manifest"]["selected_tools"] = [
+        "edit_file",
+        "read_file",
+        "record_finding",
+        "write_file",
+    ]
+    calls = {"model": 0, "graph": 0}
+
+    def model_factory(*_args):
+        calls["model"] += 1
+        return _IdentityCapturingModel()
+
+    def graph_factory(*_args):
+        calls["graph"] += 1
+        return FakeGraph(cli.SEMANTIC_TOOLS)
+
+    result = cli._semantic_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=model_factory,
+        graph_factory=graph_factory,
+    )
+
+    assert result["status"] == "OPEN_SWE_TOOL_PROJECTION_BLOCKED"
+    assert result["error_code"] == "OPEN_SWE_TOOL_PROJECTION_HASH_INVALID"
+    assert result["process_started"] is False
+    assert result["outcome_unknown"] is False
+    assert result["retry_safe"] is False
+    assert calls == {"model": 0, "graph": 0}
+    assert cli._read_operation_state(cli._operation_path(request)) is None
+
+
+def test_semantic_run_identity_binds_validated_projection_not_spoofed_top_level_hashes(
+    tmp_path,
+):
+    request = _project_worker_request(
+        _semantic_request(tmp_path),
+        ("read_file", "record_finding", "write_file"),
+    )
+    validated_authorization_hash = request["effect_authorization"]["authorization_hash"]
+    validated_projection_hash = request["tool_projection_manifest"]["projection_hash"]
+    request["effect_authorization_hash"] = "f" * 64
+    request["tool_projection_hash"] = "e" * 64
+    model = _IdentityCapturingModel()
+    graph = FakeGraph(
+        cli.SEMANTIC_TOOLS,
+        _record("record_finding", {"schema": "external_execution_envelope.v1", "binding": {}}),
+    )
+
+    result = cli._semantic_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: model,
+        graph_factory=lambda *_args: graph,
+    )
+
+    assert result["status"] == "INTELLIGENCE_COMPLETED"
+    assert graph.calls == 1
+    assert model.identity["effect_authorization_hash"] == validated_authorization_hash
+    assert model.identity["tool_projection_hash"] == validated_projection_hash
+
+
 def test_semantic_started_without_terminal_reconciles_to_unknown(tmp_path):
     request = _semantic_request(tmp_path)
     cli._write_started(request, "semantic")

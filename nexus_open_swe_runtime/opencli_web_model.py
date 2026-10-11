@@ -797,6 +797,23 @@ def _tool_call_id(name: str, arguments: Mapping[str, Any], raw: str) -> str:
     return "opencli_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
 
 
+_CREDENTIAL_ENV_MARKERS = ("API_KEY", "SECRET", "PASSWORD", "CREDENTIAL")
+_CREDENTIAL_ENV_PREFIXES = ("GOOGLE_", "GEMINI_", "OPENAI_", "ANTHROPIC_")
+
+
+def _is_credential_env_name(name: str) -> bool:
+    """Return True for env names that carry model-provider or generic secrets.
+
+    OPENCLI-scoped names are exempt because they configure the child process itself.
+    """
+    upper = name.upper()
+    if "OPENCLI" in upper:
+        return False
+    return upper.startswith(_CREDENTIAL_ENV_PREFIXES) or any(
+        marker in upper for marker in _CREDENTIAL_ENV_MARKERS
+    )
+
+
 class OpenCLIWebChatModel(BaseChatModel):
     """LangChain chat-model bridge backed by ChatGPT Web through OpenCLI.
 
@@ -805,9 +822,12 @@ class OpenCLIWebChatModel(BaseChatModel):
     model turn and converts an explicit web response back into an ``AIMessage``.
     Tool execution remains inside Deep Agents / the external Open SWE runtime.
 
-    Retained-conversation recovery and stricter response-schema enforcement are
-    intentionally separate follow-up gates; this W3 bridge uses a fresh ChatGPT
-    conversation for each model turn.
+    Conversation handling: a turn with no bound conversation starts a new ChatGPT
+    conversation (``--new``). Once one is bound, later turns reuse it
+    (``--conversation``), so the web session keeps earlier turns as context.
+    Protocol-repair turns always start a new conversation. Retained-conversation
+    recovery and stricter response-schema enforcement are intentionally separate
+    follow-up gates.
     """
 
     executable: str = "opencli"
@@ -1003,6 +1023,7 @@ class OpenCLIWebChatModel(BaseChatModel):
                 or "TOKEN" in k
                 and "PROVIDER" not in k
                 and "OPENCLI" not in k
+                or _is_credential_env_name(k)
             )
         }
         if self.opencli_profile:
