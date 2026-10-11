@@ -212,6 +212,10 @@ class ScopedRepairBackend:
         relative = _safe_relative_path(file_path)
         if not any(_path_matches(relative, boundary) for boundary in self._allowed):
             raise PermissionError("OPEN_SWE_MUTATION_PATH_FORBIDDEN")
+        # A symlinked component can redirect an authorized lexical path to an
+        # unauthorized physical target, so reject links on every write path.
+        if _workspace_path_has_symlink(self._root, relative):
+            raise PermissionError("OPEN_SWE_MUTATION_PATH_FORBIDDEN")
         physical = (self._root / relative).resolve()
         if not physical.is_relative_to(self._root):
             raise PermissionError("OPEN_SWE_MUTATION_PATH_FORBIDDEN")
@@ -715,6 +719,22 @@ def _worker_tool_projection(request: Mapping[str, Any]) -> ValidatedToolProjecti
         return projection
     except ToolProjectionError as exc:
         raise RuntimeErrorBounded(str(exc)) from exc
+
+
+def _assert_projected_write_paths(
+    projection: ValidatedToolProjection | None, allowed_paths: tuple[str, ...]
+) -> None:
+    """Bind the physical mutation boundary to the authorized write-path ceiling."""
+    if projection is None:
+        return
+    filesystem = projection.selected_effects.get("filesystem")
+    write_paths = filesystem.get("write_paths") if isinstance(filesystem, Mapping) else None
+    if not isinstance(write_paths, list) or not all(isinstance(path, str) for path in write_paths):
+        raise RuntimeErrorBounded("OPEN_SWE_TOOL_PROJECTION_EFFECTS_WIDENED")
+    ceiling = tuple(_safe_relative_path(path) for path in write_paths)
+    for path in allowed_paths:
+        if not any(_path_matches(path, boundary) for boundary in ceiling):
+            raise RuntimeErrorBounded("OPEN_SWE_TOOL_PROJECTION_EFFECTS_WIDENED")
 
 
 def _assert_projected_surface(
@@ -2837,6 +2857,7 @@ def _worker_run(
     try:
         failure_phase = "WORKER_CONTEXT"
         task_id, unit_id, allowed_paths, session_id = _worker_context(request, prompt)
+        _assert_projected_write_paths(tool_projection, allowed_paths)
         failure_phase = "RUNTIME_LOAD"
         runtime = runtime_loader()
         profile_key = f"{provider}:{model_id}"
