@@ -1,0 +1,3 @@
+# Claude bootstrap
+
+@AGENTS.md
