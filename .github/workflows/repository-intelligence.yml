@@ -21,11 +21,17 @@ concurrency:
 jobs:
   snapshot:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      statuses: read
+      actions: read   # supersession and self-workflow exclusion need the Actions runs API
     timeout-minutes: 5
     steps:
       - name: Collect Repository Intelligence
         id: ri
-        uses: James3014/repository-intelligence-engine@88285acf570688befbc8e36eb73f46987171bd4e  # main 2026-10-08 (v0.1.3 candidate, Issue #60)
+        uses: James3014/repository-intelligence-engine@77a937b67c3da4756f535a41b59cdf5555a25e31  # v0.1.5
 
       - name: Validate advisory envelope
         shell: bash
