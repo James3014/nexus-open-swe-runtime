@@ -120,9 +120,14 @@ class RecoveryIdentity:
     core_attempt_id: str = ""
     core_required_verifier_ids: tuple[str, ...] = ()
     core_deletion_policy: str = ""
+    # Parent candidate commit of a Core-bound repair continuation.  Empty for an
+    # initial operation and then omitted, so pre-existing identities are unchanged.
+    core_continuation_base: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
+        if not self.core_continuation_base:
+            value.pop("core_continuation_base")
         value["allowed_paths"] = list(self.allowed_paths)
         value["projected_tools"] = list(self.projected_tools)
         value["core_required_verifier_ids"] = list(self.core_required_verifier_ids)
