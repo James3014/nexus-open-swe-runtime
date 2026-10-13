@@ -1173,7 +1173,8 @@ _BOUND_CONTINUATION_REJECTION_CODES = frozenset({
     "artifact_hash", "artifact_parse", "artifact_schema", "artifact_session", "artifact_scope",
     "artifact_parent", "workspace_symlink", "workspace_read", "origin", "workspace_head",
     "workspace_dirty", "core_binding_source", "workspace_lineage", "workspace_scope",
-    "prior_bound_terminal",
+    "prior_bound_terminal", "core_binding_freshness", "core_binding_expired",
+    "prior_projection", "parent_tree",
 })
 _FAILURE_PHASES = frozenset({
     "WORKER_CONTEXT", "RUNTIME_LOAD", "SEMANTIC_ADMISSION", "RECOVERY_PREPARE",
@@ -2733,12 +2734,20 @@ def _session_core_identity_value(core_identity: Mapping[str, Any]) -> dict[str, 
     }
 
 
+def _binding_valid_until(mutation_binding: Mapping[str, Any]) -> str:
+    freshness = mutation_binding.get("freshness")
+    if not isinstance(freshness, Mapping) or freshness.get("valid_until") is None:
+        return ""
+    return str(freshness["valid_until"])
+
+
 def _bind_session_core_identity(
     request: Mapping[str, Any],
     session_id: str,
     core_identity: Mapping[str, Any],
     *,
     allow_initial_bind: bool,
+    valid_until: str = "",
 ) -> None:
     path = _session_path(request, session_id)
     context = _read_json(path)
@@ -2750,7 +2759,12 @@ def _bind_session_core_identity(
     if not present:
         if not allow_initial_bind:
             raise RuntimeErrorBounded("SESSION_CORE_BINDING_MISSING")
-        _atomic_json(path, {**context, **expected})
+        # ``core_valid_until`` is additive and omitted when the binding has none; a
+        # bound continuation requires it (see ``_bound_continuation_admission``).
+        _atomic_json(
+            path,
+            {**context, **expected, **({"core_valid_until": valid_until} if valid_until else {})},
+        )
         return
     actual = {key: context.get(key) for key in expected}
     if actual != expected:
@@ -2818,8 +2832,15 @@ def _bound_continuation_admission(
     unit_id: str,
     allowed_paths: tuple[str, ...],
     core_identity: Mapping[str, Any],
+    valid_until: Any = None,
 ) -> tuple[str, Mapping[str, Any]]:
     """Admit a repair continuation of a BOUND session without a new Core binding.
+
+    The binding's ``valid_until`` (persisted on the session at the initial bind) is
+    re-enforced: an expired or unknown deadline rejects before any effect.  The
+    parent candidate commit's tree must equal the target tree the prior BOUND
+    terminal projected from its journaled effects, so no unjournaled change can be
+    carried into the continuation as if it were already bound.
 
     The session's Core identity was persisted only after full binding validation
     (including freshness) admitted the session's first effect.  A continuation is
@@ -2835,6 +2856,11 @@ def _bound_continuation_admission(
         raise _bound_continuation_reject("core_binding_absent")
     if supplied != (core_identity["core_binding_hash"], core_identity["acceptance_contract_hash"]):
         raise _bound_continuation_reject("core_binding_hash")
+    deadline = _parse_rfc3339(valid_until)
+    if deadline is None:
+        raise _bound_continuation_reject("core_binding_freshness")
+    if deadline <= datetime.now(timezone.utc):
+        raise _bound_continuation_reject("core_binding_expired")
     if artifact_bytes is None:
         raise _bound_continuation_reject("artifact_read")
     expected_sha = _prompt_optional_field(prompt, "repair_sha256")
@@ -2924,6 +2950,28 @@ def _bound_continuation_admission(
         or (prior.get("core_binding_hash"), prior.get("acceptance_contract_hash")) != supplied
     ):
         raise _bound_continuation_reject("prior_bound_terminal")
+    projection = prior.get("core_change_set_projection")
+    manifest = projection.get("change_manifest") if isinstance(projection, Mapping) else None
+    change_set = projection.get("change_set") if isinstance(projection, Mapping) else None
+    target_tree = manifest.get("target_tree") if isinstance(manifest, Mapping) else None
+    if (
+        not isinstance(projection, Mapping)
+        or projection.get("status") != "PHYSICAL_CHANGESET_BOUND"
+        or (projection.get("core_binding_hash"), projection.get("acceptance_contract_hash"))
+        != supplied
+        or not isinstance(change_set, Mapping)
+        or change_set.get("source_revision") != core_identity["core_source_revision"]
+        or not isinstance(manifest, Mapping)
+        or manifest.get("source_tree") != core_identity["core_source_tree"]
+        or not _typed_git_tree(target_tree)
+    ):
+        raise _bound_continuation_reject("prior_projection")
+    try:
+        parent_tree = _git_output(workspace, "rev-parse", "--verify", f"{parent}^{{tree}}")
+    except RuntimeErrorBounded as exc:
+        raise _bound_continuation_reject("parent_tree") from exc
+    if f"git-tree:{parent_tree}" != target_tree:
+        raise _bound_continuation_reject("parent_tree")
     return parent, delta
 
 
@@ -3058,10 +3106,10 @@ def _worker_run(
         profile_key = f"{provider}:{model_id}"
         failure_phase = "SEMANTIC_ADMISSION"
         session_core_identity: dict[str, Any] | None = None
+        session_context: dict[str, Any] = {}
         if request.get("operation") == "worker_continue" and had_session_binding:
-            session_core_identity = _session_core_identity(
-                _read_json(_session_path(request, session_id)) or {}
-            )
+            session_context = _read_json(_session_path(request, session_id)) or {}
+            session_core_identity = _session_core_identity(session_context)
             if session_core_identity is None and (
                 request.get("core_binding_hash") or request.get("acceptance_contract_hash")
             ):
@@ -3078,6 +3126,7 @@ def _worker_run(
                 unit_id=unit_id,
                 allowed_paths=allowed_paths,
                 core_identity=session_core_identity,
+                valid_until=session_context.get("core_valid_until"),
             )
             _bind_session_core_identity(
                 request, session_id, session_core_identity, allow_initial_bind=False
@@ -3108,6 +3157,7 @@ def _worker_run(
                 session_id,
                 core_identity,
                 allow_initial_bind=not had_session_binding,
+                valid_until=_binding_valid_until(packet["repository_mutation_binding"]),
             )
         hint_binding = _worker_hint_binding(request, tool_projection, core_identity)
         hint_observer = HintExecutionObserver(hint_binding, workspace)

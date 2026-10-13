@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -121,7 +122,14 @@ def _factories(calls: _Calls, content: str) -> dict[str, Any]:
     }
 
 
-def _bound_initial_request(tmp_path: Path) -> dict[str, Any]:
+def _future(seconds: int = 3600) -> str:
+    moment = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    return moment.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _bound_initial_request(tmp_path: Path, valid_until: str | None = "") -> dict[str, Any]:
+    if valid_until == "":
+        valid_until = _future()
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     _git(workspace, "init", "-q")
@@ -131,17 +139,19 @@ def _bound_initial_request(tmp_path: Path) -> dict[str, Any]:
     card = workspace / CARD_REF
     card.parent.mkdir(parents=True)
     card.write_text(
-        "\n".join([
-            "- task_id: `task-1`",
-            "- status: `ACTIVE`",
-            "- worker_may_approve: `false`",
-            "- worker_may_integrate: `false`",
-            "- worker_may_push: `false`",
-            "- AUTO_CHAIN: `false`",
-            "- allow_deletions: `false`",
-            "\n## Allowed files\n",
-            f"- `{TARGET}`",
-        ]),
+        "\n".join(
+            [
+                "- task_id: `task-1`",
+                "- status: `ACTIVE`",
+                "- worker_may_approve: `false`",
+                "- worker_may_integrate: `false`",
+                "- worker_may_push: `false`",
+                "- AUTO_CHAIN: `false`",
+                "- allow_deletions: `false`",
+                "\n## Allowed files\n",
+                f"- `{TARGET}`",
+            ]
+        ),
         encoding="utf-8",
     )
     _git(workspace, "add", "-A")
@@ -185,7 +195,7 @@ def _bound_initial_request(tmp_path: Path) -> dict[str, Any]:
         },
         "freshness": {
             "created_at": "2026-10-13T00:00:00Z",
-            "valid_until": None,
+            "valid_until": valid_until,
             "revalidate_before_first_effect": True,
         },
     }
@@ -219,7 +229,10 @@ def _bound_initial_request(tmp_path: Path) -> dict[str, Any]:
             "next_probe": "inspect the absent target",
         },
         "definition_of_done": ["one bounded test"],
-        "evidence_refs": [f"task_card:{CARD_REF}@" + "a" * 16, f"source_absence:{TARGET}@" + "b" * 16],
+        "evidence_refs": [
+            f"task_card:{CARD_REF}@" + "a" * 16,
+            f"source_absence:{TARGET}@" + "b" * 16,
+        ],
         "inspect_first": [f"task_card:{CARD_REF}@" + "a" * 16],
         "failure_guards": ["no other paths"],
         "implementation_direction": ["create one test"],
@@ -253,13 +266,15 @@ def _bound_initial_request(tmp_path: Path) -> dict[str, Any]:
         "runtime_state_root": str(tmp_path / "state"),
         "workspace_path": str(workspace),
         "artifact_path": str(artifact),
-        "prompt": "\n".join([
-            "task_id=task-1",
-            "unit_id=u1",
-            f"authorized_mutation_paths={json.dumps([TARGET])}",
-            f"envelope_sha256={cli._sha256(raw)}",
-            f"expected_base_sha={base}",
-        ]),
+        "prompt": "\n".join(
+            [
+                "task_id=task-1",
+                "unit_id=u1",
+                f"authorized_mutation_paths={json.dumps([TARGET])}",
+                f"envelope_sha256={cli._sha256(raw)}",
+                f"expected_base_sha={base}",
+            ]
+        ),
         "session_id": "",
         "worker_identity": dict(selected),
         "worker_identity_sha256": cli._sha256(cli._canonical_json(selected)),
@@ -321,15 +336,17 @@ def _continue_request(
         operation_id=CONTINUE_OPERATION,
         session_id=session_id,
         artifact_path=str(delta_path),
-        prompt="\n".join([
-            "Continue the exact same execution unit session for a bounded repair.",
-            "task_id=task-1",
-            "unit_id=u1",
-            "repair_id=d001",
-            f"repair_artifact_ref={delta_path}",
-            f"repair_sha256={delta_sha}",
-            f"parent_candidate_commit={parent}",
-        ]),
+        prompt="\n".join(
+            [
+                "Continue the exact same execution unit session for a bounded repair.",
+                "task_id=task-1",
+                "unit_id=u1",
+                "repair_id=d001",
+                f"repair_artifact_ref={delta_path}",
+                f"repair_sha256={delta_sha}",
+                f"parent_candidate_commit={parent}",
+            ]
+        ),
     )
     request.pop("attempt_id")
     return request
@@ -373,8 +390,9 @@ def test_bound_continuation_keeps_same_core_identity_and_reconciles_with_hashes(
     assert projection["operation_id"] == CONTINUE_OPERATION
     assert projection["attempt_id"] == "attempt-test-1"
     assert projection["change_set"]["paths"] == [TARGET]
-    assert projection["change_set"]["source_revision"] == (
-        first["core_change_set_projection"]["change_set"]["source_revision"]
+    assert (
+        projection["change_set"]["source_revision"]
+        == (first["core_change_set_projection"]["change_set"]["source_revision"])
     )
     workspace = Path(initial["workspace_path"])
     assert (workspace / TARGET).read_text(encoding="utf-8") == "VALUE = 2\n"
@@ -413,8 +431,7 @@ def test_bound_continuation_keeps_same_core_identity_and_reconciles_with_hashes(
         (lambda r: r.update(acceptance_contract_hash="sha256:" + "9" * 64), "CORE_BINDING_HASH"),
         (
             lambda r: Path(r["artifact_path"]).write_text(
-                Path(r["artifact_path"]).read_text(encoding="utf-8").replace("d001", "d002")
-                + " ",
+                Path(r["artifact_path"]).read_text(encoding="utf-8").replace("d001", "d002") + " ",
                 encoding="utf-8",
             ),
             "ARTIFACT_HASH",
@@ -552,12 +569,14 @@ def _legacy_session(tmp_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
         "runtime_state_root": str(tmp_path / "state"),
         "workspace_path": str(workspace),
         "artifact_path": str(artifact),
-        "prompt": "\n".join([
-            "task_id=task-1",
-            "unit_id=u1",
-            f"authorized_mutation_paths={json.dumps([TARGET])}",
-            "bounded repair",
-        ]),
+        "prompt": "\n".join(
+            [
+                "task_id=task-1",
+                "unit_id=u1",
+                f"authorized_mutation_paths={json.dumps([TARGET])}",
+                "bounded repair",
+            ]
+        ),
         "session_id": "",
         "worker_identity_sha256": "c" * 64,
     }
@@ -613,3 +632,85 @@ def test_recovery_identity_omits_empty_continuation_base_for_existing_identities
     continued = RecoveryIdentity(**fields, core_continuation_base="f" * 40)
     assert continued.as_dict()["core_continuation_base"] == "f" * 40
     assert continued.digest() != initial.digest()
+
+
+def test_session_persists_binding_valid_until_and_expired_binding_rejects(tmp_path, bound_session):
+    session_id = bound_session.result["session_id"]
+    request = _continue_request(tmp_path, bound_session.initial, session_id, bound_session.parent)
+    session_path = cli._session_path(request, session_id)
+    context = json.loads(session_path.read_text(encoding="utf-8"))
+    envelope = json.loads(Path(bound_session.initial["artifact_path"]).read_text("utf-8"))
+    persisted = envelope["repository_mutation_binding"]["freshness"]["valid_until"]
+    assert context["core_valid_until"] == persisted
+
+    context["core_valid_until"] = "2026-01-01T00:00:00Z"
+    session_path.write_text(json.dumps(context), encoding="utf-8")
+    result, calls = _run_continue(request)
+    assert result["error_code"] == "OPEN_SWE_BOUND_CONTINUATION_REJECTED_CORE_BINDING_EXPIRED"
+    assert calls.as_tuple() == (0, 0, 0)
+    assert (Path(request["workspace_path"]) / TARGET).read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
+def test_session_without_binding_deadline_cannot_be_continued(tmp_path):
+    initial = _bound_initial_request(tmp_path, valid_until=None)
+    first, _calls = _run_continue(initial, "VALUE = 1\n")
+    assert first["status"] == "COMPLETED", first
+    context = json.loads(
+        cli._session_path(initial, first["session_id"]).read_text(encoding="utf-8")
+    )
+    assert "core_valid_until" not in context
+    parent = _capture_candidate(Path(initial["workspace_path"]))
+    result, calls = _run_continue(_continue_request(tmp_path, initial, first["session_id"], parent))
+    assert result["error_code"] == "OPEN_SWE_BOUND_CONTINUATION_REJECTED_CORE_BINDING_FRESHNESS"
+    assert calls.as_tuple() == (0, 0, 0)
+
+
+@pytest.mark.parametrize("variant", ["extra_commit", "different_content"])
+def test_parent_tree_must_equal_prior_projected_target_tree(tmp_path, variant):
+    initial = _bound_initial_request(tmp_path)
+    first, _calls = _run_continue(initial, "VALUE = 1\n")
+    assert first["status"] == "COMPLETED", first
+    workspace = Path(initial["workspace_path"])
+    if variant == "different_content":
+        # An in-scope change made outside the bound operation before capture.
+        (workspace / TARGET).write_text("VALUE = 'unjournaled'\n", encoding="utf-8")
+        parent = _capture_candidate(workspace)
+    else:
+        _capture_candidate(workspace)
+        (workspace / TARGET).write_text("VALUE = 'unjournaled'\n", encoding="utf-8")
+        parent = _capture_candidate(workspace)
+    result, calls = _run_continue(_continue_request(tmp_path, initial, first["session_id"], parent))
+    assert result["error_code"] == "OPEN_SWE_BOUND_CONTINUATION_REJECTED_PARENT_TREE"
+    assert calls.as_tuple() == (0, 0, 0)
+    assert (workspace / TARGET).read_text(encoding="utf-8") == "VALUE = 'unjournaled'\n"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda prior: prior.pop("core_change_set_projection"),
+        lambda prior: prior["core_change_set_projection"].update(status="NO_PHYSICAL_CHANGESET"),
+        lambda prior: prior["core_change_set_projection"].update(
+            core_binding_hash="sha256:" + "9" * 64
+        ),
+        lambda prior: prior["core_change_set_projection"]["change_manifest"].update(
+            target_tree="not-a-tree"
+        ),
+        lambda prior: prior["core_change_set_projection"].pop("change_manifest"),
+        lambda prior: prior["core_change_set_projection"]["change_set"].update(
+            source_revision="git-commit:" + "0" * 40
+        ),
+    ],
+    ids=["missing", "status", "hash", "target_tree", "no_manifest", "source"],
+)
+def test_missing_or_malformed_prior_projection_rejects(tmp_path, bound_session, mutate):
+    request = _continue_request(
+        tmp_path, bound_session.initial, bound_session.result["session_id"], bound_session.parent
+    )
+    index_path = cli._workspace_index_path(request)
+    prior = json.loads(index_path.read_text(encoding="utf-8"))
+    mutate(prior)
+    index_path.write_text(json.dumps(prior), encoding="utf-8")
+    result, calls = _run_continue(request)
+    assert result["error_code"] == "OPEN_SWE_BOUND_CONTINUATION_REJECTED_PRIOR_PROJECTION"
+    assert calls.as_tuple() == (0, 0, 0)
