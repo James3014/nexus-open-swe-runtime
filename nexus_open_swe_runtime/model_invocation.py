@@ -689,6 +689,11 @@ class DurableInvocationJournal:
             except (OSError, ValueError) as exc:
                 raise ModelInvocationError("MODEL_INVOCATION_RECORD_CORRUPT") from exc
             try:
+                # The state root is shared by every operation, so receipts written by other
+                # operations are well-formed but foreign: skip them instead of failing this one.
+                own_operation = self.binding.get("operation_id", "")
+                if own_operation and _validated_receipt(raw, None)["operation_id"] != own_operation:
+                    continue
                 receipt = _validated_receipt(raw, self.binding)
             except ModelInvocationError as exc:
                 if str(exc) == "MODEL_INVOCATION_IDENTITY_MISMATCH":

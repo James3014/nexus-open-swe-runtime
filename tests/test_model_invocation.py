@@ -230,6 +230,26 @@ class TestJournalRoundTrip:
         state_root, journal = _fresh_journal()
         assert journal.result_invocations() == []
 
+    def test_shared_state_root_skips_other_operations(self):
+        state_root, journal = _fresh_journal()
+        a = _receipt()
+        journal.record(a)
+        other_identity = {**_identity(), "operation_id": "op-next"}
+        other = DurableInvocationJournal(state_root, other_identity)
+        b = _receipt(identity=other_identity, attempt=_attempt(invocation_id="inv_next"))
+        other.record(b)
+        assert journal.result_invocations() == [a]
+        assert other.result_invocations() == [b]
+
+    def test_same_operation_identity_mismatch_still_fails_closed(self):
+        state_root, journal = _fresh_journal()
+        foreign_identity = {**_identity(), "effect_authorization_hash": "FOREIGN"}
+        DurableInvocationJournal(state_root, foreign_identity).record(
+            _receipt(identity=foreign_identity)
+        )
+        with pytest.raises(ModelInvocationError, match="MODEL_INVOCATION_IDENTITY_MISMATCH"):
+            journal.result_invocations()
+
 
 
 class _GenericDelegate:
