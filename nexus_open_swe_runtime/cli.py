@@ -1168,6 +1168,13 @@ _SEMANTIC_REJECTION_CODES = frozenset({
     "core_binding_scope", "core_binding_deletion", "core_binding_contract_hash",
     "core_binding_freshness",
 })
+_BOUND_CONTINUATION_REJECTION_CODES = frozenset({
+    "session_core_binding", "core_binding_absent", "core_binding_hash", "artifact_read",
+    "artifact_hash", "artifact_parse", "artifact_schema", "artifact_session", "artifact_scope",
+    "artifact_parent", "workspace_symlink", "workspace_read", "origin", "workspace_head",
+    "workspace_dirty", "core_binding_source", "workspace_lineage", "workspace_scope",
+    "prior_bound_terminal",
+})
 _FAILURE_PHASES = frozenset({
     "WORKER_CONTEXT", "RUNTIME_LOAD", "SEMANTIC_ADMISSION", "RECOVERY_PREPARE",
     "DIAGNOSIS", "REPAIR", "RESULT_FINALIZATION",
@@ -1222,6 +1229,9 @@ def _bounded_error_code(exc: BaseException) -> str:
         )) or any(
             code == f"OPEN_SWE_SEMANTIC_V2_REJECTED_{reason.upper()}"
             for reason in _SEMANTIC_REJECTION_CODES
+        ) or any(
+            code == f"OPEN_SWE_BOUND_CONTINUATION_REJECTED_{reason.upper()}"
+            for reason in _BOUND_CONTINUATION_REJECTION_CODES
         ):
             return code
         return "OPEN_SWE_BOUNDED_FAILURE_UNCLASSIFIED"
@@ -1412,7 +1422,21 @@ def _physical_core_changeset_projection(
             if actual_sha != effect.get("postimage_sha256"):
                 raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH")
         effect_paths.add(relative)
-    if actual_paths and not set(actual_paths).issubset(effect_paths):
+    journaled_scope = set(actual_paths)
+    continuation_base = identity.core_continuation_base
+    if continuation_base:
+        # A bound repair continuation starts on the parent candidate commit, whose
+        # changes the parent bound operation already journaled and projected.  Only
+        # changes on top of that commit must be journaled by this operation; the
+        # cumulative change set against the bound source is still scope-checked above.
+        if re.fullmatch(r"[0-9a-f]{40}", continuation_base) is None:
+            raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_SOURCE_INVALID")
+        try:
+            _git_output(workspace, "merge-base", "--is-ancestor", source_commit, continuation_base)
+        except RuntimeErrorBounded as exc:
+            raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_SOURCE_MISMATCH") from exc
+        journaled_scope = set(_physical_changed_paths(workspace, continuation_base))
+    if journaled_scope and not journaled_scope.issubset(effect_paths):
         raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_UNJOURNALED_EFFECT")
     if not actual_paths:
         return {
@@ -2733,6 +2757,176 @@ def _bind_session_core_identity(
         raise RuntimeErrorBounded("SESSION_CORE_BINDING_MISMATCH")
 
 
+_SESSION_CORE_KEYS = (
+    "core_binding_hash",
+    "acceptance_contract_hash",
+    "core_repository",
+    "core_source_revision",
+    "core_source_tree",
+    "core_attempt_id",
+    "core_required_verifier_ids",
+    "core_deletion_policy",
+)
+_REPAIR_DELTA_SCHEMAS = frozenset({"unit_repair_delta.v2", "composition_repair_delta.v1"})
+
+
+def _bound_continuation_reject(reason: str) -> RuntimeErrorBounded:
+    return RuntimeErrorBounded(f"OPEN_SWE_BOUND_CONTINUATION_REJECTED_{reason.upper()}")
+
+
+def _session_core_identity(context: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return the Core identity persisted on a BOUND session, or None if never bound."""
+    present = [key for key in _SESSION_CORE_KEYS if key in context]
+    if not present:
+        return None
+    verifier_ids = context.get("core_required_verifier_ids")
+    if (
+        len(present) != len(_SESSION_CORE_KEYS)
+        or not _prefixed_sha256(context.get("core_binding_hash"))
+        or not _prefixed_sha256(context.get("acceptance_contract_hash"))
+        or not isinstance(context.get("core_repository"), str)
+        or not context["core_repository"].strip()
+        or not _typed_git_commit(context.get("core_source_revision"))
+        or not _typed_git_tree(context.get("core_source_tree"))
+        or not isinstance(context.get("core_attempt_id"), str)
+        or not context["core_attempt_id"].strip()
+        or not _string_list(verifier_ids)
+        or not verifier_ids
+        or context.get("core_deletion_policy") != "FORBID"
+    ):
+        raise _bound_continuation_reject("session_core_binding")
+    return {
+        "core_binding_hash": str(context["core_binding_hash"]),
+        "acceptance_contract_hash": str(context["acceptance_contract_hash"]),
+        "core_repository": str(context["core_repository"]),
+        "core_source_revision": str(context["core_source_revision"]),
+        "core_source_tree": str(context["core_source_tree"]),
+        "core_attempt_id": str(context["core_attempt_id"]),
+        "core_required_verifier_ids": tuple(str(value) for value in verifier_ids),
+        "core_deletion_policy": str(context["core_deletion_policy"]),
+    }
+
+
+def _bound_continuation_admission(
+    request: Mapping[str, Any],
+    workspace: Path,
+    prompt: str,
+    artifact_bytes: bytes | None,
+    *,
+    session_id: str,
+    task_id: str,
+    unit_id: str,
+    allowed_paths: tuple[str, ...],
+    core_identity: Mapping[str, Any],
+) -> tuple[str, Mapping[str, Any]]:
+    """Admit a repair continuation of a BOUND session without a new Core binding.
+
+    The session's Core identity was persisted only after full binding validation
+    (including freshness) admitted the session's first effect.  A continuation is
+    bound to that same identity: the caller must echo the exact binding/contract
+    hashes, the hash-pinned repair artifact must name this session, unit, workspace
+    and scope, the workspace must sit cleanly on the parent candidate commit that
+    descends from the bound source revision with every cumulative change inside the
+    bound scope, and the workspace's last terminal result must be a COMPLETED BOUND
+    result of this session.  Returns ``(parent_candidate_commit, repair_artifact)``.
+    """
+    supplied = (request.get("core_binding_hash"), request.get("acceptance_contract_hash"))
+    if any(value in (None, "") for value in supplied):
+        raise _bound_continuation_reject("core_binding_absent")
+    if supplied != (core_identity["core_binding_hash"], core_identity["acceptance_contract_hash"]):
+        raise _bound_continuation_reject("core_binding_hash")
+    if artifact_bytes is None:
+        raise _bound_continuation_reject("artifact_read")
+    expected_sha = _prompt_optional_field(prompt, "repair_sha256")
+    if not expected_sha or _sha256(artifact_bytes) != expected_sha:
+        raise _bound_continuation_reject("artifact_hash")
+    try:
+        delta = _parse_unique_json(artifact_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise _bound_continuation_reject("artifact_parse") from exc
+    if delta.get("schema") not in _REPAIR_DELTA_SCHEMAS:
+        raise _bound_continuation_reject("artifact_schema")
+    delta_workspace = delta.get("workspace_path")
+    if (
+        delta.get("session_id") != session_id
+        or delta.get("task_id") != task_id
+        or delta.get("unit_id") != unit_id
+        or not isinstance(delta_workspace, str)
+        or Path(delta_workspace).expanduser().resolve() != workspace
+    ):
+        raise _bound_continuation_reject("artifact_session")
+    delta_paths = delta.get("allowed_mutation_paths")
+    try:
+        scope_matches = _string_list(delta_paths) and sorted(
+            _safe_relative_path(path) for path in delta_paths
+        ) == sorted(allowed_paths)
+    except RuntimeErrorBounded as exc:
+        raise _bound_continuation_reject("artifact_scope") from exc
+    if not scope_matches:
+        raise _bound_continuation_reject("artifact_scope")
+    parent = delta.get("parent_candidate_commit")
+    if (
+        not isinstance(parent, str)
+        or re.fullmatch(r"[0-9a-f]{40}", parent) is None
+        or _prompt_optional_field(prompt, "parent_candidate_commit") != parent
+    ):
+        raise _bound_continuation_reject("artifact_parent")
+    if (
+        workspace.is_symlink()
+        or _workspace_path_has_symlink(workspace, "")
+        or any(_workspace_path_has_symlink(workspace, path) for path in allowed_paths)
+    ):
+        raise _bound_continuation_reject("workspace_symlink")
+    source_commit = str(core_identity["core_source_revision"]).removeprefix("git-commit:")
+    try:
+        origin = _git_output(workspace, "remote", "get-url", "origin")
+        head = _git_output(workspace, "rev-parse", "HEAD")
+        status = _git_output(workspace, "status", "--porcelain")
+        source_tree = _git_output(workspace, "rev-parse", "--verify", f"{source_commit}^{{tree}}")
+    except RuntimeErrorBounded as exc:
+        raise _bound_continuation_reject("workspace_read") from exc
+    if not _canonical_origin_repository(origin) or _canonical_origin_repository(
+        origin
+    ) != _canonical_binding_repository(str(core_identity["core_repository"])):
+        raise _bound_continuation_reject("origin")
+    if head != parent:
+        raise _bound_continuation_reject("workspace_head")
+    if status:
+        raise _bound_continuation_reject("workspace_dirty")
+    if f"git-tree:{source_tree}" != core_identity["core_source_tree"]:
+        raise _bound_continuation_reject("core_binding_source")
+    if head == source_commit:
+        raise _bound_continuation_reject("workspace_lineage")
+    try:
+        _git_output(workspace, "merge-base", "--is-ancestor", source_commit, head)
+    except RuntimeErrorBounded as exc:
+        raise _bound_continuation_reject("workspace_lineage") from exc
+    try:
+        changes = _physical_changed_paths(workspace, source_commit)
+    except RuntimeErrorBounded as exc:
+        raise _bound_continuation_reject("workspace_scope") from exc
+    if (
+        not changes
+        or any(path not in allowed_paths for path in changes)
+        or any(change == "DELETE" for change in changes.values())
+    ):
+        raise _bound_continuation_reject("workspace_scope")
+    try:
+        prior = _read_json(_workspace_index_path(request))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _bound_continuation_reject("prior_bound_terminal") from exc
+    if (
+        prior is None
+        or prior.get("kind") != "worker"
+        or prior.get("status") != "COMPLETED"
+        or prior.get("core_binding_status") != "BOUND"
+        or prior.get("session_id") != session_id
+        or (prior.get("core_binding_hash"), prior.get("acceptance_contract_hash")) != supplied
+    ):
+        raise _bound_continuation_reject("prior_bound_terminal")
+    return parent, delta
+
+
 def _worker_context(
     request: Mapping[str, Any], prompt: str
 ) -> tuple[str, str, tuple[str, ...], str]:
@@ -2849,6 +3043,7 @@ def _worker_run(
     effect_journal: DurableEffectJournal | None = None
     semantic_admission = FALLBACK
     core_identity: dict[str, Any] = {}
+    continuation_base = ""
     had_session_binding = bool(request.get("session_id"))
     diagnosis_model: Any | None = None
     invocation_journal: DurableInvocationJournal | None = None
@@ -2862,9 +3057,41 @@ def _worker_run(
         runtime = runtime_loader()
         profile_key = f"{provider}:{model_id}"
         failure_phase = "SEMANTIC_ADMISSION"
-        semantic_admission = _semantic_v2_admission(
-            request, workspace, artifact, prompt, allowed_paths, artifact_bytes
-        )
+        session_core_identity: dict[str, Any] | None = None
+        if request.get("operation") == "worker_continue" and had_session_binding:
+            session_core_identity = _session_core_identity(
+                _read_json(_session_path(request, session_id)) or {}
+            )
+            if session_core_identity is None and (
+                request.get("core_binding_hash") or request.get("acceptance_contract_hash")
+            ):
+                # An unbound session can never be continued as a BOUND one.
+                raise _bound_continuation_reject("session_core_binding")
+        if session_core_identity is not None:
+            continuation_base, repair_artifact = _bound_continuation_admission(
+                request,
+                workspace,
+                prompt,
+                artifact_bytes,
+                session_id=session_id,
+                task_id=task_id,
+                unit_id=unit_id,
+                allowed_paths=allowed_paths,
+                core_identity=session_core_identity,
+            )
+            _bind_session_core_identity(
+                request, session_id, session_core_identity, allow_initial_bind=False
+            )
+            core_identity = session_core_identity
+            # The repair artifact is untrusted model evidence; diagnosis runs as for
+            # any non-PROVEN packet, while the Core identity stays the session's.
+            semantic_admission = SemanticAdmission(
+                FALLBACK, artifact_bytes or b"", repair_artifact
+            )
+        else:
+            semantic_admission = _semantic_v2_admission(
+                request, workspace, artifact, prompt, allowed_paths, artifact_bytes
+            )
         semantic_admission_decision = semantic_admission.decision
         if semantic_admission_decision == REJECT:
             reason = semantic_admission.reason_code or "predicate_exception"
@@ -2935,6 +3162,7 @@ def _worker_run(
                 tool_projection.selected_tools if tool_projection is not None else ()
             ),
             **core_identity,
+            core_continuation_base=continuation_base,
         )
         recovery_journal = DurableOperationJournal(
             request.get("runtime_state_root") or "", recovery_identity
@@ -3310,6 +3538,7 @@ def _worker_reconcile(
                 str(value) for value in identity_data.get("core_required_verifier_ids", [])
             ),
             core_deletion_policy=str(identity_data.get("core_deletion_policy", "")),
+            core_continuation_base=str(identity_data.get("core_continuation_base", "")),
         )
         if identity.operation_id != operation_id:
             return cached
