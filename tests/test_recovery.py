@@ -393,7 +393,8 @@ def test_scoped_backend_edit_normalizes_hostile_newlines_once(tmp_path: Path, ne
 
     assert result.path == "a.py"
     assert result.occurrences == 1
-    assert target.read_bytes() == b"new\n"
+    # #130 review: the file's own line ending is preserved (previously rewritten to LF).
+    assert target.read_bytes() == f"new{newline}".encode()
     records = list(journal.root.glob("*.json"))
     assert len(records) == 1
     assert json.loads(records[0].read_text(encoding="utf-8"))["status"] == "RESULT"

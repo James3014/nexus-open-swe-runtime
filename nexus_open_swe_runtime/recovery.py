@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import tempfile
 import threading
 import time
@@ -123,11 +124,18 @@ class RecoveryIdentity:
     # Parent candidate commit of a Core-bound repair continuation.  Empty for an
     # initial operation and then omitted, so pre-existing identities are unchanged.
     core_continuation_base: str = ""
+    # Card/authority/forbidden paths the write backend must refuse (shared path
+    # gate, #130).  Omitted when empty so pre-existing identities are unchanged.
+    mutation_protected_paths: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
         if not self.core_continuation_base:
             value.pop("core_continuation_base")
+        if self.mutation_protected_paths:
+            value["mutation_protected_paths"] = list(self.mutation_protected_paths)
+        else:
+            value.pop("mutation_protected_paths")
         value["allowed_paths"] = list(self.allowed_paths)
         value["projected_tools"] = list(self.projected_tools)
         value["core_required_verifier_ids"] = list(self.core_required_verifier_ids)
@@ -400,17 +408,20 @@ class DurableEffectJournal:
             raise RuntimeError("RECOVERY_WRITE_SYMLINK")
         if state.get("status") == "RESULT":
             return "RESULT"
-        actual = _sha(path.read_text(encoding="utf-8")) if path.exists() else "absent"
+        actual = _sha(path.read_bytes()) if path.exists() else "absent"
         if actual == effect.postimage_sha256:
             _fsync_replace(self._path(effect.effect_id), {"status": "RESULT", **asdict(effect)})
             return "RESULT"
         if actual != effect.preimage_sha256:
             raise RuntimeError("RECOVERY_WRITE_PREIMAGE_MISMATCH")
+        # Replacing an existing file keeps its permission bits (e.g. 0o755);
+        # new files are created private.
+        mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            os.fchmod(fd, mode)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
                 stream.write(effect.postimage)
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -423,7 +434,7 @@ class DurableEffectJournal:
         finally:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(temporary)
-        if _sha(path.read_text(encoding="utf-8")) != effect.postimage_sha256:
+        if _sha(path.read_bytes()) != effect.postimage_sha256:
             raise RuntimeError("RECOVERY_WRITE_POSTIMAGE_MISMATCH")
         _fsync_replace(self._path(effect.effect_id), {"status": "RESULT", **asdict(effect)})
         return "RESULT"
