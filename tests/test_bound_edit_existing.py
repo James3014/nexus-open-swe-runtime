@@ -692,3 +692,145 @@ def test_backend_forbids_symlink_and_escape_and_directory_targets(tmp_path):
         backend.write("pkg/../../escape.py", "VALUE = 2\n")
     assert (root / "pkg" / "core.py").read_text(encoding="utf-8") == "VALUE = 1\n"
     assert (outside / "core.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
+# --- review hardening (#130 review of PR #131) -----------------------------------
+
+
+def _run_real_backend(
+    request: dict[str, Any],
+    actions: Callable[[cli.ScopedRepairBackend, Path], None],
+) -> dict[str, Any]:
+    """Run the bound worker with a repair graph that drives the REAL scoped backend."""
+
+    def repair_factory(
+        _model, workspace, _runtime, allowed_paths, _key, checkpointer=None, effect_journal=None
+    ):
+        assert effect_journal is not None
+        backend = cli.ScopedRepairBackend(
+            _Delegate(), Path(workspace), tuple(allowed_paths), effect_journal
+        )
+
+        def effect() -> None:
+            effect_journal.bind_turn("turn-1", "call-1")
+            actions(backend, Path(workspace))
+
+        return _Graph(
+            cli.REPAIR_TOOLS, _record("record_worker_result", {"summary": "repaired"}), effect
+        )
+
+    return cli._worker_run(
+        request,
+        runtime_loader=lambda: {"human_message": lambda content: content},
+        model_factory=lambda *_args: SimpleNamespace(_conversation_id=None),
+        diagnosis_factory=lambda *_a, **_k: pytest.fail("bound packet must skip diagnosis"),
+        repair_factory=repair_factory,
+    )
+
+
+def _executable(path: str) -> Callable[[Path], None]:
+    return lambda workspace: os.chmod(workspace / path, 0o755)
+
+
+def _crlf_executable(workspace: Path) -> None:
+    (workspace / "pkg").mkdir(parents=True, exist_ok=True)
+    (workspace / "pkg" / "tool.py").write_bytes(b"x = 1\r\ny = 2\r\nz = 3\r\n")
+    os.chmod(workspace / "pkg" / "tool.py", 0o755)
+
+
+def test_real_backend_edit_preserves_crlf_bytes_and_executable_mode(tmp_path):
+    request = _bound_request(
+        tmp_path,
+        base_files={},
+        test_paths=[],
+        production_paths=["pkg/tool.py"],
+        refs=[f"task_card:{CARD_REF}@" + "a" * 16, "source_file:pkg/tool.py@" + "b" * 16],
+        prepare=_crlf_executable,
+    )
+    outcome: dict[str, Any] = {}
+
+    def actions(backend: cli.ScopedRepairBackend, _workspace: Path) -> None:
+        outcome["edit"] = backend.edit("pkg/tool.py", "y = 2", "y = 20")
+
+    result = _run_real_backend(request, actions)
+
+    assert getattr(outcome["edit"], "error", None) is None, outcome
+    assert result["status"] == "COMPLETED", result
+    assert result["core_binding_status"] == "BOUND"
+    workspace = Path(request["workspace_path"])
+    target = workspace / "pkg" / "tool.py"
+    assert target.read_bytes() == b"x = 1\r\ny = 20\r\nz = 3\r\n"
+    assert target.stat().st_mode & 0o777 == 0o755
+    assert _git(workspace, "diff", "--numstat") == "1\t1\tpkg/tool.py"
+    (entry,) = result["core_change_set_projection"]["change_manifest"]["entries"]
+    assert entry["change_type"] == "MODIFY"
+    assert entry["before_mode"] == entry["after_mode"] == "100755"
+
+
+def test_real_backend_multiline_crlf_edit_preserves_untouched_bytes(tmp_path):
+    request = _bound_request(
+        tmp_path,
+        base_files={},
+        test_paths=[],
+        production_paths=["pkg/tool.py"],
+        refs=[f"task_card:{CARD_REF}@" + "a" * 16, "source_file:pkg/tool.py@" + "b" * 16],
+        prepare=_crlf_executable,
+    )
+
+    def actions(backend: cli.ScopedRepairBackend, _workspace: Path) -> None:
+        result = backend.edit("pkg/tool.py", "x = 1\ny = 2", "x = 10\ny = 20")
+        assert getattr(result, "error", None) is None, result
+
+    result = _run_real_backend(request, actions)
+    assert result["status"] == "COMPLETED", result
+    target = Path(request["workspace_path"]) / "pkg" / "tool.py"
+    assert target.read_bytes() == b"x = 10\r\ny = 20\r\nz = 3\r\n"
+
+
+def test_real_backend_write_preserves_executable_mode(tmp_path):
+    request = _bound_request(
+        tmp_path,
+        base_files={"bin/run.py": "print(1)\n"},
+        test_paths=[],
+        production_paths=["bin/run.py"],
+        prepare=_executable("bin/run.py"),
+    )
+
+    def actions(backend: cli.ScopedRepairBackend, _workspace: Path) -> None:
+        backend.write("bin/run.py", "print(2)\n")
+
+    result = _run_real_backend(request, actions)
+    assert result["status"] == "COMPLETED", result
+    workspace = Path(request["workspace_path"])
+    assert (workspace / "bin" / "run.py").stat().st_mode & 0o777 == 0o755
+    assert "mode change" not in _git(workspace, "diff", "--summary")
+    (entry,) = result["core_change_set_projection"]["change_manifest"]["entries"]
+    assert entry["before_mode"] == entry["after_mode"] == "100755"
+
+
+def test_journal_edit_of_executable_keeps_mode(tmp_path):
+    request = _bound_request(
+        tmp_path,
+        base_files={"bin/run.py": "print(1)\n"},
+        test_paths=[],
+        production_paths=["bin/run.py"],
+        prepare=_executable("bin/run.py"),
+    )
+    result, _calls = _run(request, {"bin/run.py": "print(2)\n"})
+    assert result["status"] == "COMPLETED", result
+    workspace = Path(request["workspace_path"])
+    assert (workspace / "bin" / "run.py").stat().st_mode & 0o777 == 0o755
+
+
+def test_projection_rejects_mode_change(tmp_path):
+    request = _bound_request(
+        tmp_path,
+        base_files={"pkg/core.py": "VALUE = 1\n"},
+        test_paths=[],
+        production_paths=["pkg/core.py"],
+    )
+    result, _calls = _run(
+        request, {"pkg/core.py": "VALUE = 2\n"}, extra_effect=_executable("pkg/core.py")
+    )
+    assert result["status"] != "COMPLETED"
+    assert result["error_code"] == "OPEN_SWE_CORE_CHANGESET_MODE_CHANGE_FORBIDDEN"

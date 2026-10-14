@@ -177,6 +177,30 @@ def _path_matches(path: str, boundary: str) -> bool:
     )
 
 
+def _read_exact_text(path: Path) -> str:
+    """Read text without newline translation so untouched bytes round-trip exactly."""
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        return stream.read()
+
+
+def _match_line_endings(content: str, old_string: str, new_string: str) -> tuple[str, str]:
+    """Normalize model strings to LF once, then to the file's own consistent line ending.
+
+    Mixed-ending files keep LF strings, so a multi-line match there fails closed
+    instead of rewriting endings.
+    """
+    old_string = old_string.replace("\r\n", "\n").replace("\r", "\n")
+    new_string = new_string.replace("\r\n", "\n").replace("\r", "\n")
+    rest = content.replace("\r\n", "")
+    if "\r\n" in content and "\n" not in rest and "\r" not in rest:
+        ending = "\r\n"
+    elif "\r" in content and "\n" not in content:
+        ending = "\r"
+    else:
+        return old_string, new_string
+    return old_string.replace("\n", ending), new_string.replace("\n", ending)
+
+
 class ScopedRepairBackend:
     def __init__(
         self,
@@ -251,7 +275,7 @@ class ScopedRepairBackend:
     def write(self, file_path: str, content: str) -> Any:
         self._authorize(file_path)
         target = self._root / _safe_relative_path(file_path)
-        old = target.read_text(encoding="utf-8") if target.exists() else None
+        old = _read_exact_text(target) if target.exists() else None
         effect = self._effect("write_file", _safe_relative_path(file_path), content, old)
         if effect is not None:
             self._last_effect = effect
@@ -268,7 +292,7 @@ class ScopedRepairBackend:
         if not isinstance(envelope, Mapping) or not isinstance(envelope.get("summary"), str):
             raise RuntimeErrorBounded("OPEN_SWE_COMPOSITE_RESULT_INVALID")
         target = self._root / _safe_relative_path(file_path)
-        old = target.read_text(encoding="utf-8") if target.exists() else None
+        old = _read_exact_text(target) if target.exists() else None
         turn_id = str(self._effect_journal._current_turn_id or "turn_unknown")
         call_id = str(self._effect_journal._current_tool_call_id or "")
         if not call_id:
@@ -320,7 +344,7 @@ class ScopedRepairBackend:
     async def awrite(self, file_path: str, content: str) -> Any:
         self._authorize(file_path)
         target = self._root / _safe_relative_path(file_path)
-        old = target.read_text(encoding="utf-8") if target.exists() else None
+        old = _read_exact_text(target) if target.exists() else None
         effect = self._effect("write_file", _safe_relative_path(file_path), content, old)
         if effect is not None:
             self._effect_journal.recover_write(effect)
@@ -342,9 +366,8 @@ class ScopedRepairBackend:
             from deepagents.backends.protocol import EditResult
 
             return EditResult(error=f"Error: File '{file_path}' not found")
-        old = target.read_text(encoding="utf-8")
-        old_string = old_string.replace("\r\n", "\n").replace("\r", "\n")
-        new_string = new_string.replace("\r\n", "\n").replace("\r", "\n")
+        old = _read_exact_text(target)
+        old_string, new_string = _match_line_endings(old, old_string, new_string)
         from deepagents.backends.utils import perform_string_replacement
 
         replacement = perform_string_replacement(old, old_string, new_string, replace_all)
@@ -375,9 +398,8 @@ class ScopedRepairBackend:
             from deepagents.backends.protocol import EditResult
 
             return EditResult(error=f"Error: File '{file_path}' not found")
-        old = target.read_text(encoding="utf-8")
-        old_string = old_string.replace("\r\n", "\n").replace("\r", "\n")
-        new_string = new_string.replace("\r\n", "\n").replace("\r", "\n")
+        old = _read_exact_text(target)
+        old_string, new_string = _match_line_endings(old, old_string, new_string)
         from deepagents.backends.utils import perform_string_replacement
 
         replacement = perform_string_replacement(old, old_string, new_string, replace_all)
@@ -1224,6 +1246,7 @@ def _bounded_error_code(exc: BaseException) -> str:
             "OPEN_SWE_CORE_CHANGESET_SOURCE_MISMATCH",
             "OPEN_SWE_CORE_CHANGESET_SCOPE_MISMATCH",
             "OPEN_SWE_CORE_CHANGESET_DELETION_FORBIDDEN",
+            "OPEN_SWE_CORE_CHANGESET_MODE_CHANGE_FORBIDDEN",
             "OPEN_SWE_CORE_CHANGESET_EFFECT_INVALID",
             "OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH",
             "OPEN_SWE_CORE_CHANGESET_UNJOURNALED_EFFECT",
@@ -1491,6 +1514,9 @@ def _physical_core_changeset_projection(
                 )
             if change_type == "ADD" and before_oid is not None:
                 change_type = "MODIFY"
+            if before_mode is not None and after_mode is not None and before_mode != after_mode:
+                # No card field authorizes a permission change; edits keep the base mode.
+                raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_MODE_CHANGE_FORBIDDEN")
             entries.append({
                 "path": path,
                 "change_type": change_type,
