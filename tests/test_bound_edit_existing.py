@@ -876,3 +876,40 @@ def test_git_control_file_target_is_rejected_at_admission(tmp_path, path):
     admission = _admission(request)
     assert admission.decision == cli.REJECT
     assert admission.reason_code == "path_git_control"
+
+
+def test_task_card_cannot_authorize_editing_itself(tmp_path):
+    request = _bound_request(
+        tmp_path,
+        base_files={"pkg/core.py": "VALUE = 1\n"},
+        test_paths=[],
+        production_paths=["pkg/core.py", CARD_REF],
+        refs=[
+            f"task_card:{CARD_REF}@" + "a" * 16,
+            "source_file:pkg/core.py@" + "b" * 16,
+            f"source_file:{CARD_REF}@" + "b" * 16,
+        ],
+    )
+    admission = _admission(request)
+    assert admission.decision == cli.REJECT
+    assert admission.reason_code == "path_authority"
+
+
+def test_allowed_path_overlapping_forbidden_paths_is_rejected(tmp_path):
+    request = _bound_request(
+        tmp_path,
+        base_files={"pkg/core.py": "VALUE = 1\n"},
+        test_paths=[],
+        production_paths=["pkg/core.py"],
+    )
+    envelope = json.loads(Path(request["artifact_path"]).read_text(encoding="utf-8"))
+    envelope["scope_signal"]["forbidden_paths"] = ["pkg"]
+    raw = cli._canonical_json(envelope)
+    Path(request["artifact_path"]).write_text(raw, encoding="utf-8")
+    request["prompt"] = "\n".join(
+        f"envelope_sha256={cli._sha256(raw)}" if line.startswith("envelope_sha256=") else line
+        for line in request["prompt"].splitlines()
+    )
+    admission = _admission(request)
+    assert admission.decision == cli.REJECT
+    assert admission.reason_code == "path_authority"

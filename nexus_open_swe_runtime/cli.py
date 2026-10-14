@@ -1206,7 +1206,7 @@ _SEMANTIC_REJECTION_CODES = frozenset({
     "scope_migration", "authority", "scope_paths", "diagnosis_fields", "task_card_evidence",
     "task_card_evidence_duplicate", "path_symlink", "source_evidence", "source_present",
     "path_parent", "path_not_regular", "source_untracked", "path_git_metadata",
-    "path_git_control", "worker_identity", "worker_identity_hash", "predicate_exception",
+    "path_git_control", "path_authority", "worker_identity", "worker_identity_hash", "predicate_exception",
     "workspace_head_read", "workspace_status_read", "origin_read", "card_read",
     "core_binding_shape", "core_binding_schema", "core_binding_identity", "core_binding_operation",
     "core_binding_hash", "core_binding_repository", "core_binding_source", "core_binding_workspace",
@@ -2300,6 +2300,20 @@ def _semantic_v2_admission(
             for ref in refs
         ):
             return _semantic_reject("task_card_evidence_duplicate")
+        # The card that authorizes the write, read-only authorities and forbidden
+        # paths can never be write targets (a card could otherwise rewrite itself).
+        protected = []
+        for value in (task_card_ref, *scope["read_only_authorities"], *scope["forbidden_paths"]):
+            try:
+                protected.append(_safe_relative_path(str(value)).lower())
+            except RuntimeErrorBounded:
+                continue
+        if any(
+            _path_matches(path.lower(), boundary) or _path_matches(boundary, path.lower())
+            for path in allowed_paths
+            for boundary in protected
+        ):
+            return _semantic_reject("path_authority")
         if any(_git_metadata_path(path) for path in allowed_paths):
             return _semantic_reject("path_git_metadata")
         if any(_git_control_path(path) for path in allowed_paths):
