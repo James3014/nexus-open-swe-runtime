@@ -194,6 +194,91 @@ def _git_control_path(relative: str) -> bool:
     return any(part.lower() in _GIT_CONTROL_FILES for part in PurePosixPath(relative).parts)
 
 
+def _protected_mutation_paths(values: Any) -> tuple[str, ...]:
+    """Normalize Task Card / authority / forbidden refs for the overlap gate."""
+    protected: list[str] = []
+    for value in values:
+        try:
+            protected.append(_safe_relative_path(str(value)).lower())
+        except RuntimeErrorBounded:
+            continue
+    return tuple(protected)
+
+
+def _protected_paths_from_envelope(envelope: Any) -> tuple[str, ...]:
+    """Card ref, read-only authorities and forbidden paths of a v2 envelope, if any."""
+    if not isinstance(envelope, Mapping):
+        return ()
+    binding = envelope.get("binding")
+    scope = envelope.get("scope_signal")
+    values: list[Any] = []
+    if isinstance(binding, Mapping) and isinstance(binding.get("task_card_ref"), str):
+        values.append(binding["task_card_ref"])
+    if isinstance(scope, Mapping):
+        for key in ("read_only_authorities", "forbidden_paths"):
+            if _string_list(scope.get(key)):
+                values.extend(scope[key])
+    return _protected_mutation_paths(values)
+
+
+def _mutation_target_violation(
+    workspace: Path,
+    path: str,
+    *,
+    base_commit: str | None,
+    protected: tuple[str, ...] = (),
+) -> str | None:
+    """The ONE path gate shared by every write entry point (#130 sibling-gate parity).
+
+    Called by v2 admission, bound repair continuation and ``ScopedRepairBackend``
+    (write/edit/async and the composite write).  Returns a stable reason code, or
+    ``None`` when ``path`` may be written.  ``base_commit`` enables the
+    tracked-at-base gate for a target that already exists; it is ``None`` for
+    unbound runs and for files the current run itself created.
+    """
+    try:
+        relative = _safe_relative_path(path)
+    except RuntimeErrorBounded:
+        return "path_escape"
+    if _git_metadata_path(relative):
+        return "path_git_metadata"
+    if _git_control_path(relative):
+        return "path_git_control"
+    lowered = relative.lower()
+    if any(
+        _path_matches(lowered, boundary) or _path_matches(boundary, lowered)
+        for boundary in protected
+    ):
+        return "path_authority"
+    if _workspace_path_has_symlink(workspace, relative):
+        return "path_symlink"
+    target = workspace / relative
+    try:
+        target_stat = target.lstat()
+    except FileNotFoundError:
+        target_stat = None
+    except OSError:
+        return "path_parent"
+    if target_stat is None:
+        parent = target.parent
+        while parent != workspace and not parent.exists():
+            parent = parent.parent
+        if (
+            parent.is_symlink()
+            or not parent.resolve().is_relative_to(workspace)
+            or not target.resolve().parent.is_relative_to(workspace)
+        ):
+            return "path_parent"
+        return None
+    if target_stat.st_mode & 0o170000 != 0o100000:
+        return "path_not_regular"
+    if not target.resolve().is_relative_to(workspace):
+        return "path_parent"
+    if base_commit is not None and not _base_tracks_regular_blob(workspace, base_commit, relative):
+        return "source_untracked"
+    return None
+
+
 def _read_exact_text(path: Path) -> str:
     """Read text without newline translation so untouched bytes round-trip exactly."""
     with path.open("r", encoding="utf-8", newline="") as stream:
@@ -231,6 +316,21 @@ class ScopedRepairBackend:
         self._allowed = tuple(_safe_relative_path(path) for path in allowed_paths)
         self._effect_journal = effect_journal
         self._last_effect: Any = None
+        identity = getattr(effect_journal, "identity", None)
+        # Same gate inputs as admission/continuation: a Core-bound run checks
+        # pre-existing targets against the commit it started from (the bound base,
+        # or the parent candidate of a continuation) and honours the protected
+        # card/authority/forbidden paths recorded on the identity.
+        self._base_commit: str | None = None
+        if identity is not None and getattr(identity, "core_binding_hash", ""):
+            base = getattr(identity, "core_continuation_base", "") or str(
+                getattr(identity, "core_source_revision", "")
+            ).removeprefix("git-commit:")
+            self._base_commit = base or None
+        self._protected = tuple(getattr(identity, "mutation_protected_paths", ()) or ())
+        self._initially_present = frozenset(
+            path for path in self._allowed if os.path.lexists(self._root / path)
+        )
 
     def _effect(self, tool_name: str, file_path: str, content: str, old: str | None) -> Any:
         if self._effect_journal is None:
@@ -251,20 +351,19 @@ class ScopedRepairBackend:
 
     def _authorize(self, file_path: str) -> None:
         relative = _safe_relative_path(file_path)
-        if _git_metadata_path(relative):
-            raise PermissionError("OPEN_SWE_MUTATION_PATH_FORBIDDEN")
         if not any(_path_matches(relative, boundary) for boundary in self._allowed):
             raise PermissionError("OPEN_SWE_MUTATION_PATH_FORBIDDEN")
-        # A symlinked component can redirect an authorized lexical path to an
-        # unauthorized physical target, so reject links on every write path.
-        if _workspace_path_has_symlink(self._root, relative):
-            raise PermissionError("OPEN_SWE_MUTATION_PATH_FORBIDDEN")
-        physical = (self._root / relative).resolve()
-        if not physical.is_relative_to(self._root):
-            raise PermissionError("OPEN_SWE_MUTATION_PATH_FORBIDDEN")
-        # Existing targets may be edited in place but only as regular files; this
-        # surface never deletes, renames or replaces a directory/special file.
-        if physical.exists() and not physical.is_file():
+        # The shared gate (symlink, regular file, containment, .git, git control
+        # files, protected overlap, tracked-at-base) — identical to admission.
+        # Tracked-at-base applies to targets that existed when the run started; a
+        # file this run created itself may be edited again.
+        violation = _mutation_target_violation(
+            self._root,
+            relative,
+            base_commit=self._base_commit if relative in self._initially_present else None,
+            protected=self._protected,
+        )
+        if violation is not None:
             raise PermissionError("OPEN_SWE_MUTATION_PATH_FORBIDDEN")
 
     def ls(self, *args: Any, **kwargs: Any) -> Any:
@@ -1206,7 +1305,7 @@ _SEMANTIC_REJECTION_CODES = frozenset({
     "scope_migration", "authority", "scope_paths", "diagnosis_fields", "task_card_evidence",
     "task_card_evidence_duplicate", "path_symlink", "source_evidence", "source_present",
     "path_parent", "path_not_regular", "source_untracked", "path_git_metadata",
-    "path_git_control", "path_authority", "worker_identity", "worker_identity_hash", "predicate_exception",
+    "path_git_control", "path_authority", "path_escape", "worker_identity", "worker_identity_hash", "predicate_exception",
     "workspace_head_read", "workspace_status_read", "origin_read", "card_read",
     "core_binding_shape", "core_binding_schema", "core_binding_identity", "core_binding_operation",
     "core_binding_hash", "core_binding_repository", "core_binding_source", "core_binding_workspace",
@@ -1220,7 +1319,8 @@ _BOUND_CONTINUATION_REJECTION_CODES = frozenset({
     "artifact_parent", "workspace_symlink", "workspace_read", "origin", "workspace_head",
     "workspace_dirty", "core_binding_source", "workspace_lineage", "workspace_scope",
     "prior_bound_terminal", "core_binding_freshness", "core_binding_expired",
-    "prior_projection", "parent_tree",
+    "prior_projection", "parent_tree", "path_escape", "path_git_metadata", "path_git_control",
+    "path_authority", "path_symlink", "path_parent", "path_not_regular", "source_untracked",
 })
 _FAILURE_PHASES = frozenset({
     "WORKER_CONTEXT", "RUNTIME_LOAD", "SEMANTIC_ADMISSION", "RECOVERY_PREPARE",
@@ -2300,57 +2400,23 @@ def _semantic_v2_admission(
             for ref in refs
         ):
             return _semantic_reject("task_card_evidence_duplicate")
-        # The card that authorizes the write, read-only authorities and forbidden
-        # paths can never be write targets (a card could otherwise rewrite itself).
-        protected = []
-        for value in (task_card_ref, *scope["read_only_authorities"], *scope["forbidden_paths"]):
-            try:
-                protected.append(_safe_relative_path(str(value)).lower())
-            except RuntimeErrorBounded:
-                continue
-        if any(
-            _path_matches(path.lower(), boundary) or _path_matches(boundary, path.lower())
-            for path in allowed_paths
-            for boundary in protected
-        ):
-            return _semantic_reject("path_authority")
-        if any(_git_metadata_path(path) for path in allowed_paths):
-            return _semantic_reject("path_git_metadata")
-        if any(_git_control_path(path) for path in allowed_paths):
-            return _semantic_reject("path_git_control")
+        # Path gates are shared with the backend and continuation; the card that
+        # authorizes the write, read-only authorities and forbidden paths are
+        # protected (a card could otherwise rewrite itself).
+        protected = _protected_paths_from_envelope(envelope)
         for path in allowed_paths:
-            if _workspace_path_has_symlink(workspace, path):
-                return _semantic_reject("path_symlink")
-            target = workspace / path
-            try:
-                target_stat = target.lstat()
-            except FileNotFoundError:
-                target_stat = None
-            if target_stat is not None:
-                # Existing target: a listed regular file tracked at the bound base,
-                # evidenced by the source read at that base.  Deletion and rename
-                # stay impossible (no backend surface; projection forbids them).
-                if _source_ref_for_path(refs, path, kind="source_file") is None:
-                    return _semantic_reject("source_evidence")
-                if target_stat.st_mode & 0o170000 != 0o100000:
-                    return _semantic_reject("path_not_regular")
-                if not target.resolve().is_relative_to(workspace):
-                    return _semantic_reject("path_parent")
-                if not _base_tracks_regular_blob(workspace, expected_base, path):
-                    return _semantic_reject("source_untracked")
-                continue
-            source_ref = _source_ref_for_path(refs, path)
-            if source_ref is None:
+            violation = _mutation_target_violation(
+                workspace, path, base_commit=expected_base, protected=protected
+            )
+            if violation is not None:
+                return _semantic_reject(violation)
+        for path in allowed_paths:
+            # Existing target: evidenced by the source read at the bound base; new
+            # target: evidenced by its recorded absence.  Deletion and rename stay
+            # impossible (no backend surface; the projection forbids them).
+            kind = "source_file" if (workspace / path).exists() else "source_absence"
+            if _source_ref_for_path(refs, path, kind=kind) is None:
                 return _semantic_reject("source_evidence")
-            parent = target.parent
-            while parent != workspace and not parent.exists():
-                parent = parent.parent
-            if (
-                parent.is_symlink()
-                or not parent.resolve().is_relative_to(workspace)
-                or not target.resolve().parent.is_relative_to(workspace)
-            ):
-                return _semantic_reject("path_parent")
         identity = request.get("worker_identity")
         if not isinstance(identity, Mapping) or dict(selected) != dict(identity):
             return _semantic_reject("worker_identity")
@@ -2856,6 +2922,7 @@ def _bind_session_core_identity(
     *,
     allow_initial_bind: bool,
     valid_until: str = "",
+    protected_paths: tuple[str, ...] = (),
 ) -> None:
     path = _session_path(request, session_id)
     context = _read_json(path)
@@ -2869,9 +2936,16 @@ def _bind_session_core_identity(
             raise RuntimeErrorBounded("SESSION_CORE_BINDING_MISSING")
         # ``core_valid_until`` is additive and omitted when the binding has none; a
         # bound continuation requires it (see ``_bound_continuation_admission``).
+        # ``core_protected_paths`` is additive too: the shared path gate of a bound
+        # continuation re-applies the card/authority/forbidden paths admitted here.
         _atomic_json(
             path,
-            {**context, **expected, **({"core_valid_until": valid_until} if valid_until else {})},
+            {
+                **context,
+                **expected,
+                **({"core_valid_until": valid_until} if valid_until else {}),
+                **({"core_protected_paths": list(protected_paths)} if protected_paths else {}),
+            },
         )
         return
     actual = {key: context.get(key) for key in expected}
@@ -2941,6 +3015,7 @@ def _bound_continuation_admission(
     allowed_paths: tuple[str, ...],
     core_identity: Mapping[str, Any],
     valid_until: Any = None,
+    protected_paths: Any = (),
 ) -> tuple[str, Mapping[str, Any]]:
     """Admit a repair continuation of a BOUND session without a new Core binding.
 
@@ -3011,6 +3086,16 @@ def _bound_continuation_admission(
         or any(_workspace_path_has_symlink(workspace, path) for path in allowed_paths)
     ):
         raise _bound_continuation_reject("workspace_symlink")
+    stored_protected = protected_paths if _string_list(protected_paths) else []
+    for path in allowed_paths:
+        violation = _mutation_target_violation(
+            workspace,
+            path,
+            base_commit=parent,
+            protected=_protected_mutation_paths(stored_protected),
+        )
+        if violation is not None:
+            raise _bound_continuation_reject(violation)
     source_commit = str(core_identity["core_source_revision"]).removeprefix("git-commit:")
     try:
         origin = _git_output(workspace, "remote", "get-url", "origin")
@@ -3235,6 +3320,7 @@ def _worker_run(
                 allowed_paths=allowed_paths,
                 core_identity=session_core_identity,
                 valid_until=session_context.get("core_valid_until"),
+                protected_paths=session_context.get("core_protected_paths") or [],
             )
             _bind_session_core_identity(
                 request, session_id, session_core_identity, allow_initial_bind=False
@@ -3266,7 +3352,15 @@ def _worker_run(
                 core_identity,
                 allow_initial_bind=not had_session_binding,
                 valid_until=_binding_valid_until(packet["repository_mutation_binding"]),
+                protected_paths=_protected_paths_from_envelope(packet),
             )
+        if session_core_identity is not None:
+            stored = session_context.get("core_protected_paths")
+            mutation_protected_paths = _protected_mutation_paths(
+                stored if _string_list(stored) else []
+            )
+        else:
+            mutation_protected_paths = _protected_paths_from_envelope(packet)
         hint_binding = _worker_hint_binding(request, tool_projection, core_identity)
         hint_observer = HintExecutionObserver(hint_binding, workspace)
         started["hint_execution_receipt"] = hint_observer.receipt()
@@ -3321,6 +3415,7 @@ def _worker_run(
             ),
             **core_identity,
             core_continuation_base=continuation_base,
+            mutation_protected_paths=mutation_protected_paths,
         )
         recovery_journal = DurableOperationJournal(
             request.get("runtime_state_root") or "", recovery_identity
@@ -3700,6 +3795,9 @@ def _worker_reconcile(
             ),
             core_deletion_policy=str(identity_data.get("core_deletion_policy", "")),
             core_continuation_base=str(identity_data.get("core_continuation_base", "")),
+            mutation_protected_paths=tuple(
+                str(value) for value in identity_data.get("mutation_protected_paths", [])
+            ),
         )
         if identity.operation_id != operation_id:
             return cached

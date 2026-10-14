@@ -124,11 +124,18 @@ class RecoveryIdentity:
     # Parent candidate commit of a Core-bound repair continuation.  Empty for an
     # initial operation and then omitted, so pre-existing identities are unchanged.
     core_continuation_base: str = ""
+    # Card/authority/forbidden paths the write backend must refuse (shared path
+    # gate, #130).  Omitted when empty so pre-existing identities are unchanged.
+    mutation_protected_paths: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
         if not self.core_continuation_base:
             value.pop("core_continuation_base")
+        if self.mutation_protected_paths:
+            value["mutation_protected_paths"] = list(self.mutation_protected_paths)
+        else:
+            value.pop("mutation_protected_paths")
         value["allowed_paths"] = list(self.allowed_paths)
         value["projected_tools"] = list(self.projected_tools)
         value["core_required_verifier_ids"] = list(self.core_required_verifier_ids)
