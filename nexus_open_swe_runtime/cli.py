@@ -1655,6 +1655,10 @@ def _physical_core_changeset_projection(
                 raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_INVALID") from exc
             if actual_sha != terminal:
                 raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH")
+        elif terminal != "absent":
+            # No write tool deletes, so a journaled path missing on disk was
+            # removed outside the journal.
+            raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH")
     effect_paths = set(effects_by_path)
     journaled_scope = set(actual_paths)
     if continuation_base:

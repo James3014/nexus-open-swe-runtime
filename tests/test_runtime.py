@@ -3520,6 +3520,16 @@ def test_physical_core_changeset_rejects_chain_not_starting_at_source(tmp_path):
         cli._physical_core_changeset_projection(workspace, identity, journal)
 
 
+def test_physical_core_changeset_rejects_journaled_file_missing_on_disk(tmp_path):
+    workspace, target, identity, journal = _changeset_fixture(tmp_path)
+    _journal_edit(journal, target, 1, "VALUE = 1\n", "VALUE = 2\n")
+    target.unlink()
+    identity = dataclasses.replace(identity, core_deletion_policy="ALLOW")
+
+    with pytest.raises(cli.RuntimeErrorBounded, match="OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH"):
+        cli._physical_core_changeset_projection(workspace, identity, journal)
+
+
 def _h(label):
     return hashlib.sha256(label.encode()).hexdigest()
 
