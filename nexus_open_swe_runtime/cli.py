@@ -219,6 +219,10 @@ class ScopedRepairBackend:
         physical = (self._root / relative).resolve()
         if not physical.is_relative_to(self._root):
             raise PermissionError("OPEN_SWE_MUTATION_PATH_FORBIDDEN")
+        # Existing targets may be edited in place but only as regular files; this
+        # surface never deletes, renames or replaces a directory/special file.
+        if physical.exists() and not physical.is_file():
+            raise PermissionError("OPEN_SWE_MUTATION_PATH_FORBIDDEN")
 
     def ls(self, *args: Any, **kwargs: Any) -> Any:
         return self._delegate.ls(*args, **kwargs)
@@ -1160,7 +1164,7 @@ _SEMANTIC_REJECTION_CODES = frozenset({
     "card_symlink", "card_hash", "card_contract", "scope_confidence", "allowed_paths",
     "scope_migration", "authority", "scope_paths", "diagnosis_fields", "task_card_evidence",
     "task_card_evidence_duplicate", "path_symlink", "source_evidence", "source_present",
-    "path_parent", "worker_identity", "worker_identity_hash", "predicate_exception",
+    "path_parent", "path_not_regular", "source_untracked", "worker_identity", "worker_identity_hash", "predicate_exception",
     "workspace_head_read", "workspace_status_read", "origin_read", "card_read",
     "core_binding_shape", "core_binding_schema", "core_binding_identity", "core_binding_operation",
     "core_binding_hash", "core_binding_repository", "core_binding_source", "core_binding_workspace",
@@ -1667,13 +1671,37 @@ def _task_card_allows_exact_paths(
     return tuple(listed) == allowed_paths
 
 
-def _source_ref_for_path(refs: list[Any], path: str) -> str | None:
-    prefix = f"source_absence:{path}@"
+def _source_ref_for_path(
+    refs: list[Any], path: str, *, kind: str = "source_absence"
+) -> str | None:
+    prefix = f"{kind}:{path}@"
     for ref in refs:
         suffix = ref[len(prefix) :] if isinstance(ref, str) and ref.startswith(prefix) else ""
         if re.fullmatch(r"(?:[0-9a-f]{16}|[0-9a-f]{64})", suffix):
             return ref
     return None
+
+
+def _base_tracks_regular_blob(workspace: Path, base_commit: str, path: str) -> bool:
+    """Return whether ``path`` is a regular (non-symlink, non-submodule) blob at base."""
+    try:
+        output = _git_output(workspace, "ls-tree", base_commit, "--", path)
+    except RuntimeErrorBounded:
+        return False
+    lines = output.splitlines()
+    if len(lines) != 1:
+        return False
+    try:
+        header, observed_path = lines[0].split("\t", 1)
+        mode, object_type, oid = header.split(" ", 2)
+    except ValueError:
+        return False
+    return (
+        observed_path == path
+        and object_type == "blob"
+        and mode in {"100644", "100755"}
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid) is not None
+    )
 
 
 _V2_KEYS = {
@@ -2181,17 +2209,21 @@ def _semantic_v2_admission(
             return _semantic_reject("scope_confidence")
         if len(set(allowed_paths)) != len(allowed_paths):
             return _semantic_reject("allowed_paths")
-        if scope["production_edit_paths"] or scope["conditional_migration_paths"]:
+        # Owner decision 2026-10-14 (#130): the bound path may edit files the Task
+        # Card lists, including production code.  Conditional migrations stay out.
+        if scope["conditional_migration_paths"]:
             return _semantic_reject("scope_migration")
         if not _safe_read_only_authorities(
             scope["read_only_authorities"], task_card_ref, binding, refs
         ):
             return _semantic_reject("authority")
-        required = tuple(
-            _safe_relative_path(str(path)) for path in scope["required_test_edit_paths"]
+        scoped_paths = tuple(
+            _safe_relative_path(str(path))
+            for path in (*scope["required_test_edit_paths"], *scope["production_edit_paths"])
         )
         if (
-            required != allowed_paths
+            len(set(scoped_paths)) != len(scoped_paths)
+            or sorted(scoped_paths) != sorted(allowed_paths)
             or not isinstance(scope["max_files"], int)
             or isinstance(scope["max_files"], bool)
             or scope["max_files"] != len(allowed_paths)
@@ -2225,15 +2257,27 @@ def _semantic_v2_admission(
         for path in allowed_paths:
             if _workspace_path_has_symlink(workspace, path):
                 return _semantic_reject("path_symlink")
+            target = workspace / path
+            try:
+                target_stat = target.lstat()
+            except FileNotFoundError:
+                target_stat = None
+            if target_stat is not None:
+                # Existing target: a listed regular file tracked at the bound base,
+                # evidenced by the source read at that base.  Deletion and rename
+                # stay impossible (no backend surface; projection forbids them).
+                if _source_ref_for_path(refs, path, kind="source_file") is None:
+                    return _semantic_reject("source_evidence")
+                if target_stat.st_mode & 0o170000 != 0o100000:
+                    return _semantic_reject("path_not_regular")
+                if not target.resolve().is_relative_to(workspace):
+                    return _semantic_reject("path_parent")
+                if not _base_tracks_regular_blob(workspace, expected_base, path):
+                    return _semantic_reject("source_untracked")
+                continue
             source_ref = _source_ref_for_path(refs, path)
             if source_ref is None:
                 return _semantic_reject("source_evidence")
-            target = workspace / path
-            try:
-                target.lstat()
-                return _semantic_reject("source_present")
-            except FileNotFoundError:
-                pass
             parent = target.parent
             while parent != workspace and not parent.exists():
                 parent = parent.parent
@@ -3252,7 +3296,10 @@ def _worker_run(
             diagnosis = {
                 "status": "ROOT_CAUSE_SUPPORTED",
                 "summary": semantic_admission.diagnosis["hypothesis"],
-                "evidence_paths": list(packet["scope_signal"]["required_test_edit_paths"]),
+                "evidence_paths": [
+                    *packet["scope_signal"]["required_test_edit_paths"],
+                    *packet["scope_signal"]["production_edit_paths"],
+                ],
             }
         else:
             if tool_projection is not None and "record_diagnosis" not in tool_projection.selected_tools:
