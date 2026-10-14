@@ -177,6 +177,23 @@ def _path_matches(path: str, boundary: str) -> bool:
     )
 
 
+_GIT_CONTROL_FILES = frozenset({".gitattributes", ".gitmodules", ".gitignore"})
+
+
+def _git_metadata_path(relative: str) -> bool:
+    """A `.git` segment at any depth (case-insensitive) is repository metadata.
+
+    Git never reports it in a diff, so a write there would escape the change-set
+    scope check; hooks would also execute on the host when Nexus commits.
+    """
+    return any(part.lower() == ".git" for part in PurePosixPath(relative).parts)
+
+
+def _git_control_path(relative: str) -> bool:
+    """Files that change how Git hashes, diffs or populates the tree."""
+    return any(part.lower() in _GIT_CONTROL_FILES for part in PurePosixPath(relative).parts)
+
+
 def _read_exact_text(path: Path) -> str:
     """Read text without newline translation so untouched bytes round-trip exactly."""
     with path.open("r", encoding="utf-8", newline="") as stream:
@@ -234,6 +251,8 @@ class ScopedRepairBackend:
 
     def _authorize(self, file_path: str) -> None:
         relative = _safe_relative_path(file_path)
+        if _git_metadata_path(relative):
+            raise PermissionError("OPEN_SWE_MUTATION_PATH_FORBIDDEN")
         if not any(_path_matches(relative, boundary) for boundary in self._allowed):
             raise PermissionError("OPEN_SWE_MUTATION_PATH_FORBIDDEN")
         # A symlinked component can redirect an authorized lexical path to an
@@ -1186,7 +1205,8 @@ _SEMANTIC_REJECTION_CODES = frozenset({
     "card_symlink", "card_hash", "card_contract", "scope_confidence", "allowed_paths",
     "scope_migration", "authority", "scope_paths", "diagnosis_fields", "task_card_evidence",
     "task_card_evidence_duplicate", "path_symlink", "source_evidence", "source_present",
-    "path_parent", "path_not_regular", "source_untracked", "worker_identity", "worker_identity_hash", "predicate_exception",
+    "path_parent", "path_not_regular", "source_untracked", "path_git_metadata",
+    "path_git_control", "worker_identity", "worker_identity_hash", "predicate_exception",
     "workspace_head_read", "workspace_status_read", "origin_read", "card_read",
     "core_binding_shape", "core_binding_schema", "core_binding_identity", "core_binding_operation",
     "core_binding_hash", "core_binding_repository", "core_binding_source", "core_binding_workspace",
@@ -2280,6 +2300,10 @@ def _semantic_v2_admission(
             for ref in refs
         ):
             return _semantic_reject("task_card_evidence_duplicate")
+        if any(_git_metadata_path(path) for path in allowed_paths):
+            return _semantic_reject("path_git_metadata")
+        if any(_git_control_path(path) for path in allowed_paths):
+            return _semantic_reject("path_git_control")
         for path in allowed_paths:
             if _workspace_path_has_symlink(workspace, path):
                 return _semantic_reject("path_symlink")

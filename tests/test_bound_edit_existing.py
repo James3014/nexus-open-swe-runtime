@@ -834,3 +834,45 @@ def test_projection_rejects_mode_change(tmp_path):
     )
     assert result["status"] != "COMPLETED"
     assert result["error_code"] == "OPEN_SWE_CORE_CHANGESET_MODE_CHANGE_FORBIDDEN"
+
+
+@pytest.mark.parametrize(
+    "path", [".git/hooks/post-commit", "sub/.GIT/config", ".Git", "a/.git/b/c.py"]
+)
+def test_git_metadata_target_is_rejected_at_admission(tmp_path, path):
+    request = _bound_request(
+        tmp_path,
+        base_files={},
+        test_paths=[path],
+        production_paths=[],
+        refs=[f"task_card:{CARD_REF}@" + "a" * 16, f"source_absence:{path}@" + "b" * 16],
+    )
+    admission = _admission(request)
+    assert admission.decision == cli.REJECT
+    assert admission.reason_code == "path_git_metadata"
+
+
+@pytest.mark.parametrize("path", [".git/hooks/post-commit", "sub/.GIT/config", ".git"])
+def test_backend_refuses_git_metadata_paths(tmp_path, path):
+    root = tmp_path / "root"
+    (root / ".git" / "hooks").mkdir(parents=True)
+    backend = cli.ScopedRepairBackend(_Delegate(), root, (path,))
+    with pytest.raises(PermissionError, match="OPEN_SWE_MUTATION_PATH_FORBIDDEN"):
+        backend.write(path, "#!/bin/sh\necho owned\n")
+    assert not (root / ".git" / "hooks" / "post-commit").exists()
+
+
+@pytest.mark.parametrize(
+    "path", [".gitattributes", "pkg/.gitignore", ".GitModules", "a/b/.GITATTRIBUTES"]
+)
+def test_git_control_file_target_is_rejected_at_admission(tmp_path, path):
+    request = _bound_request(
+        tmp_path,
+        base_files={},
+        test_paths=[path],
+        production_paths=[],
+        refs=[f"task_card:{CARD_REF}@" + "a" * 16, f"source_absence:{path}@" + "b" * 16],
+    )
+    admission = _admission(request)
+    assert admission.decision == cli.REJECT
+    assert admission.reason_code == "path_git_control"
