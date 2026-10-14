@@ -1512,35 +1512,79 @@ def _workspace_file_mode(path: Path) -> str:
     return "100755" if path.stat().st_mode & 0o111 else "100644"
 
 
-def _terminal_effect_postimage(effects: list[dict[str, Any]]) -> str:
-    """Return the final postimage of one path's journaled writes.
+_EFFECT_SHA_RE = re.compile(r"[0-9a-f]{64}")
 
-    Repeated edits to one file form a chain (each preimage is the previous
-    postimage); only the last link must match the workspace.  A fork, a gap,
-    or a cycle is not a single chain and fails closed.
+
+def _git_blob_sha256(workspace: Path, commit: str, path: str) -> str:
+    """Return sha256 of ``path`` bytes at ``commit``, or ``absent``."""
+    oid, _mode = _git_tree_entry(workspace, commit, path)
+    if oid is None:
+        return "absent"
+    if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid) is None:
+        raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_TREE_INVALID")
+    git = shutil.which("git")
+    if not git or not Path(git).is_absolute():
+        raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_GIT_FAILED")
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"})
+    try:
+        completed = subprocess.run(
+            [git, "-C", str(workspace), "--no-optional-locks", "cat-file", "blob", oid],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=5,
+            env=env,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_GIT_FAILED") from exc
+    return _sha256(completed.stdout)
+
+
+def _terminal_effect_postimage(effects: list[dict[str, Any]], start: str) -> str:
+    """Return the content a path must hold after all of its journaled writes.
+
+    ``recover_write`` only applies a write when the file holds its preimage,
+    so the writes to one path form a walk over content hashes that starts at
+    the bound base content (``start``).  The walk may revisit content (an edit
+    that is later undone).  Its end is fixed by the edge balance alone, so
+    journal order does not matter: a walk exists only if the edges are
+    connected to ``start`` and every node except the start (one extra
+    outgoing edge) and the end (one extra incoming edge) is balanced.  Any
+    other shape means an unjournaled change and fails closed.
     """
-    if len(effects) == 1:
-        return str(effects[0].get("postimage_sha256"))
-    by_preimage: dict[Any, dict[str, Any]] = {}
+    balance: dict[str, int] = {start: 0}
+    neighbours: dict[str, set[str]] = {start: set()}
     for effect in effects:
         preimage = effect.get("preimage_sha256")
-        if preimage in by_preimage:
-            raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH")
-        by_preimage[preimage] = effect
-    postimages = {effect.get("postimage_sha256") for effect in effects}
-    starts = [effect for effect in effects if effect.get("preimage_sha256") not in postimages]
-    if len(starts) != 1:
+        postimage = effect.get("postimage_sha256")
+        if not isinstance(postimage, str) or _EFFECT_SHA_RE.fullmatch(postimage) is None:
+            raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_INVALID")
+        if not isinstance(preimage, str) or (
+            preimage != "absent" and _EFFECT_SHA_RE.fullmatch(preimage) is None
+        ):
+            raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_INVALID")
+        balance[preimage] = balance.get(preimage, 0) + 1
+        balance[postimage] = balance.get(postimage, 0) - 1
+        neighbours.setdefault(preimage, set()).add(postimage)
+        neighbours.setdefault(postimage, set()).add(preimage)
+    reached = {start}
+    pending = [start]
+    while pending:
+        for node in neighbours[pending.pop()]:
+            if node not in reached:
+                reached.add(node)
+                pending.append(node)
+    if reached != set(neighbours):
         raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH")
-    current = starts[0]
-    visited = 1
-    while current.get("postimage_sha256") in by_preimage:
-        current = by_preimage[current.get("postimage_sha256")]
-        visited += 1
-        if visited > len(effects):
-            raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH")
-    if visited != len(effects):
+    unbalanced = {node: value for node, value in balance.items() if value}
+    if not unbalanced:
+        return start
+    ends = [node for node, value in unbalanced.items() if value == -1]
+    if unbalanced.get(start) != 1 or len(unbalanced) != 2 or len(ends) != 1:
         raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH")
-    return str(current.get("postimage_sha256"))
+    return ends[0]
 
 
 def _physical_core_changeset_projection(
@@ -1593,18 +1637,26 @@ def _physical_core_changeset_projection(
         if relative not in allowed:
             raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_SCOPE_MISMATCH")
         effects_by_path.setdefault(relative, []).append(effect)
+    continuation_base = identity.core_continuation_base
+    if continuation_base and re.fullmatch(r"[0-9a-f]{40}", continuation_base) is None:
+        raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_SOURCE_INVALID")
+    # This operation's writes start from the parent candidate commit in a bound
+    # repair continuation, otherwise from the bound source commit.
+    effect_base = continuation_base or source_commit
     for relative, path_effects in effects_by_path.items():
+        terminal = _terminal_effect_postimage(
+            path_effects, _git_blob_sha256(workspace, effect_base, relative)
+        )
         physical = workspace / relative
         if physical.exists():
             try:
                 actual_sha = _sha256(physical.read_bytes())
             except OSError as exc:
                 raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_INVALID") from exc
-            if actual_sha != _terminal_effect_postimage(path_effects):
+            if actual_sha != terminal:
                 raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH")
     effect_paths = set(effects_by_path)
     journaled_scope = set(actual_paths)
-    continuation_base = identity.core_continuation_base
     if continuation_base:
         # A bound repair continuation starts on the parent candidate commit, whose
         # changes the parent bound operation already journaled and projected.  Only

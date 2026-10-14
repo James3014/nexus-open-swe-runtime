@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -3474,30 +3476,110 @@ def test_physical_core_changeset_rejects_chained_edits_when_disk_differs(tmp_pat
         cli._physical_core_changeset_projection(workspace, identity, journal)
 
 
+def test_physical_core_changeset_accepts_edit_that_is_later_undone(tmp_path):
+    workspace, target, identity, journal = _changeset_fixture(tmp_path)
+    _journal_edit(journal, target, 1, "VALUE = 1\n", "VALUE = 2\n")
+    _journal_edit(journal, target, 2, "VALUE = 2\n", "VALUE = 3\n")
+    _journal_edit(journal, target, 3, "VALUE = 3\n", "VALUE = 2\n")
+    _journal_edit(journal, target, 4, "VALUE = 2\n", "VALUE = 2\n")
+
+    projection = cli._physical_core_changeset_projection(workspace, identity, journal)
+    assert projection["status"] == "PHYSICAL_CHANGESET_BOUND"
+
+
+def test_physical_core_changeset_accepts_chained_crlf_edits(tmp_path):
+    workspace, target, identity, _journal = _changeset_fixture(tmp_path)
+    target.write_bytes(b"VALUE = 1\r\n")
+    subprocess.run(["git", "-C", str(workspace), "commit", "-q", "-am", "crlf"], check=True)
+    head = subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"], text=True
+    ).strip()
+    tree = subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD^{tree}"], text=True
+    ).strip()
+    identity = dataclasses.replace(
+        identity, core_source_revision=f"git-commit:{head}", core_source_tree=f"git-tree:{tree}"
+    )
+    journal = DurableEffectJournal(tmp_path / "state-crlf", identity)
+    _journal_edit(journal, target, 1, "VALUE = 1\r\n", "VALUE = 2\r\n")
+    _journal_edit(journal, target, 2, "VALUE = 2\r\n", "VALUE = 3\r\n")
+    assert target.read_bytes() == b"VALUE = 3\r\n"
+
+    projection = cli._physical_core_changeset_projection(workspace, identity, journal)
+    assert projection["status"] == "PHYSICAL_CHANGESET_BOUND"
+
+
+def test_physical_core_changeset_rejects_chain_not_starting_at_source(tmp_path):
+    workspace, target, identity, journal = _changeset_fixture(tmp_path)
+    # an unjournaled change to "VALUE = 9" happened before the first write
+    target.write_text("VALUE = 9\n", encoding="utf-8")
+    _journal_edit(journal, target, 1, "VALUE = 9\n", "VALUE = 2\n")
+    _journal_edit(journal, target, 2, "VALUE = 2\n", "VALUE = 3\n")
+
+    with pytest.raises(cli.RuntimeErrorBounded, match="OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH"):
+        cli._physical_core_changeset_projection(workspace, identity, journal)
+
+
+def _h(label):
+    return hashlib.sha256(label.encode()).hexdigest()
+
+
 @pytest.mark.parametrize(
     "effects",
     [
         # fork: two writes from the same preimage
-        [("p", "q"), ("p", "r")],
+        [("a", "b"), ("a", "c")],
         # gap: the second write does not start from the first postimage
-        [("p", "q"), ("x", "r")],
-        # cycle: no unique first write
-        [("p", "q"), ("q", "p")],
+        [("a", "b"), ("x", "c")],
+        # disconnected cycle beside the real chain
+        [("a", "b"), ("x", "y"), ("y", "x")],
+        # first write does not start at the base content
+        [("x", "b"), ("b", "c")],
     ],
 )
-def test_terminal_effect_postimage_fails_closed_on_non_chains(effects):
-    records = [{"preimage_sha256": pre, "postimage_sha256": post} for pre, post in effects]
+def test_terminal_effect_postimage_fails_closed_on_non_walks(effects):
+    records = [{"preimage_sha256": _h(pre), "postimage_sha256": _h(post)} for pre, post in effects]
     with pytest.raises(cli.RuntimeErrorBounded, match="OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH"):
-        cli._terminal_effect_postimage(records)
+        cli._terminal_effect_postimage(records, _h("a"))
 
 
-def test_terminal_effect_postimage_orders_chain_independent_of_journal_order():
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"postimage_sha256": "b" * 64},
+        {"preimage_sha256": None, "postimage_sha256": "b" * 64},
+        {"preimage_sha256": "a" * 64},
+        {"preimage_sha256": "a" * 64, "postimage_sha256": "absent"},
+        {"preimage_sha256": "A" * 64, "postimage_sha256": "b" * 64},
+        {"preimage_sha256": "a" * 64, "postimage_sha256": "b" * 63},
+    ],
+)
+def test_terminal_effect_postimage_rejects_malformed_hashes(record):
+    with pytest.raises(cli.RuntimeErrorBounded, match="OPEN_SWE_CORE_CHANGESET_EFFECT_INVALID"):
+        cli._terminal_effect_postimage([record], "a" * 64)
+
+
+@pytest.mark.parametrize(
+    "effects,expected",
+    [
+        ([("b", "c"), ("c", "d"), ("a", "b")], "d"),
+        ([("a", "b"), ("b", "a")], "a"),
+        ([("a", "b"), ("b", "c"), ("c", "b")], "b"),
+        ([("a", "b"), ("b", "b")], "b"),
+    ],
+)
+def test_terminal_effect_postimage_follows_walk_independent_of_journal_order(effects, expected):
+    records = [{"preimage_sha256": _h(pre), "postimage_sha256": _h(post)} for pre, post in effects]
+    assert cli._terminal_effect_postimage(records, _h("a")) == _h(expected)
+    assert cli._terminal_effect_postimage(list(reversed(records)), _h("a")) == _h(expected)
+
+
+def test_terminal_effect_postimage_starts_new_file_from_absent():
     records = [
-        {"preimage_sha256": "q", "postimage_sha256": "r"},
-        {"preimage_sha256": "r", "postimage_sha256": "s"},
-        {"preimage_sha256": "p", "postimage_sha256": "q"},
+        {"preimage_sha256": "absent", "postimage_sha256": _h("b")},
+        {"preimage_sha256": _h("b"), "postimage_sha256": _h("c")},
     ]
-    assert cli._terminal_effect_postimage(records) == "s"
+    assert cli._terminal_effect_postimage(records, "absent") == _h("c")
 
 
 @pytest.mark.parametrize(
