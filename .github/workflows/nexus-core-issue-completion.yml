@@ -38,6 +38,8 @@ jobs:
     outputs:
       artifact-name: ${{ steps.gate.outputs.artifact-name }}
       issue-number: ${{ steps.gate.outputs.issue-number }}
+      artifact-id: ${{ steps.gate.outputs.artifact-id }}
+      outcome: ${{ steps.gate.outputs.outcome }}
     steps:
       - id: gate
         uses: James3014/nexus-core/.github/actions/issue-gate@3f3dc38de7120b66f25eb246d22ef29d5d5971d9
@@ -57,14 +59,18 @@ jobs:
     permissions:
       contents: read
       actions: read
+      # PR_ALREADY_CLOSED_SKIPPED: receipt-verify re-reads the live PR.
+      pull-requests: read
     steps:
       - uses: James3014/nexus-core/.github/actions/receipt-verify@3f3dc38de7120b66f25eb246d22ef29d5d5971d9
         with:
           artifact-name: ${{ needs.run.outputs.artifact-name }}
+          artifact-id: ${{ needs.run.outputs.artifact-id }}
           # This very workflow file, on the default branch.
           expected-identity: https://github.com/James3014/nexus-open-swe-runtime/.github/workflows/nexus-core-issue-completion.yml@refs/heads/main
           github-repository: ${{ github.repository }}
           head-sha: ${{ github.event.pull_request.head.sha }}
           base-sha: ${{ github.event.pull_request.base.sha }}
           issue-number: ${{ needs.run.outputs.issue-number }}
+          gate-outcome: ${{ needs.run.outputs.outcome }}
           nexus-certify-ref: "3f3dc38de7120b66f25eb246d22ef29d5d5971d9"
