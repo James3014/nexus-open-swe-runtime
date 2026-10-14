@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -3397,6 +3399,197 @@ def test_physical_core_changeset_projection_uses_temp_git_index_and_real_effects
     assert subprocess.check_output(
         ["git", "-C", str(workspace), "diff", "--cached", "--name-only"], text=True
     ).strip() == ""
+
+
+def _changeset_fixture(tmp_path):
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    subprocess.run(["git", "-C", str(workspace), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(workspace), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(workspace), "config", "user.name", "Test"], check=True)
+    target = workspace / "a.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(workspace), "add", "a.py"], check=True)
+    subprocess.run(["git", "-C", str(workspace), "commit", "-q", "-m", "base"], check=True)
+    source_commit = subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"], text=True
+    ).strip()
+    source_tree = subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD^{tree}"], text=True
+    ).strip()
+    identity = RecoveryIdentity(
+        operation_id="a" * 64,
+        execution_material_sha256="b" * 64,
+        workspace=str(workspace),
+        task_id="task-1",
+        unit_id="unit-1",
+        session_id="session-1",
+        allowed_paths=("a.py",),
+        provider_id="opencli_chatgpt",
+        model_id="balanced",
+        worker_identity_sha256="c" * 64,
+        transport_config_sha256="d" * 64,
+        runtime_identity_sha256="e" * 64,
+        core_binding_hash="sha256:" + "1" * 64,
+        acceptance_contract_hash="sha256:" + "2" * 64,
+        core_repository="James3014/nexus-open-swe-runtime",
+        core_source_revision=f"git-commit:{source_commit}",
+        core_source_tree=f"git-tree:{source_tree}",
+        core_attempt_id="attempt-1",
+        core_required_verifier_ids=("pytest",),
+        core_deletion_policy="FORBID",
+    )
+    return workspace, target, identity, DurableEffectJournal(tmp_path / "state", identity)
+
+
+def _journal_edit(journal, target, call, before, after):
+    effect = journal.intent(
+        turn_id=f"turn-{call}",
+        tool_call_id=f"call-{call}",
+        tool_name="edit_file",
+        arguments={"file_path": "a.py", "old_string": before, "new_string": after},
+        path=target,
+        preimage=before,
+        postimage=after,
+    )
+    journal.recover_write(effect)
+
+
+def test_physical_core_changeset_accepts_chained_edits_to_one_file(tmp_path):
+    workspace, target, identity, journal = _changeset_fixture(tmp_path)
+    _journal_edit(journal, target, 1, "VALUE = 1\n", "VALUE = 2\n")
+    _journal_edit(journal, target, 2, "VALUE = 2\n", "VALUE = 3\n")
+    _journal_edit(journal, target, 3, "VALUE = 3\n", "VALUE = 4\n")
+
+    projection = cli._physical_core_changeset_projection(workspace, identity, journal)
+    assert projection["status"] == "PHYSICAL_CHANGESET_BOUND"
+    assert projection["change_set"]["paths"] == ["a.py"]
+
+
+def test_physical_core_changeset_rejects_chained_edits_when_disk_differs(tmp_path):
+    workspace, target, identity, journal = _changeset_fixture(tmp_path)
+    _journal_edit(journal, target, 1, "VALUE = 1\n", "VALUE = 2\n")
+    _journal_edit(journal, target, 2, "VALUE = 2\n", "VALUE = 3\n")
+    target.write_text("VALUE = 2\n", encoding="utf-8")
+
+    with pytest.raises(cli.RuntimeErrorBounded, match="OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH"):
+        cli._physical_core_changeset_projection(workspace, identity, journal)
+
+
+def test_physical_core_changeset_accepts_edit_that_is_later_undone(tmp_path):
+    workspace, target, identity, journal = _changeset_fixture(tmp_path)
+    _journal_edit(journal, target, 1, "VALUE = 1\n", "VALUE = 2\n")
+    _journal_edit(journal, target, 2, "VALUE = 2\n", "VALUE = 3\n")
+    _journal_edit(journal, target, 3, "VALUE = 3\n", "VALUE = 2\n")
+    _journal_edit(journal, target, 4, "VALUE = 2\n", "VALUE = 2\n")
+
+    projection = cli._physical_core_changeset_projection(workspace, identity, journal)
+    assert projection["status"] == "PHYSICAL_CHANGESET_BOUND"
+
+
+def test_physical_core_changeset_accepts_chained_crlf_edits(tmp_path):
+    workspace, target, identity, _journal = _changeset_fixture(tmp_path)
+    target.write_bytes(b"VALUE = 1\r\n")
+    subprocess.run(["git", "-C", str(workspace), "commit", "-q", "-am", "crlf"], check=True)
+    head = subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"], text=True
+    ).strip()
+    tree = subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD^{tree}"], text=True
+    ).strip()
+    identity = dataclasses.replace(
+        identity, core_source_revision=f"git-commit:{head}", core_source_tree=f"git-tree:{tree}"
+    )
+    journal = DurableEffectJournal(tmp_path / "state-crlf", identity)
+    _journal_edit(journal, target, 1, "VALUE = 1\r\n", "VALUE = 2\r\n")
+    _journal_edit(journal, target, 2, "VALUE = 2\r\n", "VALUE = 3\r\n")
+    assert target.read_bytes() == b"VALUE = 3\r\n"
+
+    projection = cli._physical_core_changeset_projection(workspace, identity, journal)
+    assert projection["status"] == "PHYSICAL_CHANGESET_BOUND"
+
+
+def test_physical_core_changeset_rejects_chain_not_starting_at_source(tmp_path):
+    workspace, target, identity, journal = _changeset_fixture(tmp_path)
+    # an unjournaled change to "VALUE = 9" happened before the first write
+    target.write_text("VALUE = 9\n", encoding="utf-8")
+    _journal_edit(journal, target, 1, "VALUE = 9\n", "VALUE = 2\n")
+    _journal_edit(journal, target, 2, "VALUE = 2\n", "VALUE = 3\n")
+
+    with pytest.raises(cli.RuntimeErrorBounded, match="OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH"):
+        cli._physical_core_changeset_projection(workspace, identity, journal)
+
+
+def test_physical_core_changeset_rejects_journaled_file_missing_on_disk(tmp_path):
+    workspace, target, identity, journal = _changeset_fixture(tmp_path)
+    _journal_edit(journal, target, 1, "VALUE = 1\n", "VALUE = 2\n")
+    target.unlink()
+    identity = dataclasses.replace(identity, core_deletion_policy="ALLOW")
+
+    with pytest.raises(cli.RuntimeErrorBounded, match="OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH"):
+        cli._physical_core_changeset_projection(workspace, identity, journal)
+
+
+def _h(label):
+    return hashlib.sha256(label.encode()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "effects",
+    [
+        # fork: two writes from the same preimage
+        [("a", "b"), ("a", "c")],
+        # gap: the second write does not start from the first postimage
+        [("a", "b"), ("x", "c")],
+        # disconnected cycle beside the real chain
+        [("a", "b"), ("x", "y"), ("y", "x")],
+        # first write does not start at the base content
+        [("x", "b"), ("b", "c")],
+    ],
+)
+def test_terminal_effect_postimage_fails_closed_on_non_walks(effects):
+    records = [{"preimage_sha256": _h(pre), "postimage_sha256": _h(post)} for pre, post in effects]
+    with pytest.raises(cli.RuntimeErrorBounded, match="OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH"):
+        cli._terminal_effect_postimage(records, _h("a"))
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"postimage_sha256": "b" * 64},
+        {"preimage_sha256": None, "postimage_sha256": "b" * 64},
+        {"preimage_sha256": "a" * 64},
+        {"preimage_sha256": "a" * 64, "postimage_sha256": "absent"},
+        {"preimage_sha256": "A" * 64, "postimage_sha256": "b" * 64},
+        {"preimage_sha256": "a" * 64, "postimage_sha256": "b" * 63},
+    ],
+)
+def test_terminal_effect_postimage_rejects_malformed_hashes(record):
+    with pytest.raises(cli.RuntimeErrorBounded, match="OPEN_SWE_CORE_CHANGESET_EFFECT_INVALID"):
+        cli._terminal_effect_postimage([record], "a" * 64)
+
+
+@pytest.mark.parametrize(
+    "effects,expected",
+    [
+        ([("b", "c"), ("c", "d"), ("a", "b")], "d"),
+        ([("a", "b"), ("b", "a")], "a"),
+        ([("a", "b"), ("b", "c"), ("c", "b")], "b"),
+        ([("a", "b"), ("b", "b")], "b"),
+    ],
+)
+def test_terminal_effect_postimage_follows_walk_independent_of_journal_order(effects, expected):
+    records = [{"preimage_sha256": _h(pre), "postimage_sha256": _h(post)} for pre, post in effects]
+    assert cli._terminal_effect_postimage(records, _h("a")) == _h(expected)
+    assert cli._terminal_effect_postimage(list(reversed(records)), _h("a")) == _h(expected)
+
+
+def test_terminal_effect_postimage_starts_new_file_from_absent():
+    records = [
+        {"preimage_sha256": "absent", "postimage_sha256": _h("b")},
+        {"preimage_sha256": _h("b"), "postimage_sha256": _h("c")},
+    ]
+    assert cli._terminal_effect_postimage(records, "absent") == _h("c")
 
 
 @pytest.mark.parametrize(
