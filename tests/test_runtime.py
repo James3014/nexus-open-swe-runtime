@@ -3399,6 +3399,107 @@ def test_physical_core_changeset_projection_uses_temp_git_index_and_real_effects
     ).strip() == ""
 
 
+def _changeset_fixture(tmp_path):
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    subprocess.run(["git", "-C", str(workspace), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(workspace), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(workspace), "config", "user.name", "Test"], check=True)
+    target = workspace / "a.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(workspace), "add", "a.py"], check=True)
+    subprocess.run(["git", "-C", str(workspace), "commit", "-q", "-m", "base"], check=True)
+    source_commit = subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"], text=True
+    ).strip()
+    source_tree = subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD^{tree}"], text=True
+    ).strip()
+    identity = RecoveryIdentity(
+        operation_id="a" * 64,
+        execution_material_sha256="b" * 64,
+        workspace=str(workspace),
+        task_id="task-1",
+        unit_id="unit-1",
+        session_id="session-1",
+        allowed_paths=("a.py",),
+        provider_id="opencli_chatgpt",
+        model_id="balanced",
+        worker_identity_sha256="c" * 64,
+        transport_config_sha256="d" * 64,
+        runtime_identity_sha256="e" * 64,
+        core_binding_hash="sha256:" + "1" * 64,
+        acceptance_contract_hash="sha256:" + "2" * 64,
+        core_repository="James3014/nexus-open-swe-runtime",
+        core_source_revision=f"git-commit:{source_commit}",
+        core_source_tree=f"git-tree:{source_tree}",
+        core_attempt_id="attempt-1",
+        core_required_verifier_ids=("pytest",),
+        core_deletion_policy="FORBID",
+    )
+    return workspace, target, identity, DurableEffectJournal(tmp_path / "state", identity)
+
+
+def _journal_edit(journal, target, call, before, after):
+    effect = journal.intent(
+        turn_id=f"turn-{call}",
+        tool_call_id=f"call-{call}",
+        tool_name="edit_file",
+        arguments={"file_path": "a.py", "old_string": before, "new_string": after},
+        path=target,
+        preimage=before,
+        postimage=after,
+    )
+    journal.recover_write(effect)
+
+
+def test_physical_core_changeset_accepts_chained_edits_to_one_file(tmp_path):
+    workspace, target, identity, journal = _changeset_fixture(tmp_path)
+    _journal_edit(journal, target, 1, "VALUE = 1\n", "VALUE = 2\n")
+    _journal_edit(journal, target, 2, "VALUE = 2\n", "VALUE = 3\n")
+    _journal_edit(journal, target, 3, "VALUE = 3\n", "VALUE = 4\n")
+
+    projection = cli._physical_core_changeset_projection(workspace, identity, journal)
+    assert projection["status"] == "PHYSICAL_CHANGESET_BOUND"
+    assert projection["change_set"]["paths"] == ["a.py"]
+
+
+def test_physical_core_changeset_rejects_chained_edits_when_disk_differs(tmp_path):
+    workspace, target, identity, journal = _changeset_fixture(tmp_path)
+    _journal_edit(journal, target, 1, "VALUE = 1\n", "VALUE = 2\n")
+    _journal_edit(journal, target, 2, "VALUE = 2\n", "VALUE = 3\n")
+    target.write_text("VALUE = 2\n", encoding="utf-8")
+
+    with pytest.raises(cli.RuntimeErrorBounded, match="OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH"):
+        cli._physical_core_changeset_projection(workspace, identity, journal)
+
+
+@pytest.mark.parametrize(
+    "effects",
+    [
+        # fork: two writes from the same preimage
+        [("p", "q"), ("p", "r")],
+        # gap: the second write does not start from the first postimage
+        [("p", "q"), ("x", "r")],
+        # cycle: no unique first write
+        [("p", "q"), ("q", "p")],
+    ],
+)
+def test_terminal_effect_postimage_fails_closed_on_non_chains(effects):
+    records = [{"preimage_sha256": pre, "postimage_sha256": post} for pre, post in effects]
+    with pytest.raises(cli.RuntimeErrorBounded, match="OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH"):
+        cli._terminal_effect_postimage(records)
+
+
+def test_terminal_effect_postimage_orders_chain_independent_of_journal_order():
+    records = [
+        {"preimage_sha256": "q", "postimage_sha256": "r"},
+        {"preimage_sha256": "r", "postimage_sha256": "s"},
+        {"preimage_sha256": "p", "postimage_sha256": "q"},
+    ]
+    assert cli._terminal_effect_postimage(records) == "s"
+
+
 @pytest.mark.parametrize(
     "name,mutate,expected,refresh_hash",
     [

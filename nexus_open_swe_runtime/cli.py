@@ -1512,6 +1512,37 @@ def _workspace_file_mode(path: Path) -> str:
     return "100755" if path.stat().st_mode & 0o111 else "100644"
 
 
+def _terminal_effect_postimage(effects: list[dict[str, Any]]) -> str:
+    """Return the final postimage of one path's journaled writes.
+
+    Repeated edits to one file form a chain (each preimage is the previous
+    postimage); only the last link must match the workspace.  A fork, a gap,
+    or a cycle is not a single chain and fails closed.
+    """
+    if len(effects) == 1:
+        return str(effects[0].get("postimage_sha256"))
+    by_preimage: dict[Any, dict[str, Any]] = {}
+    for effect in effects:
+        preimage = effect.get("preimage_sha256")
+        if preimage in by_preimage:
+            raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH")
+        by_preimage[preimage] = effect
+    postimages = {effect.get("postimage_sha256") for effect in effects}
+    starts = [effect for effect in effects if effect.get("preimage_sha256") not in postimages]
+    if len(starts) != 1:
+        raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH")
+    current = starts[0]
+    visited = 1
+    while current.get("postimage_sha256") in by_preimage:
+        current = by_preimage[current.get("postimage_sha256")]
+        visited += 1
+        if visited > len(effects):
+            raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH")
+    if visited != len(effects):
+        raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH")
+    return str(current.get("postimage_sha256"))
+
+
 def _physical_core_changeset_projection(
     workspace: Path,
     identity: RecoveryIdentity,
@@ -1552,7 +1583,7 @@ def _physical_core_changeset_projection(
     if deleted_paths and identity.core_deletion_policy == "FORBID":
         raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_DELETION_FORBIDDEN")
 
-    effect_paths: set[str] = set()
+    effects_by_path: dict[str, list[dict[str, Any]]] = {}
     for effect in effect_journal.result_effects():
         try:
             relative = Path(str(effect["path"])).resolve().relative_to(workspace).as_posix()
@@ -1561,15 +1592,17 @@ def _physical_core_changeset_projection(
         relative = _safe_relative_path(relative)
         if relative not in allowed:
             raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_SCOPE_MISMATCH")
+        effects_by_path.setdefault(relative, []).append(effect)
+    for relative, path_effects in effects_by_path.items():
         physical = workspace / relative
         if physical.exists():
             try:
                 actual_sha = _sha256(physical.read_bytes())
             except OSError as exc:
                 raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_INVALID") from exc
-            if actual_sha != effect.get("postimage_sha256"):
+            if actual_sha != _terminal_effect_postimage(path_effects):
                 raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_EFFECT_MISMATCH")
-        effect_paths.add(relative)
+    effect_paths = set(effects_by_path)
     journaled_scope = set(actual_paths)
     continuation_base = identity.core_continuation_base
     if continuation_base:
