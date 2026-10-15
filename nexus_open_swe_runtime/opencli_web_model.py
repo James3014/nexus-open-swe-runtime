@@ -2910,8 +2910,10 @@ class OpenCLIWebChatModel(BaseChatModel):
             if position == len(tail):
                 return expected
             result = tail[position]
-            if not isinstance(result, ToolMessage) or str(result.tool_call_id or "") != str(
-                expected.tool_calls[0]["id"]
+            if (
+                not isinstance(result, ToolMessage)
+                or str(result.tool_call_id or "") != str(expected.tool_calls[0]["id"])
+                or result.name != expected.tool_calls[0]["name"]
             ):
                 raise invalid
             position += 1

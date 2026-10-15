@@ -496,7 +496,9 @@ def _three_call_batch() -> str:
     )
 
 
-@pytest.mark.parametrize("shape", ["jump_to_last", "missing_result", "failed_prefix", "out_of_order"])
+@pytest.mark.parametrize(
+    "shape", ["jump_to_last", "missing_result", "failed_prefix", "out_of_order", "wrong_tool_name"]
+)
 def test_review138_batch_resume_requires_contiguous_successful_prefix(shape):
     response = _three_call_batch()
     first, first_ok = _batch_pair(response, 0)
@@ -508,6 +510,12 @@ def test_review138_batch_resume_requires_contiguous_successful_prefix(shape):
         "missing_result": [HumanMessage("x"), first, second],
         "failed_prefix": [HumanMessage("x"), first, first_failed, second],
         "out_of_order": [HumanMessage("x"), second, second_ok, first],
+        "wrong_tool_name": [
+            HumanMessage("x"),
+            first,
+            ToolMessage(content="ok", tool_call_id=first.tool_calls[0]["id"], name="write_file"),
+            second,
+        ],
     }[shape]
     recovered = OpenCLIWebChatModel._response_message(response, _DECLARED)
     with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_BATCH_STATE_INVALID"):
