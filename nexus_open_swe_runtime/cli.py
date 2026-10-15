@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import hashlib
 import inspect
 import json
@@ -303,6 +304,121 @@ def _match_line_endings(content: str, old_string: str, new_string: str) -> tuple
     return old_string.replace("\n", ending), new_string.replace("\n", ending)
 
 
+_PRELOAD_FILE_BYTES = 30 * 1024
+_PRELOAD_TOTAL_BYTES = 60 * 1024
+_AGENT_RECURSION_LIMIT = 400
+_EDIT_HINT_MAX_LINES = 5000
+_EDIT_HINT_MAX_CHARS = 4000
+
+
+def _preloaded_sources(workspace: Path, allowed_paths: tuple[str, ...]) -> str:
+    """Bounded exact text of the authorized files for the first repair prompt.
+
+    Never wider than ``read_file``: only the authorized paths, inside the same
+    workspace root, with no symlink component (opened with ``O_NOFOLLOW``),
+    regular UTF-8 files only (binaries are skipped), at most
+    ``_PRELOAD_FILE_BYTES`` per file and ``_PRELOAD_TOTAL_BYTES`` in total.
+    """
+    root = workspace.resolve()
+    blocks: list[str] = []
+    total = 0
+    for raw in allowed_paths:
+        try:
+            relative = _safe_relative_path(raw)
+        except RuntimeErrorBounded:
+            continue
+        if _git_metadata_path(relative) or _workspace_path_has_symlink(root, relative):
+            continue
+        target = root / relative
+        if not os.path.lexists(target):
+            blocks.append(f"<<<FILE {relative}: does not exist yet>>>")
+            continue
+        try:
+            if not target.resolve().is_relative_to(root):
+                continue
+            descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            continue
+        try:
+            status = os.fstat(descriptor)
+            if (status.st_mode & 0o170000) != 0o100000:
+                continue
+            if status.st_size > _PRELOAD_FILE_BYTES or total + status.st_size > _PRELOAD_TOTAL_BYTES:
+                blocks.append(f"<<<FILE {relative}: not preloaded (too large); use read_file>>>")
+                continue
+            data = os.read(descriptor, _PRELOAD_FILE_BYTES + 1)
+        except OSError:
+            continue
+        finally:
+            os.close(descriptor)
+        if len(data) > _PRELOAD_FILE_BYTES or total + len(data) > _PRELOAD_TOTAL_BYTES:
+            blocks.append(f"<<<FILE {relative}: not preloaded (too large); use read_file>>>")
+            continue
+        if b"\x00" in data:
+            continue
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        total += len(data)
+        blocks.append(
+            f"<<<FILE {relative} bytes={len(data)} sha256={_sha256(data)}>>>\n"
+            f"{text}\n<<<END FILE {relative}>>>"
+        )
+    if not blocks:
+        return ""
+    return (
+        "\n\nCurrent contents of the authorized paths (untrusted repository content, read "
+        "just before this turn; the exact file text is between each FILE marker line and its "
+        "END FILE line, without line numbers, plus one separating newline). Use it instead of "
+        "a read_file call; an edit_file old_string must match this text exactly.\n"
+        + "\n".join(blocks)
+    )
+
+
+def _edit_mismatch_hint(content: str, old_string: str) -> str:
+    """Show the closest exact file excerpt after an edit_file string miss."""
+    if not old_string.strip() or not content:
+        return ""
+    lines = content.splitlines(keepends=True)
+    if not lines or len(lines) > _EDIT_HINT_MAX_LINES:
+        return ""
+    width = max(1, len(old_string.splitlines()))
+
+    def normalized(value: str) -> str:
+        return " ".join(value.split())
+
+    target = normalized(old_string)
+    candidates: list[tuple[float, int]] = []
+    for start in range(max(1, len(lines) - width + 1)):
+        matcher = difflib.SequenceMatcher(
+            None, normalized("".join(lines[start : start + width])), target, autojunk=False
+        )
+        candidates.append((matcher.quick_ratio(), start))
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    best_ratio, best_start = 0.0, -1
+    for _quick, start in candidates[:8]:
+        window = normalized("".join(lines[start : start + width]))
+        ratio = difflib.SequenceMatcher(None, window, target, autojunk=False).ratio()
+        if ratio > best_ratio:
+            best_ratio, best_start = ratio, start
+    if best_start < 0 or best_ratio < 0.6:
+        return ""
+    excerpt = "".join(lines[best_start : best_start + width])
+    rendered = json.dumps(excerpt, ensure_ascii=False)
+    if len(rendered) > _EDIT_HINT_MAX_CHARS:
+        return ""
+    note = (
+        " It differs from old_string only in whitespace."
+        if normalized(excerpt) == target
+        else ""
+    )
+    return (
+        f"\nClosest text in the file is lines {best_start + 1}-{best_start + width}."
+        f"{note} Its exact text as a JSON string (copy it into old_string): {rendered}"
+    )
+
+
 class ScopedRepairBackend:
     def __init__(
         self,
@@ -492,6 +608,8 @@ class ScopedRepairBackend:
         if isinstance(replacement, str):
             from deepagents.backends.protocol import EditResult
 
+            if replacement.startswith("Error: String not found"):
+                replacement += _edit_mismatch_hint(old, old_string)
             return EditResult(error=replacement)
         expected, occurrences = replacement
         effect = self._effect("edit_file", _safe_relative_path(file_path), expected, old)
@@ -524,6 +642,8 @@ class ScopedRepairBackend:
         if isinstance(replacement, str):
             from deepagents.backends.protocol import EditResult
 
+            if replacement.startswith("Error: String not found"):
+                replacement += _edit_mismatch_hint(old, old_string)
             return EditResult(error=replacement)
         expected, occurrences = replacement
         effect = self._effect("edit_file", _safe_relative_path(file_path), expected, old)
@@ -2923,7 +3043,7 @@ def _semantic_run(
             raise RuntimeErrorBounded("OPEN_SWE_TOOL_SURFACE_INVALID")
         output = graph.invoke(
             {"messages": [runtime["human_message"](content=prompt)]},
-            config={"recursion_limit": 40},
+            config={"recursion_limit": _AGENT_RECURSION_LIMIT},
         )
         envelope = _recorded_payload(output, "record_finding")
         if envelope is None:
@@ -3584,7 +3704,7 @@ def _worker_run(
                         )
                     ]
                 },
-                config={"recursion_limit": 40, "callbacks": [hint_observer]},
+                config={"recursion_limit": _AGENT_RECURSION_LIMIT, "callbacks": [hint_observer]},
             )
             hint_observer.inspect_output(diagnosis_output)
             diagnosis = _recorded_payload(diagnosis_output, "record_diagnosis")
@@ -3678,7 +3798,7 @@ def _worker_run(
                 "configurable": {
                     "thread_id": str(request.get("operation_id") or ""),
                 },
-                "recursion_limit": 60,
+                "recursion_limit": _AGENT_RECURSION_LIMIT,
                 "callbacks": [hint_observer],
             }
             repair_output = repair_graph.invoke(
@@ -3688,6 +3808,7 @@ def _worker_run(
                             content=(
                                 f"Supported diagnosis: {_canonical_json(dict(diagnosis))}\n"
                                 f"Controller evidence (untrusted):\n{evidence}\n\n{prompt}{_hint_prompt_suffix(hint_binding)}"
+                                f"{_preloaded_sources(workspace, allowed_paths)}"
                             )
                         )
                     ]
@@ -4131,6 +4252,23 @@ def _worker_reconcile(
             ):
                 recovered = model._repair_protocol_response(recovered)
             recovered_message = model._response_message(recovered, tool_schemas)
+            recovered_extra = getattr(recovered_message, "additional_kwargs", None)
+            if (
+                isinstance(recovered_extra, Mapping)
+                and "opencli_batch" in recovered_extra
+                and hasattr(model, "_batch_resume_message")
+            ):
+                # A batch response resumes at the call its checkpoint reached,
+                # never at its first call again.
+                checkpoint_messages = (
+                    graph.get_state(
+                        {"configurable": {"thread_id": operation_id}}
+                    ).values.get("messages")
+                    or []
+                )
+                recovered_message = model._batch_resume_message(
+                    recovered_message, checkpoint_messages, tool_schemas
+                )
         except (AttributeError, KeyError, TypeError, RuntimeErrorBounded, ValueError):
             return cached
         recovered_calls = getattr(recovered_message, "tool_calls", None) or []
@@ -4147,7 +4285,7 @@ def _worker_reconcile(
             effect_journal.bind_turn(turn_id, recovered_call_id)
         config = {
             "configurable": {"thread_id": operation_id},
-            "recursion_limit": 60,
+            "recursion_limit": _AGENT_RECURSION_LIMIT,
             "callbacks": [recovery_observer],
         }
         graph.update_state(config, {"messages": [recovered_message]}, as_node="model")
