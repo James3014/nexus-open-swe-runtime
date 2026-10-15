@@ -4846,18 +4846,27 @@ def test_opencli_web_model_presend_retry_requires_exact_adapter_error(
     assert len(asks) == 1
 
 
-def test_opencli_web_model_presend_retry_accepts_exit_code_and_update_notice(
+def test_opencli_web_model_presend_retry_accepts_exit_code_line(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    stderr = (
-        "Update available 1.8.7 -> 1.8.8, run npm install -g @jackwener/opencli\n"
-        + _COMPOSER_STDERR
-        + "  exitCode: 1\n"
-    )
-    calls = _composer_flaky_process(monkeypatch, 1, stderr)
+    calls = _composer_flaky_process(monkeypatch, 1, _COMPOSER_STDERR + "  exitCode: 1\n")
     model = OpenCLIWebChatModel(executable="/opt/opencli", profile="", site_session="ephemeral")
     _use_fake_clock(model)
 
     assert model.invoke([HumanMessage(content="turn")]).content == "done"
     asks = [args for args, _kwargs in calls if args[1:3] == ["chatgpt", "ask"]]
     assert len(asks) == 2
+
+
+def test_opencli_web_model_presend_retry_rejects_extra_notice_lines(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    stderr = "Update available 1.8.7 -> 1.8.8, run npm install -g x\n" + _COMPOSER_STDERR
+    calls = _composer_flaky_process(monkeypatch, 1, stderr)
+    model = OpenCLIWebChatModel(executable="/opt/opencli", profile="", site_session="ephemeral")
+    _use_fake_clock(model)
+
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_PROCESS_FAILURE"):
+        model.invoke([HumanMessage(content="turn")])
+    asks = [args for args, _kwargs in calls if args[1:3] == ["chatgpt", "ask"]]
+    assert len(asks) == 1
