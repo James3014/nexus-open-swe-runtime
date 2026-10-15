@@ -308,6 +308,10 @@ _PRELOAD_FILE_BYTES = 30 * 1024
 _PRELOAD_TOTAL_BYTES = 60 * 1024
 _AGENT_RECURSION_LIMIT = 400
 _EDIT_HINT_MAX_LINES = 5000
+# The hint scans every window of the file, so bound the searched text too
+# (model-controlled old_string); a miss beyond these bounds gets no hint.
+_EDIT_HINT_MAX_OLD_CHARS = 4_000
+_EDIT_HINT_MAX_WIDTH = 80
 _EDIT_HINT_MAX_CHARS = 4000
 
 
@@ -378,12 +382,14 @@ def _preloaded_sources(workspace: Path, allowed_paths: tuple[str, ...]) -> str:
 
 def _edit_mismatch_hint(content: str, old_string: str) -> str:
     """Show the closest exact file excerpt after an edit_file string miss."""
-    if not old_string.strip() or not content:
+    if not old_string.strip() or not content or len(old_string) > _EDIT_HINT_MAX_OLD_CHARS:
         return ""
     lines = content.splitlines(keepends=True)
     if not lines or len(lines) > _EDIT_HINT_MAX_LINES:
         return ""
     width = max(1, len(old_string.splitlines()))
+    if width > _EDIT_HINT_MAX_WIDTH:
+        return ""
 
     def normalized(value: str) -> str:
         return " ".join(value.split())

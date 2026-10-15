@@ -467,3 +467,16 @@ def test_worker_run_first_repair_prompt_preloads_authorized_source(tmp_path):
     assert "<<<FILE a.py bytes=10 sha256=" in first_message
     assert "VALUE = 1\n\n<<<END FILE a.py>>>" in first_message
     assert payloads[0][1]["recursion_limit"] == cli._AGENT_RECURSION_LIMIT
+
+
+def test_edit_mismatch_hint_is_bounded_for_large_old_string():
+    import time
+
+    content = "".join(f"value_{index} = {index} * 2 + 1  # filler text\n" for index in range(5000))
+    huge = "x = 1\n" * 2000
+    started = time.monotonic()
+    assert cli._edit_mismatch_hint(content, huge) == ""
+    assert cli._edit_mismatch_hint(content, "y" * 5000) == ""
+    wide = "".join(f"value_{index} = {index} * 3\n" for index in range(60))
+    cli._edit_mismatch_hint(content, wide)
+    assert time.monotonic() - started < 10
