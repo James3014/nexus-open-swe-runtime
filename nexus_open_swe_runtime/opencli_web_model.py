@@ -55,6 +55,27 @@ _HARD_BLOCK_MARKERS = (
     "quota",
 )
 _BUSY_MARKERS = ("busy", "rate control", "rate-control", "too many requests")
+# `chatgpt ask` raises this before typing or sending anything (ask.js checks the
+# composer right after opening the page), so the ask is safe to repeat.  Long
+# conversations sometimes render their composer after the adapter's wait.
+# Retry only when the whole stderr is exactly that structured adapter error and
+# stdout is empty, so text echoed by any other failure (e.g. a prompt containing
+# the sentence) can never qualify.  OpenCLI prints update notices only on exit 0.
+_PRESEND_COMPOSER_STDERR = re.compile(
+    r"ok: false\nerror:\n  code: COMMAND_EXEC\n"
+    r"  message: ChatGPT ask requires a logged-in ChatGPT session with a visible composer\.\n"
+    r"(?:  exitCode: 1\n)?"
+)
+
+
+def _is_presend_composer_failure(argv: Sequence[str], stdout: str, stderr: str) -> bool:
+    if list(argv)[1:3] != ["chatgpt", "ask"] or stdout.strip():
+        return False
+    text = stderr.replace("\r\n", "\n")
+    if not text.endswith("\n"):
+        text += "\n"
+    return _PRESEND_COMPOSER_STDERR.fullmatch(text) is not None
+_PRESEND_RETRY_DELAYS_SECONDS = (20.0, 60.0)
 _MIN_WEB_SEND_INTERVAL_SECONDS = 15.0
 _POST_RESPONSE_SETTLE_SECONDS = 3.0
 _LATE_READBACK_WINDOW_SECONDS = 15.0
@@ -1217,8 +1238,23 @@ class OpenCLIWebChatModel(BaseChatModel):
                 and ("timed out" in diagnostic or "did not finish" in diagnostic)
             ) or ("timed out" in diagnostic and "may still complete" in diagnostic):
                 raise OpenCLIWebModelError("OPENCLI_WEB_TIMEOUT")
+            if _is_presend_composer_failure(argv, result.stdout or "", result.stderr or ""):
+                raise OpenCLIWebModelError("OPENCLI_WEB_PRESEND_COMPOSER_UNAVAILABLE")
             raise OpenCLIWebModelError("OPENCLI_WEB_PROCESS_FAILURE")
         return result.stdout or ""
+
+    def _run_ask(self, argv: Sequence[str]) -> str:
+        """Run `chatgpt ask`, repeating it only after a pre-send composer failure."""
+        for delay in (*_PRESEND_RETRY_DELAYS_SECONDS, None):
+            try:
+                return self._run(argv)
+            except OpenCLIWebModelError as exc:
+                if str(exc) != "OPENCLI_WEB_PRESEND_COMPOSER_UNAVAILABLE":
+                    raise
+                if delay is None:
+                    raise OpenCLIWebModelError("OPENCLI_WEB_PROCESS_FAILURE") from exc
+                self._sleep(delay)
+        raise AssertionError("unreachable")
 
     def _cooldown_and_probe_status(self) -> None:
         self._sleep(60.0)
@@ -2063,7 +2099,7 @@ class OpenCLIWebChatModel(BaseChatModel):
         if attempt is not None:
             attempt["active_started_monotonic"] = self._clock()
         try:
-            stdout = self._run(argv)
+            stdout = self._run_ask(argv)
         except OpenCLIWebModelError as exc:
             if attempt is not None:
                 attempt["active_latency_seconds"] = self._attempt_active_latency(attempt)
