@@ -806,10 +806,22 @@ def _tool_call_id(name: str, arguments: Mapping[str, Any], raw: str) -> str:
     return "opencli_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
 
 
-def _batch_call_id(name: str, arguments: Mapping[str, Any], raw: str, index: int) -> str:
-    """Deterministic id of one call inside a batch; distinct from single-call ids."""
+def _batch_call_id(
+    name: str, arguments: Mapping[str, Any], raw: str, index: int, turn: str = ""
+) -> str:
+    """Deterministic id of one call inside a batch; distinct from single-call ids.
+
+    ``turn`` is the web-turn identity that produced the batch, so an identical
+    response on a later turn never reuses an earlier batch's ids.
+    """
     canonical = json.dumps(
-        {"name": name, "arguments": dict(arguments), "raw": raw, "batch_index": index},
+        {
+            "name": name,
+            "arguments": dict(arguments),
+            "raw": raw,
+            "batch_index": index,
+            "batch_turn": turn,
+        },
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -857,16 +869,26 @@ def _batch_calls(envelope: Mapping[str, Any], allowed: set[str]) -> list[tuple[s
     return parsed
 
 
-def _batch_message(response: str, calls: Sequence[tuple[str, dict[str, Any]]], index: int) -> AIMessage:
+def _batch_message(
+    response: str,
+    calls: Sequence[tuple[str, dict[str, Any]]],
+    index: int,
+    turn: str = "",
+) -> AIMessage:
     """The single-call message for ``calls[index]`` of one batch response."""
     name, args = calls[index]
-    call_id = _batch_call_id(name, args, response, index)
+    call_id = _batch_call_id(name, args, response, index, turn)
     return AIMessage(
         content="",
         id="opencli_batch_" + call_id.removeprefix("opencli_"),
         tool_calls=[{"name": name, "args": dict(args), "id": call_id, "type": "tool_call"}],
         additional_kwargs={
-            _BATCH_METADATA_KEY: {"response": response, "index": index, "count": len(calls)}
+            _BATCH_METADATA_KEY: {
+                "response": response,
+                "index": index,
+                "count": len(calls),
+                "turn": turn,
+            }
         },
     )
 
@@ -883,8 +905,9 @@ def _batch_metadata(message: Any) -> Mapping[str, Any] | None:
     count = meta.get("count") if isinstance(meta, Mapping) else None
     if (
         not isinstance(meta, Mapping)
-        or set(meta) != {"response", "index", "count"}
+        or set(meta) != {"response", "index", "count", "turn"}
         or not isinstance(meta.get("response"), str)
+        or not isinstance(meta.get("turn"), str)
         or type(index) is not int
         or type(count) is not int
         or not 0 <= index < count <= _MAX_TOOL_CALLS_PER_RESPONSE
@@ -911,7 +934,7 @@ def _rebuild_batch_message(
         raise OpenCLIWebModelError("OPENCLI_WEB_BATCH_STATE_INVALID") from exc
     if len(calls) != meta["count"] or not 0 <= index < len(calls):
         raise OpenCLIWebModelError("OPENCLI_WEB_BATCH_STATE_INVALID")
-    return _batch_message(meta["response"], calls, index)
+    return _batch_message(meta["response"], calls, index, meta["turn"])
 
 
 def _same_single_call(left: AIMessage, right: AIMessage) -> bool:
@@ -2664,7 +2687,9 @@ class OpenCLIWebChatModel(BaseChatModel):
         return response
 
     @staticmethod
-    def _response_message(response: str, tools: Sequence[Mapping[str, Any]]) -> AIMessage:
+    def _response_message(
+        response: str, tools: Sequence[Mapping[str, Any]], *, batch_turn: str = ""
+    ) -> AIMessage:
         allowed = {name for tool in tools if (name := _tool_name(tool))}
         try:
             envelope = json.loads(response, object_pairs_hook=_reject_duplicate_json_keys)
@@ -2678,7 +2703,7 @@ class OpenCLIWebChatModel(BaseChatModel):
         if kind == "tool_calls":
             # Only the first call is released; the rest follow one by one
             # through ``_batch_continuation`` after each prior success.
-            return _batch_message(response, _batch_calls(envelope, allowed), 0)
+            return _batch_message(response, _batch_calls(envelope, allowed), 0, batch_turn)
         if kind != "tool_call":
             direct = _direct_terminal_recorder(envelope)
             if direct is None or direct[0] not in allowed:
@@ -2769,8 +2794,32 @@ class OpenCLIWebChatModel(BaseChatModel):
             response = self._repair_protocol_response(response)
         message = self._response_message(response, normalized_tools)
         if _batch_metadata(message) is not None:
+            message = self._response_message(
+                response, normalized_tools, batch_turn=self._batch_turn_identity(turn_id)
+            )
             self._bind_batch_call(message)
         return ChatResult(generations=[ChatGeneration(message=message)])
+
+    def _batch_turn_identity(self, prompt_turn_id: str = "") -> str:
+        """Identity of the web turn that produced the current batch.
+
+        With a recovery journal it is the journaled turn and its ordinal, so a
+        restarted process derives the same batch ids; without one it is the
+        prompt turn and this instance's turn count.
+        """
+        if self._recovery_journal is not None:
+            try:
+                state = self._recovery_journal.read()
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise OpenCLIWebModelError("OPENCLI_WEB_BATCH_STATE_INVALID") from exc
+            turn_id = state.get("turn_id") if isinstance(state, Mapping) else None
+            ordinal = state.get("turn_ordinal") if isinstance(state, Mapping) else None
+            if not isinstance(turn_id, str) or not turn_id or type(ordinal) is not int:
+                raise OpenCLIWebModelError("OPENCLI_WEB_BATCH_STATE_INVALID")
+            return f"{turn_id}#{ordinal}"
+        if not prompt_turn_id:
+            raise OpenCLIWebModelError("OPENCLI_WEB_BATCH_STATE_INVALID")
+        return f"{prompt_turn_id}#{self._web_turn_count}"
 
     def _bind_batch_call(self, message: AIMessage) -> None:
         """Bind the effect journal to exactly this batch call before it runs."""
@@ -2826,19 +2875,48 @@ class OpenCLIWebChatModel(BaseChatModel):
         meta = _batch_metadata(message)
         if meta is None:
             return message
-        reached = -1
-        for item in history:
-            item_meta = _batch_metadata(item)
-            if item_meta is not None and item_meta["response"] == meta["response"]:
-                reached = max(reached, int(item_meta["index"]))
-        if reached <= 0:
+        invalid = OpenCLIWebModelError("OPENCLI_WEB_BATCH_STATE_INVALID")
+        first = next(
+            (
+                position
+                for position, item in enumerate(history)
+                if (item_meta := _batch_metadata(item)) is not None
+                and item_meta["response"] == meta["response"]
+                and item_meta["turn"] == meta["turn"]
+            ),
+            None,
+        )
+        if first is None:
             return message
-        resumed = _rebuild_batch_message(meta, tools, reached)
-        if not any(
-            isinstance(item, AIMessage)
-            and item.id == resumed.id
-            and _same_single_call(item, resumed)
-            for item in history
-        ):
-            raise OpenCLIWebModelError("OPENCLI_WEB_BATCH_STATE_INVALID")
-        return resumed
+        # The checkpoint tail must be exactly AI(0), Tool(0), ..., AI(k)
+        # [, Tool(k)]: every earlier call present, in order, and successful.
+        tail = list(history[first:])
+        position = 0
+        index = 0
+        while True:
+            expected = _rebuild_batch_message(meta, tools, index)
+            request = tail[position]
+            request_meta = _batch_metadata(request)
+            if (
+                request_meta is None
+                or request_meta["response"] != meta["response"]
+                or request_meta["turn"] != meta["turn"]
+                or request_meta["index"] != index
+                or request.id != expected.id
+                or not _same_single_call(request, expected)
+            ):
+                raise invalid
+            position += 1
+            if position == len(tail):
+                return expected
+            result = tail[position]
+            if not isinstance(result, ToolMessage) or str(result.tool_call_id or "") != str(
+                expected.tool_calls[0]["id"]
+            ):
+                raise invalid
+            position += 1
+            if position == len(tail):
+                return expected
+            if not _tool_result_succeeded(result):
+                raise invalid
+            index += 1
