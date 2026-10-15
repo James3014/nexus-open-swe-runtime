@@ -63,6 +63,15 @@ _MAX_LATE_READBACK_POLLS = 5
 _MAX_WEB_TURNS_PER_OPERATION = 12
 _MAX_HISTORY_CANDIDATES = 12
 _TERMINAL_RECORDER_TOOLS = frozenset({"record_finding", "record_diagnosis", "record_worker_result"})
+# One web response may carry an ordered batch of tool calls.  The batch is
+# never handed to the tool executor as one multi-call message: every call is
+# emitted as its own single-call AIMessage, the next one only after the
+# previous call returned a successful result (see ``_batch_continuation``).
+_MAX_TOOL_CALLS_PER_RESPONSE = 8
+_BATCH_METADATA_KEY = "opencli_batch"
+# The composite terminal action keeps its dedicated single-call protocol
+# (projection, canonicalization and repair are defined only for that form).
+_BATCH_FORBIDDEN_TOOLS = frozenset({"write_file_and_record_worker_result"})
 
 
 class _CompositeProjection(str):
@@ -797,6 +806,155 @@ def _tool_call_id(name: str, arguments: Mapping[str, Any], raw: str) -> str:
     return "opencli_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
 
 
+def _batch_call_id(
+    name: str, arguments: Mapping[str, Any], raw: str, index: int, turn: str = ""
+) -> str:
+    """Deterministic id of one call inside a batch; distinct from single-call ids.
+
+    ``turn`` is the web-turn identity that produced the batch, so an identical
+    response on a later turn never reuses an earlier batch's ids.
+    """
+    canonical = json.dumps(
+        {
+            "name": name,
+            "arguments": dict(arguments),
+            "raw": raw,
+            "batch_index": index,
+            "batch_turn": turn,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return "opencli_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+
+
+def _batch_calls(envelope: Mapping[str, Any], allowed: set[str]) -> list[tuple[str, dict[str, Any]]]:
+    """Validate one ``type=tool_calls`` envelope and return its ordered calls.
+
+    Each call is ``{name, arguments}`` (or the direct terminal form
+    ``{type:<recorder>, envelope}``).  A terminal recorder may only be the
+    last call; the composite terminal tool is never accepted in a batch.
+    """
+    invalid = OpenCLIWebModelError("OPENCLI_WEB_TOOL_CALL_INVALID")
+    if set(envelope) != {"type", "calls"} or envelope.get("type") != "tool_calls":
+        raise invalid
+    calls = envelope.get("calls")
+    if not isinstance(calls, list) or not 1 <= len(calls) <= _MAX_TOOL_CALLS_PER_RESPONSE:
+        raise invalid
+    parsed: list[tuple[str, dict[str, Any]]] = []
+    for index, item in enumerate(calls):
+        if not isinstance(item, Mapping):
+            raise invalid
+        direct = _direct_terminal_recorder(item)
+        if direct is not None:
+            name, args = direct
+        elif (
+            set(item) == {"name", "arguments"}
+            and isinstance(item.get("name"), str)
+            and isinstance(item.get("arguments"), Mapping)
+        ):
+            name, args = str(item["name"]), dict(item["arguments"])
+        else:
+            raise invalid
+        if name not in allowed or name in _BATCH_FORBIDDEN_TOOLS:
+            raise invalid
+        if name in _TERMINAL_RECORDER_TOOLS and (
+            index != len(calls) - 1
+            or set(args) != {"envelope"}
+            or not isinstance(args.get("envelope"), Mapping)
+        ):
+            raise invalid
+        parsed.append((name, args))
+    return parsed
+
+
+def _batch_message(
+    response: str,
+    calls: Sequence[tuple[str, dict[str, Any]]],
+    index: int,
+    turn: str = "",
+) -> AIMessage:
+    """The single-call message for ``calls[index]`` of one batch response."""
+    name, args = calls[index]
+    call_id = _batch_call_id(name, args, response, index, turn)
+    return AIMessage(
+        content="",
+        id="opencli_batch_" + call_id.removeprefix("opencli_"),
+        tool_calls=[{"name": name, "args": dict(args), "id": call_id, "type": "tool_call"}],
+        additional_kwargs={
+            _BATCH_METADATA_KEY: {
+                "response": response,
+                "index": index,
+                "count": len(calls),
+                "turn": turn,
+            }
+        },
+    )
+
+
+def _batch_metadata(message: Any) -> Mapping[str, Any] | None:
+    """Return validated batch metadata of a message, ``None`` when absent."""
+    if not isinstance(message, AIMessage):
+        return None
+    extra = message.additional_kwargs if isinstance(message.additional_kwargs, Mapping) else {}
+    meta = extra.get(_BATCH_METADATA_KEY)
+    if meta is None:
+        return None
+    index = meta.get("index") if isinstance(meta, Mapping) else None
+    count = meta.get("count") if isinstance(meta, Mapping) else None
+    if (
+        not isinstance(meta, Mapping)
+        or set(meta) != {"response", "index", "count", "turn"}
+        or not isinstance(meta.get("response"), str)
+        or not isinstance(meta.get("turn"), str)
+        or type(index) is not int
+        or type(count) is not int
+        or not 0 <= index < count <= _MAX_TOOL_CALLS_PER_RESPONSE
+        or len(message.tool_calls) != 1
+    ):
+        raise OpenCLIWebModelError("OPENCLI_WEB_BATCH_STATE_INVALID")
+    return meta
+
+
+def _rebuild_batch_message(
+    meta: Mapping[str, Any], tools: Sequence[Mapping[str, Any]], index: int
+) -> AIMessage:
+    """Re-derive one batch message from its exact source response."""
+    allowed = {name for tool in tools if (name := _tool_name(tool))}
+    try:
+        envelope = json.loads(meta["response"], object_pairs_hook=_reject_duplicate_json_keys)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise OpenCLIWebModelError("OPENCLI_WEB_BATCH_STATE_INVALID") from exc
+    if not isinstance(envelope, Mapping):
+        raise OpenCLIWebModelError("OPENCLI_WEB_BATCH_STATE_INVALID")
+    try:
+        calls = _batch_calls(envelope, allowed)
+    except OpenCLIWebModelError as exc:
+        raise OpenCLIWebModelError("OPENCLI_WEB_BATCH_STATE_INVALID") from exc
+    if len(calls) != meta["count"] or not 0 <= index < len(calls):
+        raise OpenCLIWebModelError("OPENCLI_WEB_BATCH_STATE_INVALID")
+    return _batch_message(meta["response"], calls, index, meta["turn"])
+
+
+def _same_single_call(left: AIMessage, right: AIMessage) -> bool:
+    if len(left.tool_calls) != 1 or len(right.tool_calls) != 1:
+        return False
+    a, b = left.tool_calls[0], right.tool_calls[0]
+    return (
+        str(a.get("id") or "") == str(b.get("id") or "")
+        and a.get("name") == b.get("name")
+        and dict(a.get("args") or {}) == dict(b.get("args") or {})
+    )
+
+
+def _tool_result_succeeded(result: ToolMessage) -> bool:
+    if getattr(result, "status", "success") != "success":
+        return False
+    content = result.content
+    return not (isinstance(content, str) and content.lstrip().startswith("Error"))
+
+
 _CREDENTIAL_ENV_MARKERS = ("API_KEY", "SECRET", "PASSWORD", "CREDENTIAL")
 _CREDENTIAL_ENV_PREFIXES = ("GOOGLE_", "GEMINI_", "OPENAI_", "ANTHROPIC_")
 
@@ -1130,6 +1288,15 @@ class OpenCLIWebChatModel(BaseChatModel):
             "rules": [
                 "Repository tools are executed by the external Open SWE runtime, not by ChatGPT Web.",
                 "If a non-terminal tool is needed, return one JSON object with type=tool_call, name, and arguments.",
+                "To save turns, when you already know several tool calls you need, return instead one JSON "
+                "object {type:tool_calls,calls:[{name,arguments},...]} with at most "
+                + str(_MAX_TOOL_CALLS_PER_RESPONSE)
+                + " calls (for example read_file, edit_file, then the terminal recorder). Calls run strictly "
+                "one at a time in the given order; if any call fails, the remaining calls are skipped and you "
+                "receive the results so far. A terminal recorder may only be the last call of tool_calls, in "
+                "the form {name:<recorder>,arguments:{envelope:{...}}}, and runs only after every earlier "
+                "call succeeded. write_file_and_record_worker_result is never allowed inside tool_calls; "
+                "when it is declared it stays the required terminal action and must be sent alone.",
                 "If no tool is needed, return one JSON object with type=final and content.",
                 "Do not claim that a tool ran unless a later tool message reports its result.",
             ],
@@ -1149,7 +1316,8 @@ class OpenCLIWebChatModel(BaseChatModel):
                 + ", ".join(declared_terminal)
                 + " MUST use the direct JSON form "
                 + "{type:<tool_name>,envelope:{...}}; never wrap a terminal recorder in generic tool_call. "
-                + "Use generic tool_call only for non-terminal tools.",
+                + "Use generic tool_call only for non-terminal tools. The only exception is the last "
+                + "call of a tool_calls batch.",
             )
         return json.dumps(envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -2288,6 +2456,13 @@ class OpenCLIWebChatModel(BaseChatModel):
             return isinstance(envelope.get("name"), str) and isinstance(
                 envelope.get("arguments"), Mapping
             )
+        if kind == "tool_calls":
+            calls = envelope.get("calls")
+            return (
+                isinstance(calls, list)
+                and bool(calls)
+                and all(isinstance(call, Mapping) for call in calls)
+            )
         return _direct_terminal_recorder(envelope) is not None
 
     @staticmethod
@@ -2512,7 +2687,9 @@ class OpenCLIWebChatModel(BaseChatModel):
         return response
 
     @staticmethod
-    def _response_message(response: str, tools: Sequence[Mapping[str, Any]]) -> AIMessage:
+    def _response_message(
+        response: str, tools: Sequence[Mapping[str, Any]], *, batch_turn: str = ""
+    ) -> AIMessage:
         allowed = {name for tool in tools if (name := _tool_name(tool))}
         try:
             envelope = json.loads(response, object_pairs_hook=_reject_duplicate_json_keys)
@@ -2523,6 +2700,10 @@ class OpenCLIWebChatModel(BaseChatModel):
         kind = envelope.get("type")
         if kind == "final" and isinstance(envelope.get("content"), str):
             return AIMessage(content=str(envelope["content"]))
+        if kind == "tool_calls":
+            # Only the first call is released; the rest follow one by one
+            # through ``_batch_continuation`` after each prior success.
+            return _batch_message(response, _batch_calls(envelope, allowed), 0, batch_turn)
         if kind != "tool_call":
             direct = _direct_terminal_recorder(envelope)
             if direct is None or direct[0] not in allowed:
@@ -2580,6 +2761,10 @@ class OpenCLIWebChatModel(BaseChatModel):
             message = AIMessage(content="Terminal recorder completed.")
             return ChatResult(generations=[ChatGeneration(message=message)])
 
+        continuation = self._batch_continuation(messages, normalized_tools)
+        if continuation is not None:
+            return ChatResult(generations=[ChatGeneration(message=continuation)])
+
         self._reserve_web_turn()
         # A caller that supplies its own transport implementation owns model
         # selection as well.  This keeps injected/replayed transports fully
@@ -2608,4 +2793,132 @@ class OpenCLIWebChatModel(BaseChatModel):
         if not self._is_complete_protocol_response(response):
             response = self._repair_protocol_response(response)
         message = self._response_message(response, normalized_tools)
+        if _batch_metadata(message) is not None:
+            message = self._response_message(
+                response, normalized_tools, batch_turn=self._batch_turn_identity(turn_id)
+            )
+            self._bind_batch_call(message)
         return ChatResult(generations=[ChatGeneration(message=message)])
+
+    def _batch_turn_identity(self, prompt_turn_id: str = "") -> str:
+        """Identity of the web turn that produced the current batch.
+
+        With a recovery journal it is the journaled turn and its ordinal, so a
+        restarted process derives the same batch ids; without one it is the
+        prompt turn and this instance's turn count.
+        """
+        if self._recovery_journal is not None:
+            try:
+                state = self._recovery_journal.read()
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise OpenCLIWebModelError("OPENCLI_WEB_BATCH_STATE_INVALID") from exc
+            turn_id = state.get("turn_id") if isinstance(state, Mapping) else None
+            ordinal = state.get("turn_ordinal") if isinstance(state, Mapping) else None
+            if not isinstance(turn_id, str) or not turn_id or type(ordinal) is not int:
+                raise OpenCLIWebModelError("OPENCLI_WEB_BATCH_STATE_INVALID")
+            return f"{turn_id}#{ordinal}"
+        if not prompt_turn_id:
+            raise OpenCLIWebModelError("OPENCLI_WEB_BATCH_STATE_INVALID")
+        return f"{prompt_turn_id}#{self._web_turn_count}"
+
+    def _bind_batch_call(self, message: AIMessage) -> None:
+        """Bind the effect journal to exactly this batch call before it runs."""
+        effect_journal = getattr(self._recovery_journal, "effect_journal", None)
+        if effect_journal is None:
+            return
+        turn_id = str(getattr(effect_journal, "_current_turn_id", "") or "")
+        if not turn_id:
+            raise OpenCLIWebModelError("OPENCLI_WEB_BATCH_STATE_INVALID")
+        effect_journal.bind_turn(turn_id, str(message.tool_calls[0]["id"]))
+
+    def _batch_continuation(
+        self, messages: Sequence[BaseMessage], tools: Sequence[Mapping[str, Any]]
+    ) -> AIMessage | None:
+        """Release the next call of a batch without another web turn.
+
+        Only when the immediately preceding message pair is one batch call and
+        its own successful result.  Any failed call ends the batch: the caller
+        then makes a normal web turn so the model sees the results so far.
+        """
+        if len(messages) < 2 or not isinstance(messages[-1], ToolMessage):
+            return None
+        request = messages[-2]
+        meta = _batch_metadata(request)
+        if meta is None or not isinstance(request, AIMessage):
+            return None
+        result = messages[-1]
+        if str(result.tool_call_id or "") != str(request.tool_calls[0].get("id") or ""):
+            raise OpenCLIWebModelError("OPENCLI_WEB_BATCH_STATE_INVALID")
+        if not _tool_result_succeeded(result):
+            return None
+        index = int(meta["index"])
+        if index + 1 >= int(meta["count"]):
+            return None
+        if not _same_single_call(_rebuild_batch_message(meta, tools, index), request):
+            raise OpenCLIWebModelError("OPENCLI_WEB_BATCH_STATE_INVALID")
+        following = _rebuild_batch_message(meta, tools, index + 1)
+        self._bind_batch_call(following)
+        return following
+
+    @staticmethod
+    def _batch_resume_message(
+        message: AIMessage,
+        history: Sequence[BaseMessage],
+        tools: Sequence[Mapping[str, Any]],
+    ) -> AIMessage:
+        """Map a recovered batch response to the call the checkpoint reached.
+
+        Re-applying the response must not restart the batch at its first call:
+        the furthest call of the same response already in the checkpoint is
+        returned (same id, so the graph replaces rather than appends it).
+        """
+        meta = _batch_metadata(message)
+        if meta is None:
+            return message
+        invalid = OpenCLIWebModelError("OPENCLI_WEB_BATCH_STATE_INVALID")
+        first = next(
+            (
+                position
+                for position, item in enumerate(history)
+                if (item_meta := _batch_metadata(item)) is not None
+                and item_meta["response"] == meta["response"]
+                and item_meta["turn"] == meta["turn"]
+            ),
+            None,
+        )
+        if first is None:
+            return message
+        # The checkpoint tail must be exactly AI(0), Tool(0), ..., AI(k)
+        # [, Tool(k)]: every earlier call present, in order, and successful.
+        tail = list(history[first:])
+        position = 0
+        index = 0
+        while True:
+            expected = _rebuild_batch_message(meta, tools, index)
+            request = tail[position]
+            request_meta = _batch_metadata(request)
+            if (
+                request_meta is None
+                or request_meta["response"] != meta["response"]
+                or request_meta["turn"] != meta["turn"]
+                or request_meta["index"] != index
+                or request.id != expected.id
+                or not _same_single_call(request, expected)
+            ):
+                raise invalid
+            position += 1
+            if position == len(tail):
+                return expected
+            result = tail[position]
+            if (
+                not isinstance(result, ToolMessage)
+                or str(result.tool_call_id or "") != str(expected.tool_calls[0]["id"])
+                or result.name != expected.tool_calls[0]["name"]
+            ):
+                raise invalid
+            position += 1
+            if position == len(tail):
+                return expected
+            if not _tool_result_succeeded(result):
+                raise invalid
+            index += 1
