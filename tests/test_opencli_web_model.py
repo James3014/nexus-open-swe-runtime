@@ -4716,3 +4716,41 @@ def test_opencli_invocation_journal_failure_is_not_silently_dropped(monkeypatch)
 
     with pytest.raises(ModelInvocationError, match="MODEL_INVOCATION_PERSISTENCE_FAILED"):
         model.invoke([HumanMessage(content="inspect once")])
+
+
+def test_opencli_web_model_selects_intelligence_level_once_per_model(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = _fake_process(monkeypatch, '{"type":"final","content":"done"}')
+    model = OpenCLIWebChatModel(executable="/opt/opencli", profile="", site_session="ephemeral")
+    _use_fake_clock(model)
+
+    model.invoke([HumanMessage(content="first turn")])
+    model.invoke([HumanMessage(content="second turn")])
+    model.invoke([HumanMessage(content="third turn")])
+
+    commands = [args[1:3] for args, _kwargs in calls]
+    assert commands.count(["chatgpt", "model"]) == 1
+    assert commands[0] == ["chatgpt", "model"]
+    assert commands.count(["chatgpt", "ask"]) == 3
+
+
+def test_opencli_web_model_reselects_intelligence_level_after_failed_switch(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _fake_process(monkeypatch, '{"type":"final","content":"done"}')
+    model = OpenCLIWebChatModel(executable="/opt/opencli", profile="", site_session="ephemeral")
+    _use_fake_clock(model)
+    attempts: list[int] = []
+
+    def select() -> None:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise OpenCLIWebModelError("OPENCLI_WEB_PROCESS_FAILURE")
+
+    model._select_intelligence_level = select
+    with pytest.raises(OpenCLIWebModelError):
+        model.invoke([HumanMessage(content="first turn")])
+    model.invoke([HumanMessage(content="second turn")])
+    model.invoke([HumanMessage(content="third turn")])
+    assert len(attempts) == 2
