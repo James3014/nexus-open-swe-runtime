@@ -58,9 +58,26 @@ _BUSY_MARKERS = ("busy", "rate control", "rate-control", "too many requests")
 # `chatgpt ask` raises this before typing or sending anything (ask.js checks the
 # composer right after opening the page), so the ask is safe to repeat.  Long
 # conversations sometimes render their composer after the adapter's wait.
-_PRESEND_COMPOSER_MARKER = (
-    "chatgpt ask requires a logged-in chatgpt session with a visible composer"
+# Retry only when the whole stderr is exactly that structured adapter error
+# (update notices aside) and stdout is empty, so text echoed by any other
+# failure (e.g. a prompt containing the sentence) can never qualify.
+_PRESEND_COMPOSER_STDERR = re.compile(
+    r"ok: false\nerror:\n  code: COMMAND_EXEC\n"
+    r"  message: ChatGPT ask requires a logged-in ChatGPT session with a visible composer\.\n"
+    r"(?:  exitCode: 1\n)?"
 )
+_UPDATE_NOTICE_LINE = re.compile(r"^.*(?:Update available|npm install).*$")
+
+
+def _is_presend_composer_failure(argv: Sequence[str], stdout: str, stderr: str) -> bool:
+    if list(argv)[1:3] != ["chatgpt", "ask"] or stdout.strip():
+        return False
+    lines = [
+        line
+        for line in stderr.replace("\r\n", "\n").split("\n")
+        if line.strip() and not _UPDATE_NOTICE_LINE.match(line)
+    ]
+    return _PRESEND_COMPOSER_STDERR.fullmatch("\n".join(lines) + "\n") is not None
 _PRESEND_RETRY_DELAYS_SECONDS = (20.0, 60.0)
 _MIN_WEB_SEND_INTERVAL_SECONDS = 15.0
 _POST_RESPONSE_SETTLE_SECONDS = 3.0
@@ -1224,7 +1241,7 @@ class OpenCLIWebChatModel(BaseChatModel):
                 and ("timed out" in diagnostic or "did not finish" in diagnostic)
             ) or ("timed out" in diagnostic and "may still complete" in diagnostic):
                 raise OpenCLIWebModelError("OPENCLI_WEB_TIMEOUT")
-            if _PRESEND_COMPOSER_MARKER in diagnostic and list(argv)[1:3] == ["chatgpt", "ask"]:
+            if _is_presend_composer_failure(argv, result.stdout or "", result.stderr or ""):
                 raise OpenCLIWebModelError("OPENCLI_WEB_PRESEND_COMPOSER_UNAVAILABLE")
             raise OpenCLIWebModelError("OPENCLI_WEB_PROCESS_FAILURE")
         return result.stdout or ""
