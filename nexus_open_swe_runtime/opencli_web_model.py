@@ -853,6 +853,7 @@ class OpenCLIWebChatModel(BaseChatModel):
     _invocation_identity_set: bool = PrivateAttr(default=False)
     _recorded_invocations: list[dict[str, Any]] = PrivateAttr(default_factory=list)
     _last_setup_latency_seconds: float | None = PrivateAttr(default=None)
+    _intelligence_level_selected: bool = PrivateAttr(default=False)
     _web_attempt_counts: dict[str, int] = PrivateAttr(default_factory=dict)
 
     def __init__(self, **data: Any) -> None:
@@ -2584,9 +2585,17 @@ class OpenCLIWebChatModel(BaseChatModel):
         # selection as well.  This keeps injected/replayed transports fully
         # local and avoids probing the external CLI before their send hook.
         send_impl = getattr(self._send_and_reconcile, "__func__", None)
-        if send_impl is OpenCLIWebChatModel._send_and_reconcile:
+        if (
+            send_impl is OpenCLIWebChatModel._send_and_reconcile
+            and not self._intelligence_level_selected
+        ):
+            # The switch opens its own tab (16-30 s).  The picker keeps the
+            # level only in that page, and `ask` re-applies the pinned exact
+            # model and rejects a reply from any other model, so repeating the
+            # switch on every turn adds latency without changing the model.
             setup_started = self._clock()
             self._select_intelligence_level()
+            self._intelligence_level_selected = True
             self._last_setup_latency_seconds = round(
                 self._clock() - setup_started, 6
             )
