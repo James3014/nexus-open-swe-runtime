@@ -4754,3 +4754,68 @@ def test_opencli_web_model_reselects_intelligence_level_after_failed_switch(
     model.invoke([HumanMessage(content="second turn")])
     model.invoke([HumanMessage(content="third turn")])
     assert len(attempts) == 2
+
+
+def _composer_flaky_process(monkeypatch: pytest.MonkeyPatch, failures: int, stderr: str):
+    calls = _fake_process(monkeypatch, '{"type":"final","content":"done"}')
+    from nexus_open_swe_runtime import opencli_web_model as web_model
+
+    succeed = web_model.subprocess.run
+    remaining = [failures]
+
+    def flaky(argv, **kwargs):
+        if list(argv)[1:3] == ["chatgpt", "ask"] and remaining[0] > 0:
+            remaining[0] -= 1
+            calls.append((list(argv), dict(kwargs)))
+            return SimpleNamespace(returncode=1, stdout="", stderr=stderr)
+        return succeed(argv, **kwargs)
+
+    monkeypatch.setattr("nexus_open_swe_runtime.opencli_web_model.subprocess.run", flaky)
+    return calls
+
+
+_COMPOSER_STDERR = (
+    "ok: false\nerror:\n  code: COMMAND_EXEC\n  message: ChatGPT ask requires a logged-in "
+    "ChatGPT session with a visible composer.\n"
+)
+
+
+def test_opencli_web_model_repeats_ask_after_presend_composer_failure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = _composer_flaky_process(monkeypatch, 1, _COMPOSER_STDERR)
+    model = OpenCLIWebChatModel(executable="/opt/opencli", profile="", site_session="ephemeral")
+    clock = _use_fake_clock(model)
+
+    result = model.invoke([HumanMessage(content="turn")])
+
+    assert result.content == "done"
+    asks = [args for args, _kwargs in calls if args[1:3] == ["chatgpt", "ask"]]
+    assert len(asks) == 2 and asks[0] == asks[1]
+    assert 20.0 in clock.sleeps
+
+
+def test_opencli_web_model_presend_composer_retries_are_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = _composer_flaky_process(monkeypatch, 5, _COMPOSER_STDERR)
+    model = OpenCLIWebChatModel(executable="/opt/opencli", profile="", site_session="ephemeral")
+    _use_fake_clock(model)
+
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_PROCESS_FAILURE"):
+        model.invoke([HumanMessage(content="turn")])
+    asks = [args for args, _kwargs in calls if args[1:3] == ["chatgpt", "ask"]]
+    assert len(asks) == 3
+
+
+def test_opencli_web_model_does_not_repeat_ask_after_other_failures(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = _composer_flaky_process(monkeypatch, 1, "error: navigation failed after send\n")
+    model = OpenCLIWebChatModel(executable="/opt/opencli", profile="", site_session="ephemeral")
+    _use_fake_clock(model)
+
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_PROCESS_FAILURE"):
+        model.invoke([HumanMessage(content="turn")])
+    asks = [args for args, _kwargs in calls if args[1:3] == ["chatgpt", "ask"]]
+    assert len(asks) == 1

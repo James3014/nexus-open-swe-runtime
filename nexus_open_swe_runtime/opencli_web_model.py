@@ -55,6 +55,13 @@ _HARD_BLOCK_MARKERS = (
     "quota",
 )
 _BUSY_MARKERS = ("busy", "rate control", "rate-control", "too many requests")
+# `chatgpt ask` raises this before typing or sending anything (ask.js checks the
+# composer right after opening the page), so the ask is safe to repeat.  Long
+# conversations sometimes render their composer after the adapter's wait.
+_PRESEND_COMPOSER_MARKER = (
+    "chatgpt ask requires a logged-in chatgpt session with a visible composer"
+)
+_PRESEND_RETRY_DELAYS_SECONDS = (20.0, 60.0)
 _MIN_WEB_SEND_INTERVAL_SECONDS = 15.0
 _POST_RESPONSE_SETTLE_SECONDS = 3.0
 _LATE_READBACK_WINDOW_SECONDS = 15.0
@@ -1217,8 +1224,23 @@ class OpenCLIWebChatModel(BaseChatModel):
                 and ("timed out" in diagnostic or "did not finish" in diagnostic)
             ) or ("timed out" in diagnostic and "may still complete" in diagnostic):
                 raise OpenCLIWebModelError("OPENCLI_WEB_TIMEOUT")
+            if _PRESEND_COMPOSER_MARKER in diagnostic and list(argv)[1:3] == ["chatgpt", "ask"]:
+                raise OpenCLIWebModelError("OPENCLI_WEB_PRESEND_COMPOSER_UNAVAILABLE")
             raise OpenCLIWebModelError("OPENCLI_WEB_PROCESS_FAILURE")
         return result.stdout or ""
+
+    def _run_ask(self, argv: Sequence[str]) -> str:
+        """Run `chatgpt ask`, repeating it only after a pre-send composer failure."""
+        for delay in (*_PRESEND_RETRY_DELAYS_SECONDS, None):
+            try:
+                return self._run(argv)
+            except OpenCLIWebModelError as exc:
+                if str(exc) != "OPENCLI_WEB_PRESEND_COMPOSER_UNAVAILABLE":
+                    raise
+                if delay is None:
+                    raise OpenCLIWebModelError("OPENCLI_WEB_PROCESS_FAILURE") from exc
+                self._sleep(delay)
+        raise AssertionError("unreachable")
 
     def _cooldown_and_probe_status(self) -> None:
         self._sleep(60.0)
@@ -2063,7 +2085,7 @@ class OpenCLIWebChatModel(BaseChatModel):
         if attempt is not None:
             attempt["active_started_monotonic"] = self._clock()
         try:
-            stdout = self._run(argv)
+            stdout = self._run_ask(argv)
         except OpenCLIWebModelError as exc:
             if attempt is not None:
                 attempt["active_latency_seconds"] = self._attempt_active_latency(attempt)
