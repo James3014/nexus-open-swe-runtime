@@ -2589,10 +2589,12 @@ class OpenCLIWebChatModel(BaseChatModel):
             send_impl is OpenCLIWebChatModel._send_and_reconcile
             and not self._intelligence_level_selected
         ):
-            # The switch opens its own tab (16-30 s).  The picker keeps the
-            # level only in that page, and `ask` re-applies the pinned exact
-            # model and rejects a reply from any other model, so repeating the
-            # switch on every turn adds latency without changing the model.
+            # The switch opens its own tab (16-30 s).  With the exact-model pin
+            # (OPENCLI_CHATGPT_EXACT_MODEL, set by the EIA wrapper) the picker
+            # keeps the level only in that page, and `ask` re-applies the pin
+            # and rejects a reply from any other model.  Without the pin the
+            # switch updates the account's last-used model, which later turns
+            # keep.  Either way one switch per model instance is enough.
             setup_started = self._clock()
             self._select_intelligence_level()
             self._intelligence_level_selected = True
