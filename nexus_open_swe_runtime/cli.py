@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
@@ -197,13 +198,26 @@ def _git_control_path(relative: str) -> bool:
 
 def _protected_mutation_paths(values: Any) -> tuple[str, ...]:
     """Normalize Task Card / authority / forbidden refs for the overlap gate."""
+    # Fail closed: an entry that cannot be normalised (``../x``, backslash, empty)
+    # raises instead of silently shrinking the protected set.  Entries are NFC so
+    # ``café`` in either Unicode form matches (see ``_mutation_target_violation``).
+    # Glob-shaped entries (``*``, ``?``, ``[``) are not supported and are rejected
+    # rather than silently matched literally.
     protected: list[str] = []
     for value in values:
-        try:
-            protected.append(_safe_relative_path(str(value)).lower())
-        except RuntimeErrorBounded:
-            continue
+        if not isinstance(value, str) or any(char in value for char in "*?["):
+            raise RuntimeErrorBounded("OPEN_SWE_PATH_INVALID")
+        protected.append(unicodedata.normalize("NFC", _safe_relative_path(value)).lower())
     return tuple(protected)
+
+
+def _stored_protected_paths(value: Any) -> tuple[str, ...]:
+    """Normalise the protected list persisted on a session; invalid content fails closed."""
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise RuntimeErrorBounded("OPEN_SWE_PATH_INVALID")
+    return _protected_mutation_paths(value)
 
 
 def _protected_paths_from_envelope(envelope: Any) -> tuple[str, ...]:
@@ -217,7 +231,9 @@ def _protected_paths_from_envelope(envelope: Any) -> tuple[str, ...]:
         values.append(binding["task_card_ref"])
     if isinstance(scope, Mapping):
         for key in ("read_only_authorities", "forbidden_paths"):
-            if _string_list(scope.get(key)):
+            if key in scope and scope[key] is not None:
+                if not _string_list(scope[key]):
+                    raise RuntimeErrorBounded("OPEN_SWE_PATH_INVALID")
                 values.extend(scope[key])
     return _protected_mutation_paths(values)
 
@@ -245,10 +261,10 @@ def _mutation_target_violation(
         return "path_git_metadata"
     if _git_control_path(relative):
         return "path_git_control"
-    lowered = relative.lower()
+    lowered = unicodedata.normalize("NFC", relative).lower()
     if any(
         _path_matches(lowered, boundary) or _path_matches(boundary, lowered)
-        for boundary in protected
+        for boundary in (unicodedata.normalize("NFC", entry).lower() for entry in protected)
     ):
         return "path_authority"
     if _workspace_path_has_symlink(workspace, relative):
@@ -474,6 +490,19 @@ def _edit_mismatch_hint(content: str, old_string: str) -> str:
     )
 
 
+def _is_run_created_file(target: Path, created: Mapping[str, frozenset[str]]) -> bool:
+    """True when ``target`` is a regular file whose bytes the run itself journaled."""
+    hashes = created.get(unicodedata.normalize("NFC", os.path.realpath(target)))
+    if not hashes:
+        return False
+    try:
+        if target.is_symlink() or not target.is_file():
+            return False
+        return _sha256(target.read_bytes()) in hashes
+    except OSError:
+        return False
+
+
 class ScopedRepairBackend:
     def __init__(
         self,
@@ -499,8 +528,19 @@ class ScopedRepairBackend:
             ).removeprefix("git-commit:")
             self._base_commit = base or None
         self._protected = tuple(getattr(identity, "mutation_protected_paths", ()) or ())
+        # A file this run created earlier is not "initially present" even if the
+        # backend is rebuilt while it still exists -- but only while its bytes are
+        # still exactly what the run's verified RESULT record says it wrote.
+        created = effect_journal.run_created_files() if effect_journal is not None else {}
+        created = {
+            unicodedata.normalize("NFC", os.path.realpath(path)): hashes
+            for path, hashes in created.items()
+        }
         self._initially_present = frozenset(
-            path for path in self._allowed if os.path.lexists(self._root / path)
+            path
+            for path in self._allowed
+            if os.path.lexists(self._root / path)
+            and not _is_run_created_file(self._root / path, created)
         )
 
     def _effect(self, tool_name: str, file_path: str, content: str, old: str | None) -> Any:
@@ -1470,6 +1510,7 @@ def _semantic_reject(reason: str) -> SemanticAdmission:
 
 # fmt: off
 _SEMANTIC_REJECTION_CODES = frozenset({
+    "protected_path_invalid",
     "artifact_parse", "schema", "workspace_symlink", "envelope_keys", "envelope_hash",
     "binding_shape", "binding_keys", "scope_worker_keys", "evidence_shape", "binding_types",
     "context_digest", "task_card_digest", "main_sha", "diagnosis_types", "scope_list_types",
@@ -1489,6 +1530,7 @@ _SEMANTIC_REJECTION_CODES = frozenset({
     "core_binding_freshness",
 })
 _BOUND_CONTINUATION_REJECTION_CODES = frozenset({
+    "protected_paths_invalid",
     "session_core_binding", "core_binding_absent", "core_binding_hash", "artifact_read",
     "artifact_hash", "artifact_parse", "artifact_schema", "artifact_session", "artifact_scope",
     "artifact_parent", "workspace_symlink", "workspace_read", "origin", "workspace_head",
@@ -2667,7 +2709,10 @@ def _semantic_v2_admission(
         # Path gates are shared with the backend and continuation; the card that
         # authorizes the write, read-only authorities and forbidden paths are
         # protected (a card could otherwise rewrite itself).
-        protected = _protected_paths_from_envelope(envelope)
+        try:
+            protected = _protected_paths_from_envelope(envelope)
+        except RuntimeErrorBounded:
+            return _semantic_reject("protected_path_invalid")
         for path in allowed_paths:
             violation = _mutation_target_violation(
                 workspace, path, base_commit=expected_base, protected=protected
@@ -3350,13 +3395,16 @@ def _bound_continuation_admission(
         or any(_workspace_path_has_symlink(workspace, path) for path in allowed_paths)
     ):
         raise _bound_continuation_reject("workspace_symlink")
-    stored_protected = protected_paths if _string_list(protected_paths) else []
+    try:
+        stored_protected = _stored_protected_paths(protected_paths)
+    except RuntimeErrorBounded as exc:
+        raise _bound_continuation_reject("protected_paths_invalid") from exc
     for path in allowed_paths:
         violation = _mutation_target_violation(
             workspace,
             path,
             base_commit=parent,
-            protected=_protected_mutation_paths(stored_protected),
+            protected=stored_protected,
         )
         if violation is not None:
             raise _bound_continuation_reject(violation)
@@ -3584,7 +3632,7 @@ def _worker_run(
                 allowed_paths=allowed_paths,
                 core_identity=session_core_identity,
                 valid_until=session_context.get("core_valid_until"),
-                protected_paths=session_context.get("core_protected_paths") or [],
+                protected_paths=session_context.get("core_protected_paths"),
             )
             _bind_session_core_identity(
                 request, session_id, session_core_identity, allow_initial_bind=False
@@ -3620,11 +3668,19 @@ def _worker_run(
             )
         if session_core_identity is not None:
             stored = session_context.get("core_protected_paths")
-            mutation_protected_paths = _protected_mutation_paths(
-                stored if _string_list(stored) else []
-            )
+            try:
+                mutation_protected_paths = _stored_protected_paths(stored)
+            except RuntimeErrorBounded as exc:
+                raise _bound_continuation_reject("protected_paths_invalid") from exc
         else:
-            mutation_protected_paths = _protected_paths_from_envelope(packet)
+            try:
+                mutation_protected_paths = _protected_paths_from_envelope(packet)
+            except RuntimeErrorBounded as exc:
+                # FALLBACK / v1 packets skip PROVEN admission; an invalid or
+                # glob-shaped protected entry is a bounded pre-dispatch rejection.
+                raise RuntimeErrorBounded(
+                    "OPEN_SWE_SEMANTIC_V2_REJECTED_PROTECTED_PATH_INVALID"
+                ) from exc
         hint_binding = _worker_hint_binding(request, tool_projection, core_identity)
         hint_observer = HintExecutionObserver(hint_binding, workspace)
         started["hint_execution_receipt"] = hint_observer.receipt()
