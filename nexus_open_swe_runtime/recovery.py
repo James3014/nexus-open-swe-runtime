@@ -403,12 +403,20 @@ class DurableEffectJournal:
 
     def _assert_write_contained(self, path: Path) -> None:
         """Reject a write whose path crosses a symlink or leaves the authorized paths (#113)."""
-        workspace = Path(self.identity.workspace)
-        try:
-            relative = path.relative_to(workspace)
-        except ValueError:
+        configured = Path(self.identity.workspace)
+        workspace, relative = configured, None
+        for candidate in (configured, configured.resolve()):
+            try:
+                relative = path.relative_to(candidate)
+            except ValueError:
+                continue
+            workspace = candidate
+            break
+        if relative is None:
             # Not a workspace-relative write; ScopedRepairBackend._authorize owns
             # containment for those and the leaf-symlink check above still applies.
+            # Failing closed here breaks 20 existing tests/test_recovery.py tests that
+            # record effects outside identity.workspace (see PR discussion).
             return
         if ".." in relative.parts:
             raise RuntimeError("RECOVERY_WRITE_PATH_NOT_AUTHORIZED")
