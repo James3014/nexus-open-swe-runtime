@@ -28,6 +28,9 @@ from test_bound_edit_existing import (
 from nexus_open_swe_runtime import cli
 from nexus_open_swe_runtime.recovery import DurableEffectJournal
 
+CAFE_NFC = unicodedata.normalize("NFC", "docs/caf\u00e9.md")
+CAFE_NFD = unicodedata.normalize("NFD", "docs/caf\u00e9.md")
+
 # --- item 1: protected paths reach the identity and the session -------------------
 
 
@@ -160,10 +163,18 @@ def _identity_for(workspace: Path, base: str):
 # --- item 4: protected path normalisation fails closed ----------------------------
 
 
-@pytest.mark.parametrize("bad", ["../x", "a/../../x", "a\\b", "", "   ", "a\x00b"])
+@pytest.mark.parametrize(
+    "bad", ["../x", "a/../../x", "a\\b", "", "   ", "a\x00b", "sec/**", "a?b", "x[1]", None, 7]
+)
 def test_invalid_protected_entry_fails_closed(bad):
     with pytest.raises(cli.RuntimeErrorBounded, match="OPEN_SWE_PATH_INVALID"):
         cli._protected_mutation_paths(["tasks/card.md", bad])
+
+
+def test_protected_entries_are_normalised_to_nfc():
+    out = cli._protected_mutation_paths([CAFE_NFD, CAFE_NFC])
+    assert out == (CAFE_NFC.lower(),) * 2
+    assert all(unicodedata.is_normalized("NFC", entry) for entry in out)
 
 
 def test_valid_protected_entries_are_still_normalised():
@@ -209,3 +220,120 @@ def test_protected_path_blocks_the_other_unicode_normal_form(tmp_path, protected
         protected=cli._protected_mutation_paths([protected]),
     )
     assert violation == "path_authority"
+
+
+def test_admission_rejects_a_glob_shaped_forbidden_path(tmp_path):
+    request = _bound_request(
+        tmp_path,
+        base_files={"pkg/core.py": "VALUE = 1\n"},
+        test_paths=[],
+        production_paths=["pkg/core.py"],
+    )
+    envelope = json.loads(Path(request["artifact_path"]).read_text(encoding="utf-8"))
+    envelope["scope_signal"]["forbidden_paths"] = ["sec/**"]
+    raw = cli._canonical_json(envelope)
+    Path(request["artifact_path"]).write_text(raw, encoding="utf-8")
+    request["prompt"] = "\n".join(
+        f"envelope_sha256={cli._sha256(raw)}" if line.startswith("envelope_sha256=") else line
+        for line in request["prompt"].splitlines()
+    )
+    admission = _admission(request)
+    assert (admission.decision, admission.reason_code) == (cli.REJECT, "protected_path_invalid")
+
+
+def test_non_string_scope_entry_is_not_silently_dropped():
+    envelope = {"scope_signal": {"forbidden_paths": ["tasks/task-card.md", None]}}
+    with pytest.raises(cli.RuntimeErrorBounded, match="OPEN_SWE_PATH_INVALID"):
+        cli._protected_paths_from_envelope(envelope)
+
+
+@pytest.mark.parametrize("stored", [["tasks/task-card.md", None], "tasks/task-card.md", ["sec/**"]])
+def test_invalid_stored_session_protected_paths_reject_the_continuation(tmp_path, stored):
+    initial = _bound_initial_request(tmp_path)
+    result = cli._worker_run(initial, **_factories(_Calls(), "VALUE = 1\n"))
+    assert result["status"] == "COMPLETED", result
+    parent = _capture_candidate(Path(initial["workspace_path"]))
+    session_id = result["session_id"]
+    session_path = cli._session_path(initial, session_id)
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    session["core_protected_paths"] = stored
+    session_path.write_text(json.dumps(session), encoding="utf-8")
+    request = _continue_request(tmp_path, initial, session_id, parent)
+    outcome, calls = _run_continue(request)
+    assert outcome["error_code"] == (
+        "OPEN_SWE_BOUND_CONTINUATION_REJECTED_PROTECTED_PATHS_INVALID"
+    )
+    assert calls.as_tuple() == (0, 0, 0)
+
+
+# --- run-created exemption is bound to the file the run actually wrote ------------
+
+
+def _journal_backend(tmp_path: Path):
+    request = _bound_request(
+        tmp_path,
+        base_files={"seed.py": "SEED = 1\n"},
+        test_paths=[],
+        production_paths=[NEW],
+        refs=[f"task_card:{CARD_REF}@" + "a" * 16, f"source_absence:{NEW}@" + "b" * 16],
+    )
+    workspace = Path(request["workspace_path"]).resolve()
+    (workspace / "pkg").mkdir()
+    base = _git(workspace, "rev-parse", "HEAD")
+    journal = DurableEffectJournal(tmp_path / "state3", _identity_for(workspace, base))
+    journal.bind_turn("turn-1", "call-1")
+    return workspace, journal
+
+
+def _rebuilt_edit_outcome(workspace: Path, journal: DurableEffectJournal, old: str) -> str:
+    backend = cli.ScopedRepairBackend(_Delegate(), workspace, (NEW,), journal)
+    try:
+        backend.edit(NEW, old, "CHANGED = 1")
+    except PermissionError as exc:
+        return str(exc)
+    return "EDITED"
+
+
+def test_intent_only_record_gives_no_exemption_for_a_file_someone_else_created(tmp_path):
+    workspace, journal = _journal_backend(tmp_path)
+    journal.intent(
+        turn_id="turn-1",
+        tool_call_id="call-1",
+        tool_name="write_file",
+        arguments={"file_path": NEW, "content": "VALUE = 1\n"},
+        path=workspace / NEW,
+        preimage=None,
+        postimage="VALUE = 1\n",
+    )
+    (workspace / NEW).write_text("VALUE = 1\n", encoding="utf-8")  # another process
+    assert _rebuilt_edit_outcome(workspace, journal, "VALUE = 1") == (
+        "OPEN_SWE_MUTATION_PATH_FORBIDDEN"
+    )
+
+
+def test_run_created_file_replaced_by_other_content_is_no_longer_exempt(tmp_path):
+    workspace, journal = _journal_backend(tmp_path)
+    backend = cli.ScopedRepairBackend(_Delegate(), workspace, (NEW,), journal)
+    backend.write(NEW, "VALUE = 1\n")
+    assert _rebuilt_edit_outcome(workspace, journal, "VALUE = 1") == "EDITED"
+    (workspace / NEW).write_text("SWAPPED = 1\n", encoding="utf-8")
+    assert _rebuilt_edit_outcome(workspace, journal, "SWAPPED = 1") == (
+        "OPEN_SWE_MUTATION_PATH_FORBIDDEN"
+    )
+
+
+def test_forged_effect_record_with_missing_fields_gives_no_exemption(tmp_path):
+    workspace, journal = _journal_backend(tmp_path)
+    (workspace / NEW).write_text("VALUE = 1\n", encoding="utf-8")
+    effect_id = "effect_" + "f" * 64
+    forged = {
+        "status": "RESULT",
+        "effect_id": effect_id,
+        "operation_id": journal.identity.operation_id,
+        "path": str(workspace / NEW),
+        "preimage_sha256": "absent",
+    }
+    (journal.root / f"{effect_id}.json").write_text(json.dumps(forged), encoding="utf-8")
+    assert _rebuilt_edit_outcome(workspace, journal, "VALUE = 1") == (
+        "OPEN_SWE_MUTATION_PATH_FORBIDDEN"
+    )

@@ -378,31 +378,28 @@ class DurableEffectJournal:
             raise RuntimeError("RECOVERY_STATE_SYMLINK")
         return json.loads(path.read_text(encoding="utf-8"))
 
-    def created_paths(self) -> frozenset[str]:
-        """Paths this exact operation journaled as created (preimage absent).
+    def run_created_files(self) -> dict[str, frozenset[str]]:
+        """Files this exact operation created, as ``path -> postimage sha256 values``.
 
-        Covers INTENT as well as RESULT records, so a file created by this run
-        stays "created by this run" when the backend is rebuilt after a crash
-        between the write and its RESULT record.
+        Built only from verified RESULT records of this operation (the same
+        validation as ``result_effects``).  A path qualifies when one of its RESULT
+        records has an absent preimage; the hashes are every RESULT postimage the
+        operation journaled for it, so a later edit by the run keeps the latest
+        content valid while a file replaced by anyone else does not match.  INTENT-only
+        records and records missing required fields give no entry (fail closed).
         """
-        created: set[str] = set()
-        if not self.root.exists():
-            return frozenset()
-        for path in sorted(self.root.glob("effect_*.json")):
-            if path.is_symlink() or not path.is_file():
-                raise RuntimeError("RECOVERY_STATE_SYMLINK")
-            try:
-                value = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise RuntimeError("RECOVERY_RECORD_CORRUPT") from exc
-            if (
-                isinstance(value, dict)
-                and value.get("operation_id") == self.identity.operation_id
-                and value.get("preimage_sha256") == "absent"
-                and isinstance(value.get("path"), str)
-            ):
-                created.add(value["path"])
-        return frozenset(created)
+        records = [
+            record
+            for record in self.result_effects()
+            if isinstance(record.get("path"), str)
+            and isinstance(record.get("preimage_sha256"), str)
+            and isinstance(record.get("postimage_sha256"), str)
+        ]
+        created = {r["path"] for r in records if r["preimage_sha256"] == "absent"}
+        return {
+            path: frozenset(r["postimage_sha256"] for r in records if r["path"] == path)
+            for path in created
+        }
 
     def result_effects(self) -> list[dict[str, Any]]:
         """Return verified durable write RESULT records for this exact operation."""
