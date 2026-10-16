@@ -172,3 +172,109 @@ def test_worker_reconcile_enforces_write_path_ceiling_before_any_write(
     assert (workspace / "b.py").read_text(encoding="utf-8") == "SECRET_GATE = True\n"
     assert not list((state_root / "recovery" / "effects").glob("*.json"))
     json.dumps(result)
+
+
+def _git_workspace(request: dict, origin: str) -> None:
+    import subprocess
+
+    workspace = request["workspace_path"]
+    for args in (
+        ["init", "-q"],
+        ["remote", "add", "origin", origin],
+    ):
+        subprocess.run(["git", "-C", workspace, *args], check=True)
+
+
+def test_worker_run_rejects_authorization_repository_differing_from_git_origin(
+    tmp_path: Path,
+) -> None:
+    request = _project_worker_request(_worker_request(tmp_path), TOOLS)
+    _git_workspace(request, "https://github.com/James3014/other-repo.git")
+    result, repair = _run_write(request, "a.py")
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN" or result["status"].startswith("OPEN_SWE")
+    assert result["status"] != "COMPLETED"
+    assert result["error_code"] == "OPEN_SWE_EFFECT_AUTHORIZATION_BINDING_MISMATCH"
+    assert repair.calls == 0
+    assert (Path(request["workspace_path"]) / "a.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
+def test_worker_run_accepts_authorization_repository_matching_git_origin(tmp_path: Path) -> None:
+    request = _project_worker_request(_worker_request(tmp_path), TOOLS)
+    _git_workspace(request, "git@github.com:James3014/nexus-open-swe-runtime.git")
+    result, repair = _run_write(request, "a.py")
+    assert result["status"] == "COMPLETED"
+    assert repair.calls == 1
+
+
+@pytest.mark.parametrize(("origin", "resumed"), [("https://github.com/James3014/other-repo.git", False), ("https://github.com/James3014/nexus-open-swe-runtime", True)])
+def test_worker_reconcile_enforces_git_origin_binding(
+    tmp_path: Path, origin: str, resumed: bool
+) -> None:
+    """A recovery identity whose allowed_paths exceed the authorized ceiling is never resumed."""
+    request = _project_worker_request(_worker_request(tmp_path), TOOLS)
+    request.update(operation="worker_reconcile", provider_id="google_genai", model_id="test-model")
+    workspace = Path(request["workspace_path"])
+    _git_workspace(request, origin)
+    (workspace / "b.py").write_text("SECRET_GATE = True\n", encoding="utf-8")
+    state_root = Path(request["runtime_state_root"])
+    identity = RecoveryIdentity(
+        operation_id=request["operation_id"],
+        execution_material_sha256="b" * 64,
+        workspace=str(workspace.resolve()),
+        task_id="task-1",
+        unit_id="u1",
+        session_id="session-1",
+        allowed_paths=("a.py",),
+        provider_id="google_genai",
+        model_id="test-model",
+        worker_identity_sha256=request["worker_identity_sha256"],
+        transport_config_sha256=cli._sha256("{}"),
+        runtime_identity_sha256=cli._sha256(
+            cli._canonical_json({
+                **cli._runtime_code_identity(),
+                "deepagents": cli._deepagents_version(),
+                "checkpoint_namespace": "open-swe-repair-v1",
+            })
+        ),
+        effect_authorization_hash=request["effect_authorization"]["authorization_hash"],
+        tool_projection_hash=request["tool_projection_manifest"]["projection_hash"],
+        tool_projection_backend_id="nexus-open-swe-runtime",
+        projected_tools=TOOLS,
+    )
+    journal = DurableOperationJournal(state_root, identity)
+    journal.prepare()
+    journal.ask_dispatching(turn_id="turn-1", prompt="repair", ordinal=0)
+    journal.conversation_bound("conversation-1")
+    cli._atomic_json(
+        cli._operation_path(request),
+        {
+            **cli._write_started(request, "worker"),
+            "status": "OPEN_SWE_OUTCOME_UNKNOWN",
+            "outcome_unknown": True,
+            "retry_safe": False,
+            "execution_material_sha256": identity.execution_material_sha256,
+            "session_id": identity.session_id,
+        },
+    )
+    checkpoint, _ = cli.create_checkpoint(
+        state_root, request["operation_id"], identity.checkpoint_namespace
+    )
+    checkpoint.conn.close()
+
+    built: list[object] = []
+
+    def model_builder(*args: object) -> object:
+        built.append(args)
+        raise RuntimeError("stop after resume was attempted")
+
+    result = cli._worker_reconcile(
+        request,
+        runtime_loader=cli._load_runtime,
+        model_builder=model_builder,
+        graph_builder=lambda *_a, **_k: object(),
+    )
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert bool(built) is resumed
+    assert (workspace / "b.py").read_text(encoding="utf-8") == "SECRET_GATE = True\n"
+    assert not list((state_root / "recovery" / "effects").glob("*.json"))
+    json.dumps(result)

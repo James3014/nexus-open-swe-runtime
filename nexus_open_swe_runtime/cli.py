@@ -1081,6 +1081,25 @@ def _worker_tool_projection(request: Mapping[str, Any]) -> ValidatedToolProjecti
         raise RuntimeErrorBounded(str(exc)) from exc
 
 
+def _assert_authorization_origin(request: Mapping[str, Any], workspace: Path) -> None:
+    """Non-Core-bound runs: a determinable git origin must equal the authorized repository.
+
+    A workspace without a determinable origin (plain non-git directory) keeps the
+    previous behaviour; that is a documented residual.
+    """
+    authorization = request.get("effect_authorization")
+    if not isinstance(authorization, Mapping):
+        return
+    try:
+        origin = _canonical_origin_repository(_git_output(workspace, "remote", "get-url", "origin"))
+    except RuntimeErrorBounded:
+        return
+    if not origin:
+        return
+    if origin != _canonical_binding_repository(str(authorization.get("repository") or "")):
+        raise RuntimeErrorBounded("OPEN_SWE_EFFECT_AUTHORIZATION_BINDING_MISMATCH")
+
+
 def _assert_authorization_binding(
     request: Mapping[str, Any], core_identity: Mapping[str, Any] | None = None
 ) -> None:
@@ -3718,6 +3737,8 @@ def _worker_run(
                     "OPEN_SWE_SEMANTIC_V2_REJECTED_PROTECTED_PATH_INVALID"
                 ) from exc
         _assert_authorization_binding(request, core_identity)
+        if tool_projection is not None and not core_identity:
+            _assert_authorization_origin(request, workspace)
         hint_binding = _worker_hint_binding(request, tool_projection, core_identity)
         hint_observer = HintExecutionObserver(hint_binding, workspace)
         started["hint_execution_receipt"] = hint_observer.receipt()
@@ -4187,6 +4208,8 @@ def _worker_reconcile(
                 _assert_authorization_binding(
                     request, {"core_repository": identity.core_repository}
                 )
+                if not identity.core_binding_hash:
+                    _assert_authorization_origin(request, Path(identity.workspace))
             except RuntimeErrorBounded:
                 return cached
         if identity.core_binding_hash:
