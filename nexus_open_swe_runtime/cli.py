@@ -1091,11 +1091,13 @@ def _assert_authorization_origin(request: Mapping[str, Any], workspace: Path) ->
     if not isinstance(authorization, Mapping):
         return
     try:
-        origin = _canonical_origin_repository(_git_output(workspace, "remote", "get-url", "origin"))
+        raw_origin = _git_output(workspace, "remote", "get-url", "origin")
     except RuntimeErrorBounded:
         return
-    if not origin:
+    if not raw_origin:
         return
+    # An origin that exists but is not a recognised GitHub form cannot match.
+    origin = _canonical_origin_repository(raw_origin)
     if origin != _canonical_binding_repository(str(authorization.get("repository") or "")):
         raise RuntimeErrorBounded("OPEN_SWE_EFFECT_AUTHORIZATION_BINDING_MISMATCH")
 

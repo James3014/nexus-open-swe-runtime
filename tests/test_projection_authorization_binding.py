@@ -278,3 +278,11 @@ def test_worker_reconcile_enforces_git_origin_binding(
     assert (workspace / "b.py").read_text(encoding="utf-8") == "SECRET_GATE = True\n"
     assert not list((state_root / "recovery" / "effects").glob("*.json"))
     json.dumps(result)
+
+
+def test_worker_run_rejects_unrecognised_git_origin_form(tmp_path: Path) -> None:
+    request = _project_worker_request(_worker_request(tmp_path), TOOLS)
+    _git_workspace(request, "ssh://git@github.com:22/James3014/other-repo.git")
+    result, repair = _run_write(request, "a.py")
+    assert result["error_code"] == "OPEN_SWE_EFFECT_AUTHORIZATION_BINDING_MISMATCH"
+    assert repair.calls == 0
