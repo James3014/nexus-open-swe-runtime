@@ -492,7 +492,7 @@ def _edit_mismatch_hint(content: str, old_string: str) -> str:
 
 def _is_run_created_file(target: Path, created: Mapping[str, frozenset[str]]) -> bool:
     """True when ``target`` is a regular file whose bytes the run itself journaled."""
-    hashes = created.get(os.path.realpath(target))
+    hashes = created.get(unicodedata.normalize("NFC", os.path.realpath(target)))
     if not hashes:
         return False
     try:
@@ -532,7 +532,10 @@ class ScopedRepairBackend:
         # backend is rebuilt while it still exists -- but only while its bytes are
         # still exactly what the run's verified RESULT record says it wrote.
         created = effect_journal.run_created_files() if effect_journal is not None else {}
-        created = {os.path.realpath(path): hashes for path, hashes in created.items()}
+        created = {
+            unicodedata.normalize("NFC", os.path.realpath(path)): hashes
+            for path, hashes in created.items()
+        }
         self._initially_present = frozenset(
             path
             for path in self._allowed
@@ -3629,7 +3632,7 @@ def _worker_run(
                 allowed_paths=allowed_paths,
                 core_identity=session_core_identity,
                 valid_until=session_context.get("core_valid_until"),
-                protected_paths=session_context.get("core_protected_paths") or [],
+                protected_paths=session_context.get("core_protected_paths"),
             )
             _bind_session_core_identity(
                 request, session_id, session_core_identity, allow_initial_bind=False
@@ -3670,7 +3673,14 @@ def _worker_run(
             except RuntimeErrorBounded as exc:
                 raise _bound_continuation_reject("protected_paths_invalid") from exc
         else:
-            mutation_protected_paths = _protected_paths_from_envelope(packet)
+            try:
+                mutation_protected_paths = _protected_paths_from_envelope(packet)
+            except RuntimeErrorBounded as exc:
+                # FALLBACK / v1 packets skip PROVEN admission; an invalid or
+                # glob-shaped protected entry is a bounded pre-dispatch rejection.
+                raise RuntimeErrorBounded(
+                    "OPEN_SWE_SEMANTIC_V2_REJECTED_PROTECTED_PATH_INVALID"
+                ) from exc
         hint_binding = _worker_hint_binding(request, tool_projection, core_identity)
         hint_observer = HintExecutionObserver(hint_binding, workspace)
         started["hint_execution_receipt"] = hint_observer.receipt()

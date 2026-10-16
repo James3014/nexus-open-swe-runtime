@@ -337,3 +337,70 @@ def test_forged_effect_record_with_missing_fields_gives_no_exemption(tmp_path):
     assert _rebuilt_edit_outcome(workspace, journal, "VALUE = 1") == (
         "OPEN_SWE_MUTATION_PATH_FORBIDDEN"
     )
+
+
+# --- round 3 -----------------------------------------------------------------------
+
+
+def test_fallback_envelope_with_glob_forbidden_path_is_a_bounded_rejection(tmp_path):
+    initial = _bound_initial_request(tmp_path)
+    envelope = {
+        "schema": "external_execution_envelope.v1",
+        "scope_signal": {"forbidden_paths": ["sec/**"]},
+    }
+    raw = cli._canonical_json(envelope)
+    Path(initial["artifact_path"]).write_text(raw, encoding="utf-8")
+    initial["prompt"] = "\n".join(
+        f"envelope_sha256={cli._sha256(raw)}" if line.startswith("envelope_sha256=") else line
+        for line in initial["prompt"].splitlines()
+    )
+    calls = _Calls()
+    result = cli._worker_run(initial, **_factories(calls, "VALUE = 1\n"))
+    assert result["error_code"] == "OPEN_SWE_SEMANTIC_V2_REJECTED_PROTECTED_PATH_INVALID"
+    assert result["failure_phase"] == "SEMANTIC_ADMISSION"
+    assert calls.as_tuple() == (0, 0, 0)
+
+
+@pytest.mark.parametrize("stored", ["", {}, False, 0])
+def test_falsy_invalid_stored_protected_paths_are_not_coerced_to_empty(tmp_path, stored):
+    initial = _bound_initial_request(tmp_path)
+    result = cli._worker_run(initial, **_factories(_Calls(), "VALUE = 1\n"))
+    parent = _capture_candidate(Path(initial["workspace_path"]))
+    session_path = cli._session_path(initial, result["session_id"])
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    session["core_protected_paths"] = stored
+    session_path.write_text(json.dumps(session), encoding="utf-8")
+    request = _continue_request(tmp_path, initial, result["session_id"], parent)
+    outcome, calls = _run_continue(request)
+    assert outcome["error_code"] == (
+        "OPEN_SWE_BOUND_CONTINUATION_REJECTED_PROTECTED_PATHS_INVALID"
+    )
+    assert calls.as_tuple() == (0, 0, 0)
+
+
+def test_run_created_nfc_file_edited_via_nfd_keeps_its_exemption(tmp_path):
+    nfc = "pkg/café.py"
+    nfd = unicodedata.normalize("NFD", nfc)
+    request = _bound_request(
+        tmp_path,
+        base_files={"seed.py": "SEED = 1\n"},
+        test_paths=[],
+        production_paths=[nfc],
+        refs=[f"task_card:{CARD_REF}@" + "a" * 16, f"source_absence:{nfc}@" + "b" * 16],
+    )
+    workspace = Path(request["workspace_path"]).resolve()
+    (workspace / "pkg").mkdir()
+    base = _git(workspace, "rev-parse", "HEAD")
+    from test_mutation_gate_parity import _identity
+
+    journal = DurableEffectJournal(tmp_path / "state4", _identity(workspace, nfc, base, bound=True))
+    journal.bind_turn("turn-1", "call-1")
+    first = cli.ScopedRepairBackend(_Delegate(), workspace, (nfc,), journal)
+    first.write(nfc, "VALUE = 1\n")
+    journal.bind_turn("turn-2", "call-2")
+    # The model addresses the same file through the NFD spelling and edits it.
+    second = cli.ScopedRepairBackend(_Delegate(), workspace, (nfc, nfd), journal)
+    second.edit(nfd, "VALUE = 1", "VALUE = 2")
+    journal.bind_turn("turn-3", "call-3")
+    third = cli.ScopedRepairBackend(_Delegate(), workspace, (nfc,), journal)
+    third.edit(nfc, "VALUE = 2", "VALUE = 3")  # rejected if the NFC grouping is lost

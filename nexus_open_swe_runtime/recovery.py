@@ -18,6 +18,7 @@ import stat
 import tempfile
 import threading
 import time
+import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -395,9 +396,16 @@ class DurableEffectJournal:
             and isinstance(record.get("preimage_sha256"), str)
             and isinstance(record.get("postimage_sha256"), str)
         ]
-        created = {r["path"] for r in records if r["preimage_sha256"] == "absent"}
+        # Group by NFC-normalised path: the same file written as ``café`` in NFC
+        # and edited as NFD is one file on a normalisation-insensitive filesystem.
+        def key(path: str) -> str:
+            return unicodedata.normalize("NFC", path)
+
+        created = {key(r["path"]) for r in records if r["preimage_sha256"] == "absent"}
         return {
-            path: frozenset(r["postimage_sha256"] for r in records if r["path"] == path)
+            path: frozenset(
+                r["postimage_sha256"] for r in records if key(r["path"]) == path
+            )
             for path in created
         }
 

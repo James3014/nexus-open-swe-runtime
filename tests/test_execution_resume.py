@@ -38,6 +38,10 @@ def test_exact_identity_resumes_without_replaying_completed_effect():
     assert out["provider_session_identity"] == "conv-1"
 
 
+# The projection reports the drifted field under its expected_* name.
+_DRIFT_KEY = {"core_attempt_id": "attempt_id", "core_source_revision": "source_revision", "tool_projection_backend_id": "backend_id"}
+
+
 def test_authorization_source_backend_provider_or_projection_drift_reconciles():
     fields = {
         "operation_id": "op-other",
@@ -52,7 +56,7 @@ def test_authorization_source_backend_provider_or_projection_drift_reconciles():
         out = project_execution_resume(state(identity={field: value}), **EXPECTED)
         assert out["disposition"] == "RECONCILE"
         assert out["reason"] == "IDENTITY_DRIFT"
-        assert out["identity_drift"]
+        assert out["identity_drift"] == [_DRIFT_KEY.get(field, field)]
 
 
 def test_outcome_unknown_never_authorizes_retry():
