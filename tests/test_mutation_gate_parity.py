@@ -140,8 +140,14 @@ def _rejected_by(call: Callable[[], Any]) -> bool:
     return getattr(result, "error", None) is not None and "not found" not in str(result.error)
 
 
+_LAST_ADMISSION_REASON: list[str | None] = [None]
+_LAST_CONTINUATION_CODE: list[str | None] = [None]
+
+
 def _entry_admission(tmp_path, request, workspace, target, base):
-    return _admission(request).decision == cli.REJECT
+    admission = _admission(request)
+    _LAST_ADMISSION_REASON[0] = admission.reason_code
+    return admission.decision == cli.REJECT
 
 
 def _entry_backend_write(tmp_path, request, workspace, target, base):
@@ -223,6 +229,7 @@ def _continuation_code(workspace: Path, target: str, base: str) -> str:
 
 def _entry_continuation(tmp_path, request, workspace, target, base):
     code = _continuation_code(workspace, target, base)
+    _LAST_CONTINUATION_CODE[0] = code
     return code.removeprefix("OPEN_SWE_BOUND_CONTINUATION_REJECTED_") in _GATE_CODES
 
 
@@ -241,13 +248,59 @@ ENTRY_POINTS = {
 _NOT_APPLICABLE = {("tracked_at_base", "legacy_fallback_backend")}
 
 
+# The reason code the SHARED predicate must return for each gate cell (#132 item 2).
+# Rejection alone is not enough: a cell can be rejected by a different, earlier gate.
+EXPECTED_REASON = {
+    "symlink": "path_symlink",
+    "regular_file": "path_not_regular",
+    "tracked_at_base": "source_untracked",
+    "git_segment": "path_git_metadata",
+    "git_control_file": "path_git_control",
+    "authority_overlap": "path_authority",
+    "containment": "path_parent",
+}
+# Entry points whose own pre-checks fire before the shared predicate for a symlink.
+_PRECHECK_REASON = {("symlink", "bound_continuation"): "workspace_symlink"}
+
+
+def _simulate_symlink_swapped_after_the_symlink_gate(monkeypatch) -> None:
+    """Containment case that the symlink gate does not catch.
+
+    A symlink component planted AFTER the symlink walk (TOCTOU) is invisible to
+    ``_workspace_path_has_symlink``; only the resolve-based containment check in
+    ``_mutation_target_violation`` can still stop the write.  The gates themselves
+    are unchanged; the symlink walk is told the tree is clean.
+    """
+    monkeypatch.setattr(cli, "_workspace_path_has_symlink", lambda _workspace, _relative: False)
+
+
 @pytest.mark.parametrize("entry", sorted(ENTRY_POINTS))
 @pytest.mark.parametrize("gate", sorted(GATES))
-def test_each_gate_rejects_at_every_entry_point(tmp_path, gate, entry):
+def test_each_gate_rejects_at_every_entry_point(tmp_path, monkeypatch, gate, entry):
     if (gate, entry) in _NOT_APPLICABLE:
         pytest.skip("tracked-at-base is a bound-only gate")
     request, workspace, target, base = _workspace_for(tmp_path, gate)
+    if gate == "containment":
+        _simulate_symlink_swapped_after_the_symlink_gate(monkeypatch)
+    codes: list[str | None] = []
+    real = cli._mutation_target_violation
+
+    def spy(*args: Any, **kwargs: Any) -> str | None:
+        code = real(*args, **kwargs)
+        codes.append(code)
+        return code
+
+    monkeypatch.setattr(cli, "_mutation_target_violation", spy)
     assert ENTRY_POINTS[entry](tmp_path, request, workspace, target, base), (gate, entry)
+    expected = _PRECHECK_REASON.get((gate, entry), EXPECTED_REASON[gate])
+    if entry == "bound_continuation":
+        assert _LAST_CONTINUATION_CODE[0] == (
+            "OPEN_SWE_BOUND_CONTINUATION_REJECTED_" + expected.upper()
+        ), (gate, entry, _LAST_CONTINUATION_CODE[0])
+    elif entry == "v2_admission":
+        assert _LAST_ADMISSION_REASON[0] == expected, (gate, entry, _LAST_ADMISSION_REASON[0])
+    else:
+        assert {code for code in codes if code} == {expected}, (gate, entry, codes)
 
 
 @pytest.mark.parametrize("entry", sorted(ENTRY_POINTS))

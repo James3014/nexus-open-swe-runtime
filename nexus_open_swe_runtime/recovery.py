@@ -18,6 +18,7 @@ import stat
 import tempfile
 import threading
 import time
+import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -377,6 +378,36 @@ class DurableEffectJournal:
         if path.is_symlink():
             raise RuntimeError("RECOVERY_STATE_SYMLINK")
         return json.loads(path.read_text(encoding="utf-8"))
+
+    def run_created_files(self) -> dict[str, frozenset[str]]:
+        """Files this exact operation created, as ``path -> postimage sha256 values``.
+
+        Built only from verified RESULT records of this operation (the same
+        validation as ``result_effects``).  A path qualifies when one of its RESULT
+        records has an absent preimage; the hashes are every RESULT postimage the
+        operation journaled for it, so a later edit by the run keeps the latest
+        content valid while a file replaced by anyone else does not match.  INTENT-only
+        records and records missing required fields give no entry (fail closed).
+        """
+        records = [
+            record
+            for record in self.result_effects()
+            if isinstance(record.get("path"), str)
+            and isinstance(record.get("preimage_sha256"), str)
+            and isinstance(record.get("postimage_sha256"), str)
+        ]
+        # Group by NFC-normalised path: the same file written as ``café`` in NFC
+        # and edited as NFD is one file on a normalisation-insensitive filesystem.
+        def key(path: str) -> str:
+            return unicodedata.normalize("NFC", path)
+
+        created = {key(r["path"]) for r in records if r["preimage_sha256"] == "absent"}
+        return {
+            path: frozenset(
+                r["postimage_sha256"] for r in records if key(r["path"]) == path
+            )
+            for path in created
+        }
 
     def result_effects(self) -> list[dict[str, Any]]:
         """Return verified durable write RESULT records for this exact operation."""
