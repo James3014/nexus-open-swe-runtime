@@ -24,10 +24,10 @@ concurrency:
 jobs:
   run:
     name: Nexus Core issue run
-    # Same-repository branches only; fork PRs are intentionally excluded.
-    if: >-
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.head.repo.fork == false
+    # Same-repository branches only; fork PRs are intentionally excluded. Compare the
+    # repository name only: `head.repo.fork` is true for every branch of a repository
+    # that is itself a fork (nexus-core consumer example, #265).
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
