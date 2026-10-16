@@ -296,3 +296,12 @@ def test_worker_run_without_git_origin_keeps_previous_behaviour(tmp_path: Path) 
     result, repair = _run_write(request, "a.py")
     assert result["status"] == "COMPLETED"
     assert repair.calls == 1
+
+
+def test_unparseable_origin_never_matches_an_empty_authorized_repository(tmp_path: Path) -> None:
+    request = _reauthorize(_project_worker_request(_worker_request(tmp_path), TOOLS), repository="")
+    _git_workspace(request, "https://gitlab.com/attacker/malicious.git")
+    result, repair = _run_write(request, "a.py")
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["error_code"] == "OPEN_SWE_EFFECT_AUTHORIZATION_BINDING_MISMATCH"
+    assert repair.calls == 0

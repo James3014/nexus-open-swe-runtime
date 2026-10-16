@@ -1098,7 +1098,9 @@ def _assert_authorization_origin(request: Mapping[str, Any], workspace: Path) ->
         return
     # An origin that exists but is not a recognised GitHub form cannot match.
     origin = _canonical_origin_repository(raw_origin)
-    if origin != _canonical_binding_repository(str(authorization.get("repository") or "")):
+    if not origin or origin != _canonical_binding_repository(
+        str(authorization.get("repository") or "")
+    ):
         raise RuntimeErrorBounded("OPEN_SWE_EFFECT_AUTHORIZATION_BINDING_MISMATCH")
 
 
