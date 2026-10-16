@@ -62,3 +62,11 @@ def test_scoped_backend_rejects_symlinked_leaf_inside_workspace(tmp_path: Path) 
 def test_scoped_backend_allows_plain_authorized_path(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
     cli.ScopedRepairBackend(object(), tmp_path, ("src/a.py",))._authorize("src/a.py")
+
+
+def test_regular_file_ancestor_is_a_violation_not_a_crash(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("x\n")
+    assert cli._workspace_path_has_symlink(tmp_path, "a.py/b.py") is True
+    backend = cli.ScopedRepairBackend(object(), tmp_path, ("a.py/b.py",))
+    with pytest.raises(PermissionError, match="OPEN_SWE_MUTATION_PATH_FORBIDDEN"):
+        backend._authorize("a.py/b.py")

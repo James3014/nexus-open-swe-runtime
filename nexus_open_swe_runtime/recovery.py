@@ -432,11 +432,48 @@ class DurableEffectJournal:
             records.append(value)
         return records
 
+    def _assert_write_contained(self, path: Path) -> None:
+        """Reject a write whose path crosses a symlink or leaves the authorized paths (#113)."""
+        configured = Path(self.identity.workspace)
+        workspace, relative = configured, None
+        for candidate in (configured, configured.resolve()):
+            try:
+                relative = path.relative_to(candidate)
+            except ValueError:
+                continue
+            workspace = candidate
+            break
+        if relative is None:
+            # Not a workspace-relative write; ScopedRepairBackend._authorize owns
+            # containment for those and the leaf-symlink check above still applies.
+            # Failing closed here breaks 20 existing tests/test_recovery.py tests that
+            # record effects outside identity.workspace (see PR discussion).
+            return
+        if ".." in relative.parts:
+            raise RuntimeError("RECOVERY_WRITE_PATH_NOT_AUTHORIZED")
+        current = workspace
+        for component in relative.parts:
+            current /= component
+            try:
+                if stat.S_ISLNK(current.lstat().st_mode):
+                    raise RuntimeError("RECOVERY_WRITE_SYMLINK")
+            except FileNotFoundError:
+                break
+        # NFC-normalise both sides: the same file may be spelled NFC or NFD.
+        posix = unicodedata.normalize("NFC", relative.as_posix())
+        boundaries = (
+            unicodedata.normalize("NFC", boundary).rstrip("/")
+            for boundary in self.identity.allowed_paths
+        )
+        if not any(posix == boundary or posix.startswith(boundary + "/") for boundary in boundaries):
+            raise RuntimeError("RECOVERY_WRITE_PATH_NOT_AUTHORIZED")
+
     def recover_write(self, effect: Effect) -> str:
         state = self.read(effect.effect_id)
         path = Path(effect.path)
         if path.is_symlink():
             raise RuntimeError("RECOVERY_WRITE_SYMLINK")
+        self._assert_write_contained(path)
         if state.get("status") == "RESULT":
             return "RESULT"
         actual = _sha(path.read_bytes()) if path.exists() else "absent"

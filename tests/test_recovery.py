@@ -600,3 +600,106 @@ def test_effect_journal_lists_only_exact_operation_results(tmp_path: Path):
     assert records[0]["effect_id"] == effect.effect_id
     assert records[0]["operation_id"] == identity.operation_id
     assert records[0]["status"] == "RESULT"
+
+
+def _contained_journal(tmp_path: Path, allowed: tuple[str, ...]) -> tuple[DurableEffectJournal, Path]:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    identity = replace(_identity(tmp_path), allowed_paths=allowed)
+    return DurableEffectJournal(tmp_path / "state", identity), workspace
+
+
+def test_recover_write_rejects_symlinked_parent_directory(tmp_path: Path):
+    """#113: an authorized path whose parent is a directory symlink must not be written."""
+    journal, workspace = _contained_journal(tmp_path, ("src/a.py",))
+    protected = workspace / ".github" / "workflows"
+    protected.mkdir(parents=True)
+    (protected / "a.py").write_text("PROTECTED = True\n", encoding="utf-8")
+    (workspace / "src").symlink_to(protected, target_is_directory=True)
+    journal.bind_turn("turn_1", "call_1")
+    effect = journal.intent(
+        turn_id="turn_1",
+        tool_call_id="call_1",
+        tool_name="write_file",
+        arguments={"file_path": "src/a.py", "content": "PROTECTED = False\n"},
+        path=workspace / "src" / "a.py",
+        preimage="PROTECTED = True\n",
+        postimage="PROTECTED = False\n",
+    )
+    with pytest.raises(RuntimeError, match="RECOVERY_WRITE_SYMLINK"):
+        journal.recover_write(effect)
+    assert (protected / "a.py").read_text(encoding="utf-8") == "PROTECTED = True\n"
+
+
+def test_recover_write_rejects_path_outside_authorized_boundary(tmp_path: Path):
+    journal, workspace = _contained_journal(tmp_path, ("a.py",))
+    (workspace / "b.py").write_text("old\n", encoding="utf-8")
+    journal.bind_turn("turn_1", "call_1")
+    effect = journal.intent(
+        turn_id="turn_1",
+        tool_call_id="call_1",
+        tool_name="write_file",
+        arguments={"file_path": "b.py", "content": "new\n"},
+        path=workspace / "b.py",
+        preimage="old\n",
+        postimage="new\n",
+    )
+    with pytest.raises(RuntimeError, match="RECOVERY_WRITE_PATH_NOT_AUTHORIZED"):
+        journal.recover_write(effect)
+    assert (workspace / "b.py").read_text(encoding="utf-8") == "old\n"
+
+
+def test_recover_write_allows_authorized_contained_path(tmp_path: Path):
+    journal, workspace = _contained_journal(tmp_path, ("src",))
+    (workspace / "src").mkdir()
+    journal.bind_turn("turn_1", "call_1")
+    effect = journal.intent(
+        turn_id="turn_1",
+        tool_call_id="call_1",
+        tool_name="write_file",
+        arguments={"file_path": "src/a.py", "content": "new\n"},
+        path=workspace / "src" / "a.py",
+        preimage=None,
+        postimage="new\n",
+    )
+    assert journal.recover_write(effect) == "RESULT"
+    assert (workspace / "src" / "a.py").read_text(encoding="utf-8") == "new\n"
+
+
+def test_recover_write_rejects_dotdot_traversal_under_allowed_boundary(tmp_path: Path):
+    journal, workspace = _contained_journal(tmp_path, ("src",))
+    (workspace / "src").mkdir()
+    (workspace / "secret.py").write_text("old\n", encoding="utf-8")
+    journal.bind_turn("turn_1", "call_1")
+    effect = journal.intent(
+        turn_id="turn_1",
+        tool_call_id="call_1",
+        tool_name="write_file",
+        arguments={"file_path": "src/../secret.py", "content": "new\n"},
+        path=workspace / "src" / ".." / "secret.py",
+        preimage="old\n",
+        postimage="new\n",
+    )
+    with pytest.raises(RuntimeError, match="RECOVERY_WRITE_PATH_NOT_AUTHORIZED"):
+        journal.recover_write(effect)
+    assert (workspace / "secret.py").read_text(encoding="utf-8") == "old\n"
+
+
+def test_recover_write_rejects_parent_symlink_pointing_outside_workspace(tmp_path: Path):
+    journal, workspace = _contained_journal(tmp_path, ("src/a.py",))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workspace / "src").symlink_to(outside, target_is_directory=True)
+    journal.bind_turn("turn_1", "call_1")
+    effect = journal.intent(
+        turn_id="turn_1",
+        tool_call_id="call_1",
+        tool_name="write_file",
+        arguments={"file_path": "src/a.py", "content": "new\n"},
+        path=workspace / "src" / "a.py",
+        preimage=None,
+        postimage="new\n",
+    )
+    with pytest.raises(RuntimeError, match="RECOVERY_WRITE_SYMLINK"):
+        journal.recover_write(effect)
+    assert not (outside / "a.py").exists()
