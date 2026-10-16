@@ -459,11 +459,13 @@ class DurableEffectJournal:
                     raise RuntimeError("RECOVERY_WRITE_SYMLINK")
             except FileNotFoundError:
                 break
-        posix = relative.as_posix()
-        if not any(
-            posix == boundary.rstrip("/") or posix.startswith(boundary.rstrip("/") + "/")
+        # NFC-normalise both sides: the same file may be spelled NFC or NFD.
+        posix = unicodedata.normalize("NFC", relative.as_posix())
+        boundaries = (
+            unicodedata.normalize("NFC", boundary).rstrip("/")
             for boundary in self.identity.allowed_paths
-        ):
+        )
+        if not any(posix == boundary or posix.startswith(boundary + "/") for boundary in boundaries):
             raise RuntimeError("RECOVERY_WRITE_PATH_NOT_AUTHORIZED")
 
     def recover_write(self, effect: Effect) -> str:

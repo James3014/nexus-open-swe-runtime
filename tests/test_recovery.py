@@ -683,3 +683,23 @@ def test_recover_write_rejects_dotdot_traversal_under_allowed_boundary(tmp_path:
     with pytest.raises(RuntimeError, match="RECOVERY_WRITE_PATH_NOT_AUTHORIZED"):
         journal.recover_write(effect)
     assert (workspace / "secret.py").read_text(encoding="utf-8") == "old\n"
+
+
+def test_recover_write_rejects_parent_symlink_pointing_outside_workspace(tmp_path: Path):
+    journal, workspace = _contained_journal(tmp_path, ("src/a.py",))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workspace / "src").symlink_to(outside, target_is_directory=True)
+    journal.bind_turn("turn_1", "call_1")
+    effect = journal.intent(
+        turn_id="turn_1",
+        tool_call_id="call_1",
+        tool_name="write_file",
+        arguments={"file_path": "src/a.py", "content": "new\n"},
+        path=workspace / "src" / "a.py",
+        preimage=None,
+        postimage="new\n",
+    )
+    with pytest.raises(RuntimeError, match="RECOVERY_WRITE_SYMLINK"):
+        journal.recover_write(effect)
+    assert not (outside / "a.py").exists()

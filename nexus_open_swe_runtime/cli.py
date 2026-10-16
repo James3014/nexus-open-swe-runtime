@@ -1641,6 +1641,9 @@ def _workspace_path_has_symlink(workspace: Path, relative: str) -> bool:
                 return True
         except FileNotFoundError:
             break
+        except NotADirectoryError:
+            # A regular-file ancestor: the path cannot be a plain workspace path.
+            return True
     return False
 
 
