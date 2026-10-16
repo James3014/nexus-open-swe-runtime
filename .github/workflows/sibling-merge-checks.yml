@@ -1,0 +1,30 @@
+# Caller for the Nexus-new reusable "Sibling merge checks" (#2385).
+# Copy to .github/workflows/sibling-merge-checks.yml in each sibling repo.
+name: Sibling merge checks
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+    branches: [main]
+  issue_comment:
+    types: [created, edited, deleted]
+
+concurrency:
+  group: sibling-merge-checks-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  checks:
+    if: github.event_name != 'issue_comment' || github.event.issue.pull_request
+    uses: James3014/Nexus-new/.github/workflows/sibling-merge-checks.yml@main
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      statuses: write
+    with:
+      pr: ${{ github.event.pull_request.number || github.event.issue.number }}
+      head_sha: ${{ github.event.pull_request.head.sha || '' }}
+      run_bindings: ${{ github.event_name == 'pull_request_target' }}
