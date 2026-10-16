@@ -813,6 +813,7 @@ dependencies = [
     { name = "langchain-core" },
     { name = "langchain-google-genai" },
     { name = "langgraph-checkpoint-sqlite" },
+    { name = "pydantic" },
 ]
 
 [package.dev-dependencies]
@@ -828,6 +829,7 @@ requires-dist = [
     { name = "langchain-core", specifier = "==1.5.2" },
     { name = "langchain-google-genai", specifier = "==4.3.2" },
     { name = "langgraph-checkpoint-sqlite", specifier = "==3.1.1" },
+    { name = "pydantic", specifier = "==2.13.5" },
 ]
 
 [package.metadata.requires-dev]
