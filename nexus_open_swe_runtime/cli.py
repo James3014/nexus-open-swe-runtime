@@ -1075,9 +1075,68 @@ def _worker_tool_projection(request: Mapping[str, Any]) -> ValidatedToolProjecti
         projection = validate_tool_projection(request)
         if projection is not None:
             require_supported_projection_tools(projection, WORKER_TOOL_UNIVERSE)
+            _assert_authorization_binding(request)
         return projection
     except ToolProjectionError as exc:
         raise RuntimeErrorBounded(str(exc)) from exc
+
+
+def _assert_authorization_origin(request: Mapping[str, Any], workspace: Path) -> None:
+    """Non-Core-bound runs: a determinable git origin must equal the authorized repository.
+
+    A workspace without a determinable origin (plain non-git directory) keeps the
+    previous behaviour; that is a documented residual.
+    """
+    authorization = request.get("effect_authorization")
+    if not isinstance(authorization, Mapping):
+        return
+    try:
+        raw_origin = _git_output(workspace, "remote", "get-url", "origin")
+    except RuntimeErrorBounded:
+        return
+    if not raw_origin:
+        return
+    # An origin that exists but is not a recognised GitHub form cannot match.
+    origin = _canonical_origin_repository(raw_origin)
+    if not origin or origin != _canonical_binding_repository(
+        str(authorization.get("repository") or "")
+    ):
+        raise RuntimeErrorBounded("OPEN_SWE_EFFECT_AUTHORIZATION_BINDING_MISMATCH")
+
+
+def _assert_authorization_binding(
+    request: Mapping[str, Any], core_identity: Mapping[str, Any] | None = None
+) -> None:
+    """Fail closed when the effect authorization names another repository/workspace.
+
+    The request side is whatever the caller supplied: top-level ``repository`` /
+    ``workspace_id`` (compared only when present) and the Core-bound repository.
+    """
+    authorization = request.get("effect_authorization")
+    if not isinstance(authorization, Mapping):
+        return
+    authorized_repository = _canonical_binding_repository(str(authorization.get("repository") or ""))
+    for key in ("repository", "workspace_id"):
+        if key not in request:
+            continue
+        supplied = request[key]
+        if not isinstance(supplied, str):
+            raise RuntimeErrorBounded("OPEN_SWE_EFFECT_AUTHORIZATION_BINDING_MISMATCH")
+        if key == "repository":
+            matches = bool(authorized_repository) and (
+                _canonical_binding_repository(supplied) == authorized_repository
+            )
+        else:
+            matches = supplied == authorization.get(key)
+        if not matches:
+            raise RuntimeErrorBounded("OPEN_SWE_EFFECT_AUTHORIZATION_BINDING_MISMATCH")
+    core_repository = (core_identity or {}).get("core_repository")
+    if (
+        isinstance(core_repository, str)
+        and core_repository
+        and _canonical_binding_repository(core_repository) != authorized_repository
+    ):
+        raise RuntimeErrorBounded("OPEN_SWE_EFFECT_AUTHORIZATION_BINDING_MISMATCH")
 
 
 def _assert_projected_write_paths(
@@ -3695,6 +3754,9 @@ def _worker_run(
                 raise RuntimeErrorBounded(
                     "OPEN_SWE_SEMANTIC_V2_REJECTED_PROTECTED_PATH_INVALID"
                 ) from exc
+        _assert_authorization_binding(request, core_identity)
+        if tool_projection is not None and not core_identity:
+            _assert_authorization_origin(request, workspace)
         hint_binding = _worker_hint_binding(request, tool_projection, core_identity)
         hint_observer = HintExecutionObserver(hint_binding, workspace)
         started["hint_execution_receipt"] = hint_observer.receipt()
@@ -4160,6 +4222,16 @@ def _worker_reconcile(
                 return cached
         elif tool_projection is not None:
             return cached
+        if tool_projection is not None:
+            try:
+                _assert_projected_write_paths(tool_projection, identity.allowed_paths)
+                _assert_authorization_binding(
+                    request, {"core_repository": identity.core_repository}
+                )
+                if not identity.core_binding_hash:
+                    _assert_authorization_origin(request, Path(identity.workspace))
+            except RuntimeErrorBounded:
+                return cached
         if identity.core_binding_hash:
             supplied_core = _request_core_hashes(request)
             if supplied_core != (
