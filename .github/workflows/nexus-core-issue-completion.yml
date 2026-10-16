@@ -42,18 +42,18 @@ jobs:
       outcome: ${{ steps.gate.outputs.outcome }}
     steps:
       - id: gate
-        uses: James3014/nexus-core/.github/actions/issue-gate@3f3dc38de7120b66f25eb246d22ef29d5d5971d9
+        uses: James3014/nexus-core/.github/actions/issue-gate@ffe4392e964d2838fa6e4a069d4810f4436c4870
         with:
-          nexus-certify-ref: "3f3dc38de7120b66f25eb246d22ef29d5d5971d9"
+          nexus-certify-ref: "ffe4392e964d2838fa6e4a069d4810f4436c4870"
           evidence-universe: trusted-config
 
   verify:
     name: Nexus Core issue completion   # the required status check
     needs: run
-    if: >-
-      always() &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.head.repo.fork == false
+    # Never put a source condition here: a job skipped by `if:` reports as skipped, and
+    # GitHub treats a skipped required check as passed. verify must run and fail rather
+    # than skip; the guard step below fails closed on fork / cross-repo PRs.
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -62,7 +62,29 @@ jobs:
       # PR_ALREADY_CLOSED_SKIPPED: receipt-verify re-reads the live PR.
       pull-requests: read
     steps:
-      - uses: James3014/nexus-core/.github/actions/receipt-verify@3f3dc38de7120b66f25eb246d22ef29d5d5971d9
+      - name: Fail closed on untrusted source or unsuccessful issuer
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_RESULT: ${{ needs.run.result }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != "pull_request_target" ]; then
+            echo "NEXUS_CORE_UNTRUSTED_EVENT: $EVENT_NAME" >&2
+            exit 1
+          fi
+          if [ -z "$HEAD_REPO" ] || [ "$HEAD_REPO" != "$REPOSITORY" ]; then
+            echo "NEXUS_CORE_UNTRUSTED_PR_SOURCE: head repository '${HEAD_REPO:-}' is not '$REPOSITORY'" >&2
+            exit 1
+          fi
+          if [ "$RUN_RESULT" != "success" ]; then
+            echo "NEXUS_CORE_ISSUER_NOT_SUCCESSFUL: run job result is '$RUN_RESULT'" >&2
+            exit 1
+          fi
+
+      - uses: James3014/nexus-core/.github/actions/receipt-verify@ffe4392e964d2838fa6e4a069d4810f4436c4870
         with:
           artifact-name: ${{ needs.run.outputs.artifact-name }}
           artifact-id: ${{ needs.run.outputs.artifact-id }}
@@ -73,4 +95,4 @@ jobs:
           base-sha: ${{ github.event.pull_request.base.sha }}
           issue-number: ${{ needs.run.outputs.issue-number }}
           gate-outcome: ${{ needs.run.outputs.outcome }}
-          nexus-certify-ref: "3f3dc38de7120b66f25eb246d22ef29d5d5971d9"
+          nexus-certify-ref: "ffe4392e964d2838fa6e4a069d4810f4436c4870"
