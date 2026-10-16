@@ -2743,6 +2743,17 @@ def _semantic_v2_admission(
     return SemanticAdmission(ADMIT, raw, envelope, diagnosis)
 
 
+def _envelope_worker_status(envelope: Any) -> str:
+    """Worker-result status for a recorded envelope.
+
+    Only an exact ``BLOCKED`` is propagated; anything else keeps the historical
+    ``IMPLEMENTATION_COMPLETED`` mapping (unknown values are never promoted).
+    """
+    if isinstance(envelope, Mapping) and envelope.get("status") == "BLOCKED":
+        return "BLOCKED"
+    return "IMPLEMENTATION_COMPLETED"
+
+
 def _worker_result(task_id: str, unit_id: str, status: str, summary: str) -> str:
     return _canonical_json({
         "schema": "external_intelligence_worker_result.v1",
@@ -3945,7 +3956,9 @@ def _worker_run(
             repair_summary = repair.get("summary") if isinstance(repair, Mapping) else None
             if not isinstance(repair_summary, str) or not repair_summary.strip():
                 raise RuntimeErrorBounded("OPEN_SWE_REPAIR_RESULT_INVALID")
-            response = _worker_result(task_id, unit_id, "IMPLEMENTATION_COMPLETED", repair_summary)
+            response = _worker_result(
+                task_id, unit_id, _envelope_worker_status(repair), repair_summary
+            )
         else:
             response = _worker_result(task_id, unit_id, "BLOCKED", summary)
         failure_phase = "RESULT_FINALIZATION"
@@ -4459,7 +4472,7 @@ def _worker_reconcile(
             "status": "COMPLETED",
             "outcome_unknown": False,
             "response_text": _worker_result(
-                identity.task_id, identity.unit_id, "IMPLEMENTATION_COMPLETED", envelope["summary"]
+                identity.task_id, identity.unit_id, _envelope_worker_status(envelope), envelope["summary"]
             ),
             "process_started": True,
             "directory": identity.workspace,
