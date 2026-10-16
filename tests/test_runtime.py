@@ -5219,3 +5219,43 @@ def test_worker_diagnosis_and_repair_share_cross_transport_identity_invariant(tm
         "physical-model-2",
     ]
     assert all(delegate.calls == 1 for delegate in delegates)
+
+
+def test_worker_blocked_envelope_propagates_blocked_status(tmp_path):
+    request = _worker_request(tmp_path)
+    diagnosis = FakeGraph(
+        cli.DIAGNOSIS_TOOLS,
+        _record(
+            "record_diagnosis",
+            {
+                "status": "ROOT_CAUSE_SUPPORTED",
+                "summary": "supported",
+                "evidence_paths": ["a.py"],
+            },
+        ),
+    )
+    repair = FakeGraph(
+        cli.REPAIR_TOOLS,
+        _record("record_worker_result", {"status": "BLOCKED", "summary": "task is under-specified"}),
+    )
+
+    result = cli._worker_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=lambda *_args: object(),
+        diagnosis_factory=lambda *_args: diagnosis,
+        repair_factory=lambda *_args: repair,
+    )
+
+    assert result["status"] == "COMPLETED"
+    worker = json.loads(result["response_text"])
+    assert worker["status"] == "BLOCKED"
+    assert worker["summary"] == "task is under-specified"
+
+
+def test_worker_unexpected_envelope_status_keeps_completed_mapping(tmp_path):
+    for status in ("DONE", "blocked", " BLOCKED", None, ["BLOCKED"]):
+        assert cli._envelope_worker_status({"status": status, "summary": "x"}) == "IMPLEMENTATION_COMPLETED"
+    assert cli._envelope_worker_status({"summary": "x"}) == "IMPLEMENTATION_COMPLETED"
+    assert cli._envelope_worker_status(None) == "IMPLEMENTATION_COMPLETED"
+    assert cli._envelope_worker_status({"status": "BLOCKED"}) == "BLOCKED"
