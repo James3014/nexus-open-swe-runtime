@@ -410,6 +410,8 @@ class DurableEffectJournal:
             # Not a workspace-relative write; ScopedRepairBackend._authorize owns
             # containment for those and the leaf-symlink check above still applies.
             return
+        if ".." in relative.parts:
+            raise RuntimeError("RECOVERY_WRITE_PATH_NOT_AUTHORIZED")
         current = workspace
         for component in relative.parts:
             current /= component

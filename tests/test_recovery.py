@@ -648,3 +648,22 @@ def test_recover_write_allows_authorized_contained_path(tmp_path: Path):
     )
     assert journal.recover_write(effect) == "RESULT"
     assert (workspace / "src" / "a.py").read_text(encoding="utf-8") == "new\n"
+
+
+def test_recover_write_rejects_dotdot_traversal_under_allowed_boundary(tmp_path: Path):
+    journal, workspace = _contained_journal(tmp_path, ("src",))
+    (workspace / "src").mkdir()
+    (workspace / "secret.py").write_text("old\n", encoding="utf-8")
+    journal.bind_turn("turn_1", "call_1")
+    effect = journal.intent(
+        turn_id="turn_1",
+        tool_call_id="call_1",
+        tool_name="write_file",
+        arguments={"file_path": "src/../secret.py", "content": "new\n"},
+        path=workspace / "src" / ".." / "secret.py",
+        preimage="old\n",
+        postimage="new\n",
+    )
+    with pytest.raises(RuntimeError, match="RECOVERY_WRITE_PATH_NOT_AUTHORIZED"):
+        journal.recover_write(effect)
+    assert (workspace / "secret.py").read_text(encoding="utf-8") == "old\n"
