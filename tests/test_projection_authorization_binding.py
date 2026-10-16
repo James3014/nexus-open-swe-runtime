@@ -191,8 +191,7 @@ def test_worker_run_rejects_authorization_repository_differing_from_git_origin(
     request = _project_worker_request(_worker_request(tmp_path), TOOLS)
     _git_workspace(request, "https://github.com/James3014/other-repo.git")
     result, repair = _run_write(request, "a.py")
-    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN" or result["status"].startswith("OPEN_SWE")
-    assert result["status"] != "COMPLETED"
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
     assert result["error_code"] == "OPEN_SWE_EFFECT_AUTHORIZATION_BINDING_MISMATCH"
     assert repair.calls == 0
     assert (Path(request["workspace_path"]) / "a.py").read_text(encoding="utf-8") == "VALUE = 1\n"
@@ -210,7 +209,7 @@ def test_worker_run_accepts_authorization_repository_matching_git_origin(tmp_pat
 def test_worker_reconcile_enforces_git_origin_binding(
     tmp_path: Path, origin: str, resumed: bool
 ) -> None:
-    """A recovery identity whose allowed_paths exceed the authorized ceiling is never resumed."""
+    """Reconcile resumes only when the workspace git origin matches the authorized repository."""
     request = _project_worker_request(_worker_request(tmp_path), TOOLS)
     request.update(operation="worker_reconcile", provider_id="google_genai", model_id="test-model")
     workspace = Path(request["workspace_path"])
@@ -282,7 +281,18 @@ def test_worker_reconcile_enforces_git_origin_binding(
 
 def test_worker_run_rejects_unrecognised_git_origin_form(tmp_path: Path) -> None:
     request = _project_worker_request(_worker_request(tmp_path), TOOLS)
-    _git_workspace(request, "ssh://git@github.com:22/James3014/other-repo.git")
+    _git_workspace(request, "ssh://git@github.com:22/James3014/nexus-open-swe-runtime.git")
     result, repair = _run_write(request, "a.py")
     assert result["error_code"] == "OPEN_SWE_EFFECT_AUTHORIZATION_BINDING_MISMATCH"
     assert repair.calls == 0
+
+
+def test_worker_run_without_git_origin_keeps_previous_behaviour(tmp_path: Path) -> None:
+    """Known residual: no determinable origin (git repo without a remote) is not compared."""
+    import subprocess
+
+    request = _project_worker_request(_worker_request(tmp_path), TOOLS)
+    subprocess.run(["git", "-C", request["workspace_path"], "init", "-q"], check=True)
+    result, repair = _run_write(request, "a.py")
+    assert result["status"] == "COMPLETED"
+    assert repair.calls == 1
