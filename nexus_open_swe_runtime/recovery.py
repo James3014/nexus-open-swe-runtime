@@ -401,11 +401,36 @@ class DurableEffectJournal:
             records.append(value)
         return records
 
+    def _assert_write_contained(self, path: Path) -> None:
+        """Reject a write whose path crosses a symlink or leaves the authorized paths (#113)."""
+        workspace = Path(self.identity.workspace)
+        try:
+            relative = path.relative_to(workspace)
+        except ValueError:
+            # Not a workspace-relative write; ScopedRepairBackend._authorize owns
+            # containment for those and the leaf-symlink check above still applies.
+            return
+        current = workspace
+        for component in relative.parts:
+            current /= component
+            try:
+                if stat.S_ISLNK(current.lstat().st_mode):
+                    raise RuntimeError("RECOVERY_WRITE_SYMLINK")
+            except FileNotFoundError:
+                break
+        posix = relative.as_posix()
+        if not any(
+            posix == boundary.rstrip("/") or posix.startswith(boundary.rstrip("/") + "/")
+            for boundary in self.identity.allowed_paths
+        ):
+            raise RuntimeError("RECOVERY_WRITE_PATH_NOT_AUTHORIZED")
+
     def recover_write(self, effect: Effect) -> str:
         state = self.read(effect.effect_id)
         path = Path(effect.path)
         if path.is_symlink():
             raise RuntimeError("RECOVERY_WRITE_SYMLINK")
+        self._assert_write_contained(path)
         if state.get("status") == "RESULT":
             return "RESULT"
         actual = _sha(path.read_bytes()) if path.exists() else "absent"
