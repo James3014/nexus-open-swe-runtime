@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
@@ -197,13 +198,13 @@ def _git_control_path(relative: str) -> bool:
 
 def _protected_mutation_paths(values: Any) -> tuple[str, ...]:
     """Normalize Task Card / authority / forbidden refs for the overlap gate."""
-    protected: list[str] = []
-    for value in values:
-        try:
-            protected.append(_safe_relative_path(str(value)).lower())
-        except RuntimeErrorBounded:
-            continue
-    return tuple(protected)
+    # Fail closed: an entry that cannot be normalised (``../x``, backslash, empty)
+    # raises instead of silently shrinking the protected set.  Entries are NFC so
+    # ``café`` in either Unicode form matches (see ``_mutation_target_violation``).
+    # Glob patterns are not supported: they are matched literally.
+    return tuple(
+        unicodedata.normalize("NFC", _safe_relative_path(str(value))).lower() for value in values
+    )
 
 
 def _protected_paths_from_envelope(envelope: Any) -> tuple[str, ...]:
@@ -245,10 +246,10 @@ def _mutation_target_violation(
         return "path_git_metadata"
     if _git_control_path(relative):
         return "path_git_control"
-    lowered = relative.lower()
+    lowered = unicodedata.normalize("NFC", relative).lower()
     if any(
         _path_matches(lowered, boundary) or _path_matches(boundary, lowered)
-        for boundary in protected
+        for boundary in (unicodedata.normalize("NFC", entry).lower() for entry in protected)
     ):
         return "path_authority"
     if _workspace_path_has_symlink(workspace, relative):
@@ -499,8 +500,13 @@ class ScopedRepairBackend:
             ).removeprefix("git-commit:")
             self._base_commit = base or None
         self._protected = tuple(getattr(identity, "mutation_protected_paths", ()) or ())
+        # A file this run created earlier (journaled with an absent preimage) is not
+        # "initially present" even if the backend is rebuilt while it still exists.
+        created = effect_journal.created_paths() if effect_journal is not None else frozenset()
         self._initially_present = frozenset(
-            path for path in self._allowed if os.path.lexists(self._root / path)
+            path
+            for path in self._allowed
+            if os.path.lexists(self._root / path) and str(self._root / path) not in created
         )
 
     def _effect(self, tool_name: str, file_path: str, content: str, old: str | None) -> Any:
@@ -2667,7 +2673,10 @@ def _semantic_v2_admission(
         # Path gates are shared with the backend and continuation; the card that
         # authorizes the write, read-only authorities and forbidden paths are
         # protected (a card could otherwise rewrite itself).
-        protected = _protected_paths_from_envelope(envelope)
+        try:
+            protected = _protected_paths_from_envelope(envelope)
+        except RuntimeErrorBounded:
+            return _semantic_reject("protected_path_invalid")
         for path in allowed_paths:
             violation = _mutation_target_violation(
                 workspace, path, base_commit=expected_base, protected=protected

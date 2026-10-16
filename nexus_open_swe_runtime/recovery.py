@@ -378,6 +378,32 @@ class DurableEffectJournal:
             raise RuntimeError("RECOVERY_STATE_SYMLINK")
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def created_paths(self) -> frozenset[str]:
+        """Paths this exact operation journaled as created (preimage absent).
+
+        Covers INTENT as well as RESULT records, so a file created by this run
+        stays "created by this run" when the backend is rebuilt after a crash
+        between the write and its RESULT record.
+        """
+        created: set[str] = set()
+        if not self.root.exists():
+            return frozenset()
+        for path in sorted(self.root.glob("effect_*.json")):
+            if path.is_symlink() or not path.is_file():
+                raise RuntimeError("RECOVERY_STATE_SYMLINK")
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("RECOVERY_RECORD_CORRUPT") from exc
+            if (
+                isinstance(value, dict)
+                and value.get("operation_id") == self.identity.operation_id
+                and value.get("preimage_sha256") == "absent"
+                and isinstance(value.get("path"), str)
+            ):
+                created.add(value["path"])
+        return frozenset(created)
+
     def result_effects(self) -> list[dict[str, Any]]:
         """Return verified durable write RESULT records for this exact operation."""
         records: list[dict[str, Any]] = []
