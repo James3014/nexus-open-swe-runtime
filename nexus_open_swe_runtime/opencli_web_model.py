@@ -976,20 +976,48 @@ def _tool_result_succeeded(result: ToolMessage) -> bool:
     return not (isinstance(content, str) and content.lstrip().startswith("Error"))
 
 
-_CREDENTIAL_ENV_MARKERS = ("API_KEY", "SECRET", "PASSWORD", "CREDENTIAL")
-_CREDENTIAL_ENV_PREFIXES = ("GOOGLE_", "GEMINI_", "OPENAI_", "ANTHROPIC_")
+_CREDENTIAL_ENV_MARKERS = (
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "API_KEY",
+    "PRIVATE_KEY",
+    "KEY_ID",
+    "COOKIE",
+    "AUTHORIZATION",
+)
+_CREDENTIAL_ENV_PREFIXES = (
+    "GITHUB_",
+    "GH_",
+    "GOOGLE_",
+    "GEMINI_",
+    "OPENAI_",
+    "ANTHROPIC_",
+    "AWS_",
+)
+_CREDENTIAL_ENV_SUFFIXES = ("_KEY", "_PAT")
+_CREDENTIAL_ENV_EXACT = frozenset({
+    "SSH_AUTH_SOCK",
+    "KUBECONFIG",
+    "DOCKER_AUTH_CONFIG",
+    "DATABASE_URL",
+})
+_CREDENTIAL_ENV_EXACT_NAMES = _CREDENTIAL_ENV_EXACT
 
 
 def _is_credential_env_name(name: str) -> bool:
-    """Return True for env names that carry model-provider or generic secrets.
-
-    OPENCLI-scoped names are exempt because they configure the child process itself.
-    """
+    """Return True for env names that carry model-provider or generic secrets."""
     upper = name.upper()
-    if "OPENCLI" in upper:
-        return False
-    return upper.startswith(_CREDENTIAL_ENV_PREFIXES) or any(
-        marker in upper for marker in _CREDENTIAL_ENV_MARKERS
+    return (
+        any(marker in upper for marker in _CREDENTIAL_ENV_MARKERS)
+        or upper.endswith(_CREDENTIAL_ENV_SUFFIXES)
+        or upper == "AUTH"
+        or "AUTH_" in upper
+        or "_AUTH" in upper
+        or upper.startswith(_CREDENTIAL_ENV_PREFIXES)
+        or upper in _CREDENTIAL_ENV_EXACT
     )
 
 
@@ -1194,18 +1222,7 @@ class OpenCLIWebChatModel(BaseChatModel):
         return self.bind(tools=formatted, **kwargs)
 
     def _environment(self) -> dict[str, str]:
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if not (
-                k.startswith("GITHUB_")
-                or k.startswith("GH_")
-                or "TOKEN" in k
-                and "PROVIDER" not in k
-                and "OPENCLI" not in k
-                or _is_credential_env_name(k)
-            )
-        }
+        env = {k: v for k, v in os.environ.items() if not _is_credential_env_name(k)}
         if self.opencli_profile:
             env["OPENCLI_PROFILE"] = self.opencli_profile
         return env
