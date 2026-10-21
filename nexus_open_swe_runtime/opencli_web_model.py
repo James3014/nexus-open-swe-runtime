@@ -1004,7 +1004,6 @@ _CREDENTIAL_ENV_EXACT = frozenset({
     "DOCKER_AUTH_CONFIG",
     "DATABASE_URL",
 })
-_CREDENTIAL_ENV_EXACT_NAMES = _CREDENTIAL_ENV_EXACT
 
 
 def _is_credential_env_name(name: str) -> bool:
