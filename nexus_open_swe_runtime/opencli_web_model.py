@@ -424,19 +424,26 @@ def _read_validated_state(
             raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED")
         if not math.isfinite(float(value)) or value < 0:
             raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_MALFORMED")
+    timestamps = {
+        field_name: float(raw[field_name])
+        for field_name in ("last_send_started", "last_response_finished")
+    }
     if clock is not None:
         now = clock()
-        for field_name in ("last_send_started", "last_response_finished"):
-            value = raw.get(field_name)
-            if isinstance(value, (int, float)) and value > 0:
+        for field_name, value in timestamps.items():
+            if value > 0:
                 if value > now + _DURABLE_CLOCK_SKEW_FUTURE:
                     raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
                 if now - value > _DURABLE_CLOCK_SKEW_PAST:
-                    raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
+                    # Merely old: no send for over a day.  That cannot shorten the pacing
+                    # interval, and the state is only rewritten after a successful send, so
+                    # refusing here would block every later send for good (Nexus-new #2889).
+                    # Read it as "no recent send", exactly like a missing state file.
+                    timestamps[field_name] = 0.0
     return DurablePacingState(
         key=key,
-        last_send_started=float(raw["last_send_started"]),
-        last_response_finished=float(raw["last_response_finished"]),
+        last_send_started=timestamps["last_send_started"],
+        last_response_finished=timestamps["last_response_finished"],
     )
 
 

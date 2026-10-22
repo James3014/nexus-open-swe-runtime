@@ -35,6 +35,7 @@ from nexus_open_swe_runtime.opencli_web_model import (
     OpenCLIWebModelError,
     _durable_pacing_key,
     _read_durable_state,
+    _read_validated_state,
     _validate_state_file,
     _write_durable_state,
 )
@@ -3472,9 +3473,13 @@ def test_durable_pacing_validate_old_state_fails_closed(tmp_path):
     path = os.path.join(pacing_dir, "old-state.json")
     state = DurablePacingState(key="k", last_send_started=0.0, last_response_finished=1.0)
     _write_durable_state(path, state)
-    # 86401 seconds in the past exceeds the skew threshold
-    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_DURABLE_STATE_UNSAFE"):
-        _validate_state_file(path, clock=lambda: 86402.0)
+    # 86401 seconds in the past exceeds the skew threshold.  Since Nexus-new #2889 an old
+    # state no longer fails closed (that blocked every later send for good): it reads as
+    # "no recent send", like a missing file.  The future-skew check still fails closed.
+    _validate_state_file(path, clock=lambda: 86402.0)  # no longer raises
+    result = _read_validated_state(path, clock=lambda: 86402.0)
+    assert result is not None
+    assert (result.last_send_started, result.last_response_finished) == (0.0, 0.0)
 
 
 def test_durable_pacing_validate_non_numeric_timestamps_fail_closed(tmp_path):
@@ -3929,6 +3934,15 @@ def test_production_model_seam_rejects_unsafe_state_without_ask(tmp_path, corrup
         clock.write_text("100000.0")
     model._clock = lambda: float(clock.read_text())
     model._durable_pacing_backend._clock = model._clock
+    if corruption == "backward":
+        # Nexus-new #2889: a state ~27 h behind the clock only means "no send for over a
+        # day".  It cannot shorten the pacing interval, and failing closed here blocked every
+        # later send for good (the state is rewritten only after a successful send), so the
+        # send now proceeds and the state is rewritten.  All other corruptions still refuse.
+        model.invoke([HumanMessage(content="may ask")])
+        assert " ask " in log.read_text()
+        assert _read_validated_state(str(state)).last_send_started >= 100000.0
+        return
     with pytest.raises(OpenCLIWebModelError):
         model.invoke([HumanMessage(content="must not ask")])
     assert not log.exists() or " ask " not in log.read_text()
@@ -4870,3 +4884,31 @@ def test_opencli_web_model_presend_retry_rejects_extra_notice_lines(
         model.invoke([HumanMessage(content="turn")])
     asks = [args for args, _kwargs in calls if args[1:3] == ["chatgpt", "ask"]]
     assert len(asks) == 1
+
+
+def test_durable_pacing_stale_state_allows_the_next_send_and_is_rewritten(tmp_path):
+    """#2889: a state whose last send is two days old must not block the next send."""
+    pacing_dir = _durable_pacing_dir(tmp_path)
+    path = os.path.join(pacing_dir, "stale-state.json")
+    now = 10_000_000.0
+    stale = DurablePacingState(
+        key="k", last_send_started=now - 2 * 86400, last_response_finished=now - 2 * 86400 + 60
+    )
+    _write_durable_state(path, stale)
+    read = _read_validated_state(path, clock=lambda: now)
+    assert read is not None and read.last_send_started == 0.0
+    fresh = DurablePacingState(key="k", last_send_started=now, last_response_finished=now + 5)
+    _write_durable_state(path, fresh)
+    again = _read_validated_state(path, clock=lambda: now + 10)
+    assert again is not None and again.last_send_started == now
+
+
+def test_durable_pacing_future_state_still_fails_closed_after_2889(tmp_path):
+    pacing_dir = _durable_pacing_dir(tmp_path)
+    path = os.path.join(pacing_dir, "future-state-2889.json")
+    now = 10_000_000.0
+    _write_durable_state(
+        path, DurablePacingState(key="k", last_send_started=now + 600, last_response_finished=0.0)
+    )
+    with pytest.raises(OpenCLIWebModelError, match="OPENCLI_WEB_DURABLE_STATE_UNSAFE"):
+        _validate_state_file(path, clock=lambda: now)
