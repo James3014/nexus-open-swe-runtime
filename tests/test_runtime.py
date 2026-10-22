@@ -5259,3 +5259,57 @@ def test_worker_unexpected_envelope_status_keeps_completed_mapping(tmp_path):
     assert cli._envelope_worker_status({"summary": "x"}) == "IMPLEMENTATION_COMPLETED"
     assert cli._envelope_worker_status(None) == "IMPLEMENTATION_COMPLETED"
     assert cli._envelope_worker_status({"status": "BLOCKED"}) == "BLOCKED"
+
+
+def test_semantic_transport_failure_records_opencli_error_code(tmp_path):
+    from nexus_open_swe_runtime.opencli_web_model import OpenCLIWebModelError
+
+    request = _semantic_request(tmp_path)
+
+    def _fail(*_args):
+        raise OpenCLIWebModelError("OPENCLI_WEB_DURABLE_STATE_UNSAFE")
+
+    result = cli._semantic_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=_fail,
+        graph_factory=lambda *_args: None,
+    )
+
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["error"] == "OpenCLIWebModelError"
+    assert result["error_code"] == "OPENCLI_WEB_DURABLE_STATE_UNSAFE"
+
+
+def test_semantic_transport_failure_with_unknown_text_records_no_error_code(tmp_path):
+    from nexus_open_swe_runtime.opencli_web_model import OpenCLIWebModelError
+
+    request = _semantic_request(tmp_path)
+
+    def _fail(*_args):
+        raise OpenCLIWebModelError("arbitrary /private/path text")
+
+    result = cli._semantic_run(
+        request,
+        runtime_loader=_runtime,
+        model_factory=_fail,
+        graph_factory=lambda *_args: None,
+    )
+
+    assert result["status"] == "OPEN_SWE_OUTCOME_UNKNOWN"
+    assert result["error"] == "OpenCLIWebModelError"
+    assert "error_code" not in result
+
+
+def test_every_opencli_web_model_error_literal_is_in_bounded_allowlist():
+    import re
+
+    import nexus_open_swe_runtime.opencli_web_model as module
+
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    literals = set(re.findall(r'OpenCLIWebModelError\(\s*"([^"]+)"', source))
+    literals |= set(re.findall(r'super\(\).__init__\(\s*"(OPENCLI[A-Z_]*)"', source))
+    assert literals
+    assert literals <= cli._OPENCLI_WEB_ERROR_CODES
+    for code in literals:
+        assert cli._bounded_error_code(module.OpenCLIWebModelError(code)) == code

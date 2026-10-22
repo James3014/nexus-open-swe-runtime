@@ -1602,11 +1602,54 @@ _FAILURE_PHASES = frozenset({
     "WORKER_CONTEXT", "RUNTIME_LOAD", "SEMANTIC_ADMISSION", "RECOVERY_PREPARE",
     "DIAGNOSIS", "REPAIR", "RESULT_FINALIZATION",
 })
+_OPENCLI_WEB_ERROR_CODES = frozenset({
+    "OPENCLI_NOT_FOUND",
+    "OPENCLI_WEB_BATCH_STATE_INVALID",
+    "OPENCLI_WEB_BUSY",
+    "OPENCLI_WEB_CONVERSATION_ID_INVALID",
+    "OPENCLI_WEB_CONVERSATION_ID_MISMATCH",
+    "OPENCLI_WEB_DURABLE_BACKEND_UNAVAILABLE",
+    "OPENCLI_WEB_DURABLE_FLOCK_UNAVAILABLE",
+    "OPENCLI_WEB_DURABLE_LOCK_UNSAFE",
+    "OPENCLI_WEB_DURABLE_STATE_IDENTITY_UNKNOWN",
+    "OPENCLI_WEB_DURABLE_STATE_MALFORMED",
+    "OPENCLI_WEB_DURABLE_STATE_UNSAFE",
+    "OPENCLI_WEB_HARD_BLOCK",
+    "OPENCLI_WEB_HISTORY_INVALID",
+    "OPENCLI_WEB_MODEL_LEVEL_INVALID",
+    "OPENCLI_WEB_PACING_REGISTRY_EXHAUSTED",
+    "OPENCLI_WEB_PRESEND_COMPOSER_UNAVAILABLE",
+    "OPENCLI_WEB_PROCESS_FAILURE",
+    "OPENCLI_WEB_PROTOCOL_RESPONSE_INVALID",
+    "OPENCLI_WEB_RECONCILE_INCOMPLETE",
+    "OPENCLI_WEB_RECONCILE_INVALID",
+    "OPENCLI_WEB_REPAIR_RESUME_EXHAUSTED",
+    "OPENCLI_WEB_RESPONSE_INVALID",
+    "OPENCLI_WEB_RESUME_REQUIRED",
+    "OPENCLI_WEB_SITE_SESSION_INVALID",
+    "OPENCLI_WEB_TIMEOUT_RECONCILE_UNKNOWN",
+    "OPENCLI_WEB_TIMEOUT",
+    "OPENCLI_WEB_TOOL_CALL_INVALID",
+    "OPENCLI_WEB_TOOL_CHOICE_INVALID",
+    "OPENCLI_WEB_TOOLS_INVALID",
+    "OPENCLI_WEB_TURN_BUDGET_EXHAUSTED",
+    "OPENCLI_WEB_TURN_IDENTITY_UNKNOWN",
+})
 # fmt: on
 
 
 def _bounded_error_code(exc: BaseException) -> str:
     """Expose only stable bounded codes; never persist arbitrary exception text."""
+    try:
+        from .opencli_web_model import OpenCLIWebModelError
+    except ImportError:  # direct ``python path/to/cli.py`` compatibility
+        from nexus_open_swe_runtime.opencli_web_model import (  # type: ignore[no-redef]
+            OpenCLIWebModelError,
+        )
+
+    if isinstance(exc, OpenCLIWebModelError):
+        code = str(exc)
+        return code if code in _OPENCLI_WEB_ERROR_CODES else ""
     if isinstance(exc, RuntimeErrorBounded):
         code = str(exc)
         if code in {
@@ -3244,6 +3287,9 @@ def _semantic_run(
             "error": type(exc).__name__,
             "finished_at": _now(),
         }
+        error_code = _bounded_error_code(exc)
+        if error_code:
+            result["error_code"] = error_code
         receipts = _invocation_receipts(invocation_journal)
         if receipts:
             result["model_invocation_receipts"] = receipts
@@ -4666,6 +4712,9 @@ def main() -> int:
             "started_at": _now(),
             "finished_at": _now(),
         }
+        error_code = _bounded_error_code(exc)
+        if error_code:
+            result["error_code"] = error_code
     print(_canonical_json(result))
     return 0
 
