@@ -178,15 +178,17 @@ class DurableOperationJournal:
             return
         with operation_flock(self.lock_path):
             self._fence_depth = 1
-            state = self.read() or {}
-            if state and state.get("identity") != self.identity.as_dict():
-                raise RuntimeError("RECOVERY_IDENTITY_MISMATCH")
-            epoch = int(state.get("lease_epoch", 0)) + 1
-            state = dict(state)
-            state.update({"identity": self.identity.as_dict(), "lease_epoch": epoch})
-            self._write(state)
-            yield state
-            self._fence_depth = 0
+            try:
+                state = self.read() or {}
+                if state and state.get("identity") != self.identity.as_dict():
+                    raise RuntimeError("RECOVERY_IDENTITY_MISMATCH")
+                epoch = int(state.get("lease_epoch", 0)) + 1
+                state = dict(state)
+                state.update({"identity": self.identity.as_dict(), "lease_epoch": epoch})
+                self._write(state)
+                yield state
+            finally:
+                self._fence_depth = 0
 
     def _write(self, state: Mapping[str, Any]) -> None:
         _fsync_replace(self.path, state)

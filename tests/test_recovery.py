@@ -703,3 +703,31 @@ def test_recover_write_rejects_parent_symlink_pointing_outside_workspace(tmp_pat
     with pytest.raises(RuntimeError, match="RECOVERY_WRITE_SYMLINK"):
         journal.recover_write(effect)
     assert not (outside / "a.py").exists()
+
+
+def test_fence_resets_depth_after_exception(tmp_path: Path):
+    identity = _identity(tmp_path)
+    journal = DurableOperationJournal(tmp_path / "state", identity)
+
+    with pytest.raises(ValueError, match="boom"):
+        with journal.fence():
+            assert journal._fence_depth == 1
+            raise ValueError("boom")
+
+    assert journal._fence_depth == 0
+
+    with journal.fence():
+        assert journal._fence_depth == 1
+        assert journal.read()["lease_epoch"] == 2
+
+    assert journal._fence_depth == 0
+
+    mismatched = DurableOperationJournal(
+        tmp_path / "state", replace(identity, provider_id="other")
+    )
+    with pytest.raises(RuntimeError, match="RECOVERY_IDENTITY_MISMATCH"):
+        with mismatched.fence():
+            pass
+
+    assert mismatched._fence_depth == 0
+
