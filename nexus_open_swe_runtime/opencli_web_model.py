@@ -188,6 +188,23 @@ def _canonicalize_direct_composite_response(response: str, journal: Any = None) 
     )
 
 
+def _unwrap_opencli_json(stdout: str) -> Any:
+    """Parse OpenCLI ``-f json`` output, accepting v1 bare arrays and v2 envelopes.
+
+    v2 wraps success as ``{"ok": true, "data": [...]}``. Anything else (ok false,
+    non-list data, extra keys) is returned unchanged so callers' list checks fail closed.
+    """
+    value = json.loads(stdout)
+    if (
+        isinstance(value, dict)
+        and set(value) == {"ok", "data"}
+        and value["ok"] is True
+        and isinstance(value["data"], list)
+    ):
+        return value["data"]
+    return value
+
+
 def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -1383,7 +1400,7 @@ class OpenCLIWebChatModel(BaseChatModel):
     @staticmethod
     def _extract_ask_result(stdout: str) -> tuple[str, str]:
         try:
-            rows = json.loads(stdout)
+            rows = _unwrap_opencli_json(stdout)
         except json.JSONDecodeError as exc:
             raise OpenCLIWebModelError("OPENCLI_WEB_RESPONSE_INVALID") from exc
         if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], Mapping):
@@ -1399,7 +1416,7 @@ class OpenCLIWebChatModel(BaseChatModel):
     @staticmethod
     def _extract_detail_response(stdout: str, expected_turn_id: str = "") -> str:
         try:
-            rows = json.loads(stdout)
+            rows = _unwrap_opencli_json(stdout)
         except json.JSONDecodeError as exc:
             raise OpenCLIWebModelError("OPENCLI_WEB_RECONCILE_INVALID") from exc
         if not isinstance(rows, list) or not rows:
@@ -1431,7 +1448,7 @@ class OpenCLIWebChatModel(BaseChatModel):
     @staticmethod
     def _extract_history_ids(stdout: str) -> list[str]:
         try:
-            rows = json.loads(stdout)
+            rows = _unwrap_opencli_json(stdout)
         except json.JSONDecodeError as exc:
             raise OpenCLIWebModelError("OPENCLI_WEB_HISTORY_INVALID") from exc
         if not isinstance(rows, list):
@@ -1446,7 +1463,7 @@ class OpenCLIWebChatModel(BaseChatModel):
     def _contains_exact_turn_id(stdout: str, turn_id: str) -> bool:
         """Return whether one detail payload contains the exact user turn."""
         try:
-            rows = json.loads(stdout)
+            rows = _unwrap_opencli_json(stdout)
         except json.JSONDecodeError as exc:
             raise OpenCLIWebModelError("OPENCLI_WEB_RECONCILE_INVALID") from exc
         if not isinstance(rows, list):
@@ -1466,7 +1483,7 @@ class OpenCLIWebChatModel(BaseChatModel):
     def _repair_resume_ready(stdout: str, turn_id: str) -> bool:
         """Return whether one physical detail proves a repair turn can resume."""
         try:
-            rows = json.loads(stdout)
+            rows = _unwrap_opencli_json(stdout)
         except json.JSONDecodeError as exc:
             raise OpenCLIWebModelError("OPENCLI_WEB_RECONCILE_INVALID") from exc
         if not isinstance(rows, list):
@@ -1970,7 +1987,7 @@ class OpenCLIWebChatModel(BaseChatModel):
             "identity_observation_source": NOT_MEASURED,
         }
         try:
-            payload = json.loads(stdout)
+            payload = _unwrap_opencli_json(stdout)
         except json.JSONDecodeError:
             return telemetry
         if not isinstance(payload, list) or not payload or not isinstance(payload[0], Mapping):
