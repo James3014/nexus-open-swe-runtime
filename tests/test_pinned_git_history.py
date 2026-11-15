@@ -128,16 +128,62 @@ def test_git_call_sites_pass_pinned_argv_and_env(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.subprocess, "run", capture)
     monkeypatch.setenv("GIT_NO_REPLACE_OBJECTS", "0")
     monkeypatch.setenv("GIT_GRAFT_FILE", "/tmp/hostile-grafts")
+    monkeypatch.setenv("GIT_NO_LAZY_FETCH", "0")
     cli._git_output(tmp_path, "status")
     cli._git_temp_output(
         tmp_path, ["status"],
-        {"GIT_NO_REPLACE_OBJECTS": "0", "GIT_GRAFT_FILE": "/tmp/hostile-grafts"},
+        {
+            "GIT_NO_REPLACE_OBJECTS": "0",
+            "GIT_GRAFT_FILE": "/tmp/hostile-grafts",
+            "GIT_NO_LAZY_FETCH": "0",
+        },
     )
     cli._git_blob_sha256(tmp_path, "a" * 40, "file")
 
     git_calls = [call for call in calls if call[0][0] == shutil.which("git")]
     assert len(git_calls) == 4
     for argv, env in git_calls:
-        assert argv[1:5] == ["-c", "core.useReplaceRefs=false", "-c", "core.commitGraph=false"]
+        assert argv[1:9] == [
+            "-c", "core.useReplaceRefs=false",
+            "-c", "core.commitGraph=false",
+            "-c", "core.fsmonitor=false",
+            "-c", "core.hooksPath=/dev/null",
+        ]
+        assert argv[9] == "-C"
         assert env["GIT_NO_REPLACE_OBJECTS"] == "1"
         assert env["GIT_GRAFT_FILE"] == os.devnull
+        assert env["GIT_NO_LAZY_FETCH"] == "1"
+
+
+def test_git_wrappers_ignore_hostile_repo_local_fsmonitor(tmp_path, monkeypatch):
+    git = shutil.which("git")
+    assert git is not None
+    repo = tmp_path / "hostile-fsmonitor"
+    repo.mkdir()
+    subprocess.run([git, "-C", str(repo), "init", "-q"], check=True)
+    marker = tmp_path / "fsmonitor-ran"
+    monitor = tmp_path / "fsmonitor"
+    monitor.write_text(
+        "#!/bin/sh\nprintf ran > \"$FSmonitor_MARKER\"\nprintf '\\n'\n",
+        encoding="utf-8",
+    )
+    monitor.chmod(0o755)
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    hook = hooks / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\nprintf ran > \"$HOOK_MARKER\"\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    subprocess.run(
+        [git, "-C", str(repo), "config", "core.fsmonitor", str(monitor)], check=True
+    )
+    subprocess.run(
+        [git, "-C", str(repo), "config", "core.hooksPath", str(hooks)], check=True
+    )
+
+    monkeypatch.setenv("FSmonitor_MARKER", str(marker))
+    cli._git_output(repo, "status")
+
+    assert not marker.exists()
