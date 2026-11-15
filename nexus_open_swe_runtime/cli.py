@@ -77,6 +77,7 @@ except ImportError:  # direct ``python path/to/cli.py`` compatibility
 
 REQUEST_SCHEMA = "nexus.open_swe_runtime.request.v1"
 RESULT_SCHEMA = "nexus.open_swe_runtime.result.v1"
+_PINNED_GIT_ARGS = ["-c", "core.useReplaceRefs=false", "-c", "core.commitGraph=false"]
 SEMANTIC_TOOLS = frozenset({"glob", "grep", "ls", "read_file", "record_finding"})
 DIAGNOSIS_TOOLS = frozenset({"glob", "grep", "ls", "read_file", "record_diagnosis"})
 REPAIR_TOOLS = frozenset({
@@ -1749,15 +1750,23 @@ def _workspace_path_has_symlink(workspace: Path, relative: str) -> bool:
     return False
 
 
+def _pinned_git_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
+    env = dict(os.environ if base is None else base)
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env["GIT_GRAFT_FILE"] = os.devnull
+    return env
+
+
 def _git_output(workspace: Path, *args: str) -> str:
     git = shutil.which("git")
     if not git or not Path(git).is_absolute():
         raise RuntimeErrorBounded("OPEN_SWE_V2_WORKSPACE_BINDING_INVALID")
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"})
+    env = _pinned_git_env(env)
     try:
         completed = subprocess.run(
-            [git, "-C", str(workspace), "--no-optional-locks", *args],
+            [git, *_PINNED_GIT_ARGS, "-C", str(workspace), "--no-optional-locks", *args],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -1779,9 +1788,10 @@ def _git_temp_output(
         raise RuntimeErrorBounded("OPEN_SWE_V2_WORKSPACE_BINDING_INVALID")
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", **extra_env})
+    env = _pinned_git_env(env)
     try:
         completed = subprocess.run(
-            [git, "-C", str(workspace), "--no-optional-locks", *args],
+            [git, *_PINNED_GIT_ARGS, "-C", str(workspace), "--no-optional-locks", *args],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -1849,9 +1859,19 @@ def _git_blob_sha256(workspace: Path, commit: str, path: str) -> str:
         raise RuntimeErrorBounded("OPEN_SWE_CORE_CHANGESET_GIT_FAILED")
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"})
+    env = _pinned_git_env(env)
     try:
         completed = subprocess.run(
-            [git, "-C", str(workspace), "--no-optional-locks", "cat-file", "blob", oid],
+            [
+                git,
+                *_PINNED_GIT_ARGS,
+                "-C",
+                str(workspace),
+                "--no-optional-locks",
+                "cat-file",
+                "blob",
+                oid,
+            ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
