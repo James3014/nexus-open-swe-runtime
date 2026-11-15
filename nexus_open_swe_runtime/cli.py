@@ -77,7 +77,12 @@ except ImportError:  # direct ``python path/to/cli.py`` compatibility
 
 REQUEST_SCHEMA = "nexus.open_swe_runtime.request.v1"
 RESULT_SCHEMA = "nexus.open_swe_runtime.result.v1"
-_PINNED_GIT_ARGS = ["-c", "core.useReplaceRefs=false", "-c", "core.commitGraph=false"]
+_PINNED_GIT_ARGS = [
+    "-c", "core.useReplaceRefs=false",
+    "-c", "core.commitGraph=false",
+    "-c", "core.fsmonitor=false",
+    "-c", "core.hooksPath=/dev/null",
+]
 SEMANTIC_TOOLS = frozenset({"glob", "grep", "ls", "read_file", "record_finding"})
 DIAGNOSIS_TOOLS = frozenset({"glob", "grep", "ls", "read_file", "record_diagnosis"})
 REPAIR_TOOLS = frozenset({
@@ -1754,6 +1759,7 @@ def _pinned_git_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ if base is None else base)
     env["GIT_NO_REPLACE_OBJECTS"] = "1"
     env["GIT_GRAFT_FILE"] = os.devnull
+    env["GIT_NO_LAZY_FETCH"] = "1"
     return env
 
 
